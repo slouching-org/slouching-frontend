@@ -7,8 +7,10 @@ locally with the page. The eleven supplied screen exports are preserved in
 [docs/design/screens](docs/design/screens).
 
 **Current status:** static preview. It does not connect to peers, create keys,
-send messages, or start a call. The optional `GET /api/status` request fails
-gracefully when no local core is running.
+send messages, or start a call. The separate Rust core scaffold is in
+[`slouching-org/slouching-backend`](https://github.com/slouching-org/slouching-backend).
+This static server does not proxy `GET /api/status` to the core, so the UI
+shows it as unavailable even if the backend is running on its own port.
 
 ## Run
 

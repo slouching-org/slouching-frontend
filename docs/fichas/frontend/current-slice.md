@@ -11,8 +11,11 @@ does not create a cryptographic identity.
 The call screen displays illustrative scenes with a visible
 `SEM CONEXÃO · PRÉVIA` badge. Its buttons change visual state only.
 No camera, microphone, messaging, peer transport, or MLS is implemented
-in this repository. The `/api/status` integration point reports a local
-core if one is present; otherwise the footer says it is unavailable.
+in this repository. The backend scaffold is now in
+[`slouching-org/slouching-backend`](https://github.com/slouching-org/slouching-backend).
+The static frontend server does not proxy `/api/status` to that process;
+the footer reports the core as unavailable until a local integration layer
+is implemented.
 
 The [eleven source screens](../../design/screens) define the broader
 frontend target. Future functionality must use authoritative state from
