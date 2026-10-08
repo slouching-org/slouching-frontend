@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0D0A1C" />
+    <title>slouching · prévia local</title>
+    <link rel="icon" href="/art/appicon.jpg" />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="#home" aria-label="Slouching, início">
+          <img src="/brand/05-two-wizards-primary-logo.png" alt="" />
+          <span>slouching</span>
+        </a>
+        <nav aria-label="Prévia das telas">
+          <a href="#home" data-route="home">Início</a>
+          <a href="#onboarding" data-route="onboarding">Familiar</a>
+          <a href="#call" data-route="call">Chamada</a>
+        </nav>
+        <div class="prototype-pill">PRÉVIA LOCAL</div>
+      </header>
+      <main id="screen" tabindex="-1"></main>
+      <footer class="build-status">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="runtime-status">Consultando o core local…</span>
+        <span class="footer-note">interface em construção · nenhuma chamada conectada</span>
+      </footer>
+    </div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
