@@ -324,6 +324,12 @@ pub struct JoinedMlsGroup {
 }
 
 #[derive(Debug, Clone)]
+pub struct PreparedMlsApplicationEvent {
+    pub event: EncryptedEvent,
+    pub wire_message: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
 pub struct LocalProfile {
     pub display_name: String,
     pub familiar: String,
@@ -410,6 +416,132 @@ pub fn store_outbound_event(event: &EncryptedEvent) -> Result<StoreEventResult, 
 
 pub fn store_inbound_event(event: &EncryptedEvent) -> Result<StoreEventResult, String> {
     store_encrypted_event(event, "inbound")
+}
+
+/// Encrypts an application payload with the group's current MLS epoch and
+/// persists both the ratchet update and retryable ciphertext in one transaction.
+pub fn create_mls_application_event(
+    group_id: &[u8],
+    plaintext: &[u8],
+    expires_at_unix: i64,
+) -> Result<PreparedMlsApplicationEvent, String> {
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let device_identity = signing_key_from_secret(secret)?;
+    let mut connection = open_local_database()?;
+    create_mls_application_event_in(
+        &mut connection,
+        group_id,
+        plaintext,
+        expires_at_unix,
+        &device_identity,
+    )
+}
+
+fn create_mls_application_event_in(
+    connection: &mut Connection,
+    group_id: &[u8],
+    plaintext: &[u8],
+    expires_at_unix: i64,
+    device_identity: &SigningKey,
+) -> Result<PreparedMlsApplicationEvent, String> {
+    use openmls::prelude::GroupId;
+
+    if group_id.len() != 16 || plaintext.is_empty() || plaintext.len() > 16 * 1024 {
+        return Err(
+            "MLS application message must have a valid group and 1 to 16 KiB payload".to_owned(),
+        );
+    }
+    if expires_at_unix <= 0 {
+        return Err("MLS application event expiry must be a positive Unix timestamp".to_owned());
+    }
+    let author_device = device_identity.verifying_key().to_bytes();
+    let group_id = GroupId::from_slice(group_id);
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| format!("could not begin MLS outbox transaction: {error}"))?;
+    let result = (|| {
+        let (event, wire_message) = {
+            let provider = LocalOpenMlsProvider::new(connection);
+            let mut group = MlsGroup::load(provider.storage(), &group_id)
+                .map_err(|error| format!("could not load MLS group: {error}"))?
+                .ok_or_else(|| "MLS group state is missing".to_owned())?;
+            if !group.is_active() {
+                return Err("MLS group is inactive on this device".to_owned());
+            }
+            let ciphersuite = group.ciphersuite();
+            let own_leaf = group
+                .own_leaf()
+                .ok_or_else(|| "local MLS member leaf is missing".to_owned())?;
+            let binding =
+                MlsSigningKeyBinding::from_bytes(own_leaf.credential().serialized_content())
+                    .ok_or_else(|| {
+                        "local MLS credential has no device identity binding".to_owned()
+                    })?;
+            if binding.device_public_key != author_device
+                || !binding.verifies_mls_credential(
+                    &author_device,
+                    ciphersuite.signature_algorithm() as u16,
+                    own_leaf.signature_key().as_slice(),
+                )
+            {
+                return Err("MLS group is not bound to this device identity".to_owned());
+            }
+            let signer = SignatureKeyPair::read(
+                provider.storage(),
+                &binding.mls_signing_public_key,
+                ciphersuite.signature_algorithm(),
+            )
+            .ok_or_else(|| "MLS signing key material is missing".to_owned())?;
+            let epoch = group.epoch().as_u64();
+            let message = group
+                .create_message(&provider, &signer, plaintext)
+                .map_err(|error| format!("could not encrypt MLS application message: {error:?}"))?;
+            let wire_message = message
+                .tls_serialize_detached()
+                .map_err(|error| format!("could not serialize MLS application message: {error}"))?;
+            let mut event_id = [0_u8; 16];
+            getrandom::fill(&mut event_id)
+                .map_err(|error| format!("could not generate MLS event id: {error}"))?;
+            let event = EncryptedEvent {
+                event_id,
+                author_device,
+                group_id: group_id.to_vec(),
+                epoch,
+                checkpoint: None,
+                expires_at_unix,
+                ciphertext: wire_message.clone(),
+            };
+            (event, wire_message)
+        };
+        let digest = blake3::hash(&event.ciphertext);
+        connection
+            .execute(
+                "INSERT INTO local_events
+                    (event_id, direction, author_device, group_id, epoch, checkpoint,
+                     ciphertext_digest, ciphertext, expires_at_unix, delivery_state)
+                 VALUES (?1, 'outbound', ?2, ?3, ?4, NULL, ?5, ?6, ?7, 'queued')",
+                params![
+                    event.event_id.as_slice(),
+                    event.author_device.as_slice(),
+                    event.group_id,
+                    event.epoch as i64,
+                    digest.as_bytes().as_slice(),
+                    event.ciphertext,
+                    event.expires_at_unix
+                ],
+            )
+            .map_err(|error| {
+                format!("could not persist MLS ciphertext in local outbox: {error}")
+            })?;
+        Ok(PreparedMlsApplicationEvent {
+            event,
+            wire_message,
+        })
+    })();
+    finish_sql_transaction(connection, result, "MLS application outbox")
 }
 
 /// Loads a bounded page for a future delivery worker; this does not send it.
@@ -1975,5 +2107,91 @@ mod tests {
         drop(invitee);
         drop(creator);
         fs::remove_dir_all(directory).expect("temporary database directory should be removed");
+    }
+
+    #[test]
+    fn mls_application_event_encrypts_and_atomically_enters_retryable_outbox() {
+        use openmls::prelude::{
+            Ciphersuite, MlsMessageIn, ProcessedMessageContent,
+            tls_codec::Deserialize as TlsCodecDeserialize,
+        };
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-mls-application-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary database directory should be created");
+        let suite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+        let sender_identity = SigningKey::from_bytes(&[0x31; 32]);
+        let receiver_identity = SigningKey::from_bytes(&[0x32; 32]);
+        let mut sender = open_database(&directory.join("sender.sqlite3"), &[0x33; 32])
+            .expect("sender database should initialize");
+        let group = create_mls_group_in(&mut sender, suite, &sender_identity)
+            .expect("sender should create MLS group");
+        let mut receiver = open_database(&directory.join("receiver.sqlite3"), &[0x34; 32])
+            .expect("receiver database should initialize");
+        let package = create_mls_key_package_in(&mut receiver, suite, &receiver_identity)
+            .expect("receiver should prepare its MLS KeyPackage");
+        let admission = add_mls_group_member_in(
+            &mut sender,
+            &group.group_id,
+            &package.public_bytes,
+            &sender_identity,
+        )
+        .expect("sender should add receiver");
+        join_mls_group_from_welcome_in(
+            &mut receiver,
+            &admission.welcome,
+            &admission.ratchet_tree,
+            &receiver_identity,
+        )
+        .expect("receiver should join group");
+
+        let payload = b"MLS application payload";
+        let prepared = create_mls_application_event_in(
+            &mut sender,
+            &group.group_id,
+            payload,
+            2_000_000_000,
+            &sender_identity,
+        )
+        .expect("application payload should encrypt and persist");
+        assert_eq!(prepared.event.epoch, 1);
+        assert_eq!(prepared.event.ciphertext, prepared.wire_message);
+        let queued: (String, Vec<u8>) = sender
+            .query_row(
+                "SELECT delivery_state, ciphertext FROM local_events WHERE event_id = ?1",
+                [prepared.event.event_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("ciphertext should be saved in the outbox");
+        assert_eq!(queued.0, "queued");
+        assert_eq!(queued.1, prepared.wire_message);
+
+        let incoming = MlsMessageIn::tls_deserialize_exact(&prepared.wire_message)
+            .expect("serialized MLS message should decode exactly");
+        let decrypted = {
+            let provider = LocalOpenMlsProvider::new(&mut receiver);
+            let mut joined =
+                MlsGroup::load(provider.storage(), &GroupId::from_slice(&group.group_id))
+                    .expect("receiver group should load")
+                    .expect("receiver group should exist");
+            joined
+                .process_message(&provider, incoming.try_into_protocol_message().unwrap())
+                .expect("receiver should authenticate and decrypt MLS message")
+        };
+        match decrypted.into_content() {
+            ProcessedMessageContent::ApplicationMessage(message) => {
+                assert_eq!(message.into_bytes(), payload);
+            }
+            other => panic!("expected MLS application content, got {other:?}"),
+        }
+        drop(receiver);
+        drop(sender);
+        fs::remove_dir_all(directory).expect("temporary databases should be removed");
     }
 }

@@ -101,9 +101,11 @@ create and persist a local single-member MLS group with this device as its
 creator and designated committer. The core can admit a device-bound KeyPackage,
 merge its Commit into local group state, return Commit/Welcome/ratchet-tree
 bytes, and process the invitee's Welcome against its locally stored private
-package. The Iced UI does
-not expose group creation or invitation, and MLS application messaging and
-network delivery are not implemented. The direct-LAN screen
+package. The core can encrypt MLS application payloads and atomically persist
+the serialized message in the queued outbox alongside the MLS ratchet update.
+A two-database test verifies that another member authenticates and decrypts
+the payload. The Iced UI does not expose group creation, invitation, or MLS
+messaging; inbound event processing and network delivery remain unimplemented. The direct-LAN screen
 manually pins device public keys separately. The local profile remains
 separate from that key. Character scenes, call views, and design-board examples
 remain visual previews. The dedicated chat screen shows only real direct-LAN
@@ -119,16 +121,19 @@ or envelope metadata. Outbound rows have local queued/held/received/expired/
 failed states and bounded cursor-paginated reads; the inbox can also be read
 in bounded pages. No transport or authenticated receipt feeds those states
 yet. The direct-LAN transcript is persisted in a separate per-peer table, not
-this journal; MLS and durable inbox/outbox UI remain unimplemented.
+this journal. Outbound MLS application ciphertext now enters its retryable
+outbox atomically with the ratchet update; inbound processing and durable
+inbox UI remain unimplemented.
 
 Opening the same SQLCipher database now composes OpenMLS RustCrypto with the
 SQLite storage provider and initializes its versioned schema. The event
-journal is not yet connected to MLS or the UI. The core creates and persists a
+journal receives outbound MLS application messages, but is not yet connected
+to an incoming-message flow or the UI. The core creates and persists a
 local group and indexes its creator as designated committer. It can admit a
 device-bound KeyPackage, merge its Commit into local state, return
 Commit/Welcome/ratchet-tree bytes, and process a Welcome on the joining client.
-There is no UI group or invitation flow, MLS application messaging, or event
-delivery integration.
+There is no UI group or invitation flow, MLS inbound processing, or network
+event delivery integration.
 A caller can explicitly create or load a distinct MLS signing key for a
 chosen OpenMLS ciphersuite. Its public key is signed by the long-term device
 identity and the MLS key is stored in the encrypted database. Repeated calls
@@ -179,7 +184,8 @@ Assets and font license/provenance notes are in [assets/README.md](assets/README
   explicit Ed25519 key storage plus initial opaque encrypted-event storage
   are implemented. A pinned-device Iroh/QUIC LAN text exchange is available
   from the Iced UI with a persistent bidirectional session and per-peer history
-  in SQLCipher; MLS messaging, event-journal integration, and media remain unbuilt.
+  in SQLCipher. Outbound MLS application encryption is atomically persisted in
+  the event outbox; inbound MLS handling, transport delivery, and media remain unbuilt.
 - **Server/backend:** Elixir in
   [`slouching-org/slouching-backend`](https://github.com/slouching-org/slouching-backend).
 - **Current boundary:** loopback HTTP status and binary protobuf WebSocket

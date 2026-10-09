@@ -1,8 +1,9 @@
 # Current frontend slice
 
 **Status:** eleven native Rust/Iced screens, including direct-LAN Iroh/QUIC
-text with per-peer local history in SQLCipher; MLS messaging and product
-pairing remain open.
+text with per-peer local history in SQLCipher. Core MLS membership and atomic
+application-message encryption plus outbox persistence now work; product UI,
+inbound event handling, and network delivery remain open.
 
 The frontend's `src/main.rs` owns application state and local transport;
 `src/ui.rs` composes the eleven source-board views with native widgets,
@@ -29,8 +30,11 @@ private bundle in SQLCipher. The core creates and persists local MLS group
 state and indexes its creator as designated committer. No UI publishes
 packages or exposes group creation. Core APIs admit a device-bound KeyPackage,
 merge its Commit into local state, return Commit/Welcome/ratchet-tree bytes, and
-process a Welcome on the joining device; network delivery, MLS application messaging, fingerprint/QR
-derivation, contact pairing, and MLS group history remain unimplemented. If the keyring cannot be read, the screen offers
+process a Welcome on the joining device. It can encrypt an application payload
+at the current epoch and persist the serialized MLS message as a queued outbox
+event in the same SQLCipher transaction as the MLS ratchet update. Inbound
+event handling, network delivery, fingerprint/QR derivation, contact pairing,
+and MLS group history remain unimplemented. If the keyring cannot be read, the screen offers
 a retry that reuses an existing key rather than replacing it. The display
 profile is distinct from identity.
 
@@ -47,7 +51,7 @@ and receives actual multiple-message sessions over pinned-device Iroh/QUIC and
 stores its transcript in a separate per-peer table; it does not write to the
 local event journal. Camera/microphone actions explain their
 unavailable state; verification controls still do not verify MLS membership.
-The app does not enumerate devices, create MLS messages, or join calls. The
+The app does not enumerate devices, expose MLS group or message flows, or join calls. The
 settings **Rede & P2P** tab exposes
 real backend diagnostics separately from the illustrative call routes.
 
