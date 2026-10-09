@@ -39,6 +39,40 @@ not establish a peer session. The UI shows connection and protocol errors
 separately. **Refresh backend** repeats both
 the HTTP diagnostic and WebSocket handshake.
 
+## Direct LAN text transport experiment
+
+The client includes a one-message Iroh/QUIC path for testing two devices on
+the same LAN. Create an Ed25519 identity on each device from the Familiar
+screen, then exchange the 64-character public-key hex values out of band.
+Start the receiver on device A, pinning device B's public key:
+
+```sh
+cargo run -- --lan-listen 45873 --expect-peer <DEVICE_B_PUBLIC_KEY_HEX>
+```
+
+On device B, use A's LAN IPv4 address and public key:
+
+```sh
+cargo run -- --lan-send 192.168.1.20:45873 --expect-peer <DEVICE_A_PUBLIC_KEY_HEX> --text 'hello from the crew'
+```
+
+The listener accepts only the pinned Iroh EndpointId, and the sender dials the
+expected ID directly. The Iroh endpoint key is derived from the device's
+existing Ed25519 identity; QUIC TLS encrypts and authenticates the connection.
+The stream carries one versioned UTF-8 frame (up to 16 KiB), an acknowledgement,
+and explicit receipt frames so both processes know the exchange completed. No
+relay, address lookup, Elixir route, or database service is used. Find the
+receiver's LAN IP with `ip -4 addr` and allow UDP on the chosen port in the
+local firewall.
+
+This is a direct pairwise transport check, not MLS messaging or verified
+contact pairing. The user must manually pin the other device key on both ends.
+There is no MLS group, message history, retry/offline delivery, relay fallback,
+NAT traversal, or chat UI integration. The chat screen remains an illustrative
+preview. The automated `cargo test --test peer_process` launches two separate
+OS processes, checks a text exchange and acknowledgement, and confirms that a
+listener rejects an unpinned device.
+
 The native app now recreates all eleven design-board views with real Iced
 widgets, original characters and scenery, extracted outline SVG icons,
 Bricolage Grotesque and JetBrains Mono, translucent panels, scanlines, and
@@ -55,10 +89,12 @@ fingerprint format, contact pairing, or MLS state is implemented. The core can
 sign a versioned binding from that durable device key to an MLS signing
 public key, including its signature-scheme code, without returning the private
 seed. This primitive is not connected to an MLS credential, key package, peer
-verification, or pairing. The local profile remains separate from that key.
+credential, KeyPackage, or trusted contact roster; the direct-LAN CLI pins
+device public keys separately. The local profile remains separate from that key.
 Every view is labeled as a visual
 preview: character images, messages, and comparison words are illustrative.
-No message is sent, and no camera, microphone, or screen is captured. **Rede &
+The chat UI does not send messages; the separate direct-LAN CLI above sends one
+real pairwise text frame. No camera, microphone, or screen is captured. **Rede &
 P2P** in Settings retains the real Elixir HTTP/WebSocket diagnostics and
 manual refresh. On Linux, this uses Secret Service, so a desktop password
 vault must be installed and available in the user session.
@@ -86,7 +122,7 @@ stores then reloads an MLS signing key across database opens in a temporary
 database. The test composes OpenMLS's RustCrypto and SQL storage providers;
 the app does not yet create MLS credentials, KeyPackages, or groups.
 
-![Actual 1280 × 800 native Iced familiar screen after the device-to-MLS binding core was added; Secret Service is unavailable in this capture](docs/design/runtime/native-vhs/01-familiar.png)
+![Actual refreshed 1280 × 800 native Iced familiar screen from this transport milestone; Secret Service is unavailable in this capture](docs/design/runtime/native-vhs/01-familiar.png)
 
 ![Actual native Iced home with open scenery and icon-based feature strip, without the frog mage or gnome cutouts](docs/design/runtime/native-vhs/09-home.png)
 
@@ -121,8 +157,9 @@ Assets and font license/provenance notes are in [assets/README.md](assets/README
 - **Local client core:** Rust owns local identity, cryptography, encrypted
   storage, peer transport, and media. The encrypted display profile and
   explicit Ed25519 key storage plus initial opaque encrypted-event storage
-  are implemented; authenticated messaging, integrated inbox/history, direct
-  peer networking, and media remain unbuilt.
+  are implemented. A pinned-device Iroh/QUIC LAN text exchange is available as
+  a one-shot CLI experiment; MLS messaging, integrated inbox/history, and media
+  remain unbuilt.
 - **Server/backend:** Elixir in
   [`slouching-org/slouching-backend`](https://github.com/slouching-org/slouching-backend).
 - **Current boundary:** loopback HTTP status and binary protobuf WebSocket

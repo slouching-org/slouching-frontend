@@ -1,7 +1,8 @@
 # Current frontend slice
 
-**Status:** eleven native Rust/Iced visual-preview screens implemented;
-exact visual parity and product features remain open.
+**Status:** eleven native Rust/Iced visual-preview screens and a direct-LAN
+one-shot Iroh/QUIC text experiment implemented; MLS messaging and product
+pairing remain open.
 
 The frontend's `src/main.rs` owns application state and local transport;
 `src/ui.rs` composes the eleven source-board views with native widgets,
@@ -15,8 +16,9 @@ encrypted SQLite; its random database key is kept in the operating system
 credential store. Linux requires Secret Service in the user session. A
 separate explicit action generates a local Ed25519 device signing key and
 stores its seed in the system credential store; the public key is displayed
-as unverified. Fingerprint/QR derivation, pairing, MLS state, and message
-history remain unimplemented. If the keyring cannot be read, the screen offers
+as unverified. The core can sign the MLS signing key selected for an OpenMLS
+ciphersuite with this long-term device key. Fingerprint/QR derivation, contact
+pairing, MLS groups, and message history remain unimplemented. If the keyring cannot be read, the screen offers
 a retry that reuses an existing key rather than replacing it. The display
 profile is distinct from identity.
 
@@ -24,15 +26,17 @@ The encrypted SQLite schema now includes an event journal for opaque inbound
 and outbound ciphertext, with stable random IDs, envelope metadata, BLAKE3
 ciphertext digests, and duplicate/conflict handling. These storage primitives
 also retain queued, peer-held, received, expired, or failed outbox state and
-load bounded cursor pages for both inbox and outbox. They are not connected to the UI, MLS, or network; only
-trusted protocol code may record a real receipt, so they do not enable
-messaging.
+load bounded cursor pages for both inbox and outbox. They are not connected to
+the UI, MLS, or peer transport; only trusted protocol code may record a real
+receipt.
 
 Every view is labeled as a visual preview. Character scenes and messages
-are examples. Camera/microphone actions explain their unavailable state;
-send, capture, and verification controls cannot perform product operations.
-The app does not enumerate devices, sign protocol messages, send messages,
-join calls, or persist local conversation history. The settings **Rede & P2P** tab exposes
+inside the chat UI are examples. The separate LAN CLI can send one real text
+frame over pinned-device Iroh/QUIC; it does not write to the local event
+journal. Camera/microphone actions explain their unavailable state; send,
+capture, and verification controls in the UI cannot perform product operations.
+The app does not enumerate devices, create MLS messages, join calls, or persist
+local conversation history. The settings **Rede & P2P** tab exposes
 real backend diagnostics separately from the illustrative call routes.
 
 The earlier HTML/CSS/JavaScript preview is retained under
@@ -60,3 +64,12 @@ the copied shared v1 schema. It validates the Elixir role and protocol
 version, then keeps a development transport open with Ping/Pong heartbeats.
 It reports disconnects and retries with bounded backoff. This transport has
 no device authentication, application traffic, or messaging.
+
+The client also has a direct-LAN-only Iroh/QUIC experiment, separate from the
+Elixir diagnostics. Both sides manually pin the other's Ed25519 device public
+key; QUIC TLS authenticates and encrypts the connection. The listener accepts
+one bounded UTF-8 text frame and acknowledges it. This has no relay, address
+lookup, NAT traversal, MLS group, offline delivery, durable history, or chat UI
+integration. See [LAN text transport v1](../transport/lan-text-v1.md) for the
+framing and two-client commands. An automated test launches two separate OS
+processes and checks delivery and rejection of an unpinned peer.

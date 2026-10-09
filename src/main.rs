@@ -2,6 +2,7 @@ use futures_util::{SinkExt, StreamExt};
 use iced::{Element, Task, Theme, task::Handle};
 
 pub mod identity;
+mod peer;
 pub mod storage;
 mod ui;
 use prost::Message as ProstMessage;
@@ -657,6 +658,17 @@ fn capture_after(delay: Duration) -> Task<Message> {
 }
 
 fn main() -> iced::Result {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--lan-listen" || arg == "--lan-send")
+    {
+        if let Err(error) = run_lan_command(&args) {
+            eprintln!("LAN peer error: {error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let size = std::env::var("SLOUCHING_WINDOW_SIZE")
         .ok()
         .and_then(|s| {
@@ -682,6 +694,86 @@ fn main() -> iced::Result {
         .font(include_bytes!("../assets/fonts/jetbrainsmono.ttf").as_slice())
         .window(window)
         .run()
+}
+
+fn run_lan_command(args: &[String]) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("could not start peer runtime: {error}"))?;
+    match args.first().map(String::as_str) {
+        Some("--lan-listen") if args.len() == 4 && args[2] == "--expect-peer" => {
+            let port = args[1]
+                .parse::<u16>()
+                .map_err(|error| format!("invalid listen port: {error}"))?;
+            let expected_peer = parse_peer_id(&args[3])?;
+            let local_identity = storage::load_device_peer_secret_key()?;
+            let listener = runtime.block_on(peer::bind_listener(
+                local_identity,
+                std::net::SocketAddr::from(([0, 0, 0, 0], port)),
+                expected_peer,
+            ))?;
+            println!("Device identity: {}", hex_encode_key(listener.id().as_bytes()));
+            println!("Listening on 0.0.0.0:{port} (direct LAN only)");
+            for address in listener
+                .direct_addresses()
+                .into_iter()
+                .filter(|address| !address.ip().is_unspecified())
+            {
+                println!("Direct endpoint address: {address}");
+            }
+            std::io::Write::flush(&mut std::io::stdout())
+                .map_err(|error| format!("could not flush listener status: {error}"))?;
+            let text = runtime.block_on(listener.receive_once())?;
+            println!("Pinned peer text: {text}");
+            Ok(())
+        }
+        Some("--lan-send")
+            if args.len() == 6 && args[2] == "--expect-peer" && args[4] == "--text" =>
+        {
+            let address = args[1]
+                .parse::<std::net::SocketAddr>()
+                .map_err(|error| format!("invalid peer socket address: {error}"))?;
+            let expected_peer = parse_peer_id(&args[3])?;
+            let local_identity = storage::load_device_peer_secret_key()?;
+            println!(
+                "Device identity: {}",
+                hex_encode_key(local_identity.public().as_bytes())
+            );
+            let acknowledgement = runtime.block_on(peer::send_once(
+                local_identity,
+                expected_peer,
+                address,
+                &args[5],
+            ))?;
+            println!("Peer acknowledgement: {acknowledgement}");
+            Ok(())
+        }
+        _ => Err("usage: --lan-listen <port> --expect-peer <device-public-key-hex> | --lan-send <ip:port> --expect-peer <device-public-key-hex> --text <text>".to_owned()),
+    }
+}
+
+fn parse_peer_id(value: &str) -> Result<iroh::EndpointId, String> {
+    let bytes = hex_decode_key(value)?;
+    iroh::EndpointId::from_bytes(&bytes)
+        .map_err(|error| format!("invalid peer identity key: {error}"))
+}
+
+fn hex_decode_key(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64 {
+        return Err("device public key must be exactly 64 hexadecimal characters".to_owned());
+    }
+    let mut key = [0_u8; 32];
+    for (index, byte) in key.iter_mut().enumerate() {
+        let start = index * 2;
+        *byte = u8::from_str_radix(&value[start..start + 2], 16)
+            .map_err(|_| "device public key must be hexadecimal".to_owned())?;
+    }
+    Ok(key)
+}
+
+fn hex_encode_key(value: &[u8]) -> String {
+    value.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(test)]

@@ -20,6 +20,15 @@ const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
 const PROFILE_SCHEMA_VERSION: u32 = 4;
+type StoredEventEnvelope = (
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    i64,
+    Option<Vec<u8>>,
+    i64,
+);
 
 #[derive(Default)]
 struct OpenMlsJsonCodec;
@@ -428,15 +437,7 @@ fn store_encrypted_event(
     let transaction = connection
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| format!("could not begin local event transaction: {error}"))?;
-    let existing: Option<(
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        Vec<u8>,
-        i64,
-        Option<Vec<u8>>,
-        i64,
-    )> = transaction
+    let existing: Option<StoredEventEnvelope> = transaction
         .query_row(
             "SELECT ciphertext_digest, ciphertext, author_device, group_id, epoch,
                     checkpoint, expires_at_unix
@@ -545,6 +546,24 @@ pub fn create_or_load_identity_public_key() -> Result<[u8; 32], String> {
         }
         Err(error) => Err(format!("could not access the device identity key: {error}")),
     }
+}
+
+/// Loads the existing device identity as an Iroh endpoint key without exposing raw seed bytes.
+pub(crate) fn load_device_peer_secret_key() -> Result<iroh::SecretKey, String> {
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let signing_key = signing_key_from_secret(secret)?;
+    peer_secret_key_from_signing_key(&signing_key)
+}
+
+fn peer_secret_key_from_signing_key(signing_key: &SigningKey) -> Result<iroh::SecretKey, String> {
+    let peer_key = iroh::SecretKey::from_bytes(signing_key.as_bytes());
+    if peer_key.public().as_bytes() != signing_key.verifying_key().as_bytes() {
+        return Err("Iroh endpoint key does not match the device identity".to_owned());
+    }
+    Ok(peer_key)
 }
 
 /// Signs an MLS-key binding with the existing device identity held in the OS keyring.
@@ -858,6 +877,17 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn iroh_endpoint_id_uses_the_pinned_device_public_key() {
+        let device_identity = SigningKey::from_bytes(&[0x61; 32]);
+        let peer_identity = peer_secret_key_from_signing_key(&device_identity)
+            .expect("Iroh should accept the device Ed25519 seed");
+        assert_eq!(
+            peer_identity.public().as_bytes(),
+            device_identity.verifying_key().as_bytes()
+        );
+    }
+
+    #[test]
     fn encrypted_database_migrates_openmls_storage_idempotently() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -895,25 +925,26 @@ mod tests {
                 .expect("OpenMLS signature-key table should be queryable");
             assert_eq!(openmls_table_count, 1);
 
-            let provider = LocalOpenMlsProvider::new(&mut connection);
-            if attempt == 0 {
-                let signer = SignatureKeyPair::new(signature_scheme)
-                    .expect("MLS signature key should be generated");
-                signer
-                    .store(provider.storage())
-                    .expect("MLS signature key should persist through the SQL provider");
-                public_key = Some(signer.to_public_vec());
+            {
+                let provider = LocalOpenMlsProvider::new(&mut connection);
+                if attempt == 0 {
+                    let signer = SignatureKeyPair::new(signature_scheme)
+                        .expect("MLS signature key should be generated");
+                    signer
+                        .store(provider.storage())
+                        .expect("MLS signature key should persist through the SQL provider");
+                    public_key = Some(signer.to_public_vec());
+                }
+                let loaded_signer = SignatureKeyPair::read(
+                    provider.storage(),
+                    public_key
+                        .as_deref()
+                        .expect("MLS public key should be retained for this test"),
+                    signature_scheme,
+                )
+                .expect("persisted MLS signature key should load through the SQL provider");
+                assert_eq!(loaded_signer.public(), public_key.as_deref().unwrap());
             }
-            let loaded_signer = SignatureKeyPair::read(
-                provider.storage(),
-                public_key
-                    .as_deref()
-                    .expect("MLS public key should be retained for this test"),
-                signature_scheme,
-            )
-            .expect("persisted MLS signature key should load through the SQL provider");
-            assert_eq!(loaded_signer.public(), public_key.as_deref().unwrap());
-            drop(provider);
             let signature_key_count: i64 = connection
                 .query_row("SELECT COUNT(*) FROM openmls_signature_keys", [], |row| {
                     row.get(0)
