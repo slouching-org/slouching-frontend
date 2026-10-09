@@ -175,6 +175,7 @@ struct Slouching {
     peer_listen_status: PeerListenStatus,
     peer_send_status: PeerSendStatus,
     peer_transcript: Vec<PeerTranscriptEntry>,
+    peer_history_loaded_for: Option<String>,
     peer_listener_handle: Option<Handle>,
     peer_listener_generation: u64,
     peer_session_commands: Option<tokio::sync::mpsc::Sender<peer::PeerCommand>>,
@@ -230,9 +231,12 @@ enum PeerSendStatus {
 struct PeerTranscriptEntry {
     direction: PeerMessageDirection,
     text: String,
+    persisted: bool,
+    sequence: Option<i64>,
+    transport_id: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PeerMessageDirection {
     Sent,
     Received,
@@ -278,6 +282,7 @@ impl Default for Slouching {
             peer_listen_status: PeerListenStatus::Idle,
             peer_send_status: PeerSendStatus::Idle,
             peer_transcript: Vec::new(),
+            peer_history_loaded_for: None,
             peer_listener_handle: None,
             peer_listener_generation: 0,
             peer_session_commands: None,
@@ -316,12 +321,15 @@ enum Message {
     CopyDeviceKey,
     CopyPeerListenAddress(String),
     PeerPublicKeyChanged(String),
+    PeerHistoryLoaded(String, Result<Vec<storage::StoredDirectMessage>, String>),
     PeerListenPortChanged(String),
     PeerAddressChanged(String),
     PeerDraftChanged(String),
     StartPeerListener,
     StopPeerListener,
     PeerListenEvent(u64, PeerListenEvent),
+    PeerInboundStored(u64, String, Result<storage::StoredDirectMessage, String>),
+    PeerOutboundStored(u64, String, Result<storage::StoredDirectMessage, String>),
     SendPeerText,
     PeerCommandSent(Result<(), String>),
 }
@@ -473,7 +481,10 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             }
         },
         Message::IdentityLoaded(result) => match result {
-            Ok(Some(public_key)) => state.identity_status = IdentityStatus::Ready(public_key),
+            Ok(Some(public_key)) => {
+                state.identity_status = IdentityStatus::Ready(public_key);
+                return request_peer_history(state);
+            }
             Ok(None) => state.identity_status = IdentityStatus::Missing,
             Err(_) => state.identity_status = IdentityStatus::Failed,
         },
@@ -485,6 +496,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             Ok(public_key) => {
                 state.identity_status = IdentityStatus::Ready(public_key);
                 state.identity_key_copied = false;
+                return request_peer_history(state);
             }
             Err(_) => {
                 state.identity_status = IdentityStatus::Failed;
@@ -499,7 +511,59 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         Message::CopyPeerListenAddress(address) => {
             return iced::clipboard::write(address);
         }
-        Message::PeerPublicKeyChanged(value) => state.peer_public_key = value,
+        Message::PeerPublicKeyChanged(value) => {
+            if state.peer_public_key != value {
+                state.peer_public_key = value.clone();
+                state.peer_transcript.clear();
+                state.peer_history_loaded_for = None;
+            }
+            return request_peer_history(state);
+        }
+        Message::PeerHistoryLoaded(peer_key, result) => {
+            if state.peer_history_loaded_for.as_deref() == Some(peer_key.as_str())
+                && state.peer_public_key == peer_key
+            {
+                match result {
+                    Ok(messages) => {
+                        let mut transcript: Vec<PeerTranscriptEntry> = messages
+                            .into_iter()
+                            .map(|message| PeerTranscriptEntry {
+                                direction: match message.direction {
+                                    storage::DirectMessageDirection::Sent => {
+                                        PeerMessageDirection::Sent
+                                    }
+                                    storage::DirectMessageDirection::Received => {
+                                        PeerMessageDirection::Received
+                                    }
+                                },
+                                text: message.text,
+                                persisted: true,
+                                sequence: Some(message.sequence),
+                                transport_id: None,
+                            })
+                            .collect();
+                        for entry in std::mem::take(&mut state.peer_transcript) {
+                            if !transcript
+                                .iter()
+                                .any(|loaded| loaded.sequence == entry.sequence)
+                            {
+                                transcript.push(entry);
+                            }
+                        }
+                        transcript.sort_by_key(|entry| entry.sequence.unwrap_or(i64::MAX));
+                        if transcript.len() > 200 {
+                            transcript.drain(..transcript.len() - 200);
+                        }
+                        state.peer_transcript = transcript;
+                    }
+                    Err(error) => {
+                        state.peer_send_status = PeerSendStatus::Failed(format!(
+                            "Não foi possível carregar o histórico local: {error}"
+                        ));
+                    }
+                }
+            }
+        }
         Message::PeerListenPortChanged(value) => state.peer_listen_port = value,
         Message::PeerAddressChanged(value) => state.peer_address = value,
         Message::PeerDraftChanged(value) => state.peer_draft = value,
@@ -580,9 +644,46 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 PeerListenEvent::SessionCommands(commands) => {
                     state.peer_session_commands = Some(commands);
                 }
-                PeerListenEvent::Session(event) => {
-                    apply_peer_event(state, event);
-                }
+                PeerListenEvent::Session(event) => match event {
+                    peer::PeerEvent::Received { sequence, text } => {
+                        let Ok(peer_id) = parse_peer_id(&state.peer_public_key) else {
+                            state.peer_send_status = PeerSendStatus::Failed(
+                                "Chave do peer inválida; mensagem recebida sem confirmação."
+                                    .to_owned(),
+                            );
+                            return Task::none();
+                        };
+                        let peer_device = *peer_id.as_bytes();
+                        return Task::perform(
+                            store_direct_message_task(
+                                peer_device,
+                                storage::DirectMessageDirection::Received,
+                                text.clone(),
+                            ),
+                            move |result| Message::PeerInboundStored(sequence, text, result),
+                        );
+                    }
+                    peer::PeerEvent::Acknowledged { request_id, text } => {
+                        let Ok(peer_id) = parse_peer_id(&state.peer_public_key) else {
+                            state.peer_pending_sends.remove(&request_id);
+                            state.peer_send_status = PeerSendStatus::Failed(
+                                "Peer confirmou a entrega, mas a chave do peer está inválida."
+                                    .to_owned(),
+                            );
+                            return Task::none();
+                        };
+                        let peer_device = *peer_id.as_bytes();
+                        return Task::perform(
+                            store_direct_message_task(
+                                peer_device,
+                                storage::DirectMessageDirection::Sent,
+                                text.clone(),
+                            ),
+                            move |result| Message::PeerOutboundStored(request_id, text, result),
+                        );
+                    }
+                    event => apply_peer_event(state, event),
+                },
                 PeerListenEvent::Failed(error) => {
                     state.peer_listener_handle = None;
                     state.peer_session_commands = None;
@@ -598,6 +699,46 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             }
         }
         Message::PeerListenEvent(_, _) => {}
+        Message::PeerInboundStored(sequence, text, result) => match result {
+            Ok(stored) => {
+                apply_peer_event(state, peer::PeerEvent::Received { sequence, text });
+                if let Some(entry) = state.peer_transcript.iter_mut().rev().find(|entry| {
+                    entry.direction == PeerMessageDirection::Received
+                        && entry.transport_id == Some(sequence)
+                }) {
+                    entry.sequence = Some(stored.sequence);
+                    entry.persisted = true;
+                    entry.transport_id = None;
+                }
+            }
+            Err(error) => {
+                state.peer_send_status = PeerSendStatus::Failed(format!(
+                    "Mensagem recebida, mas não foi salva localmente; ACK não enviado: {error}"
+                ));
+                if let Some(commands) = state.peer_session_commands.as_ref() {
+                    let _ = commands.try_send(peer::PeerCommand::Disconnect);
+                }
+            }
+        },
+        Message::PeerOutboundStored(request_id, text, result) => match result {
+            Ok(stored) => {
+                apply_peer_event(state, peer::PeerEvent::Acknowledged { request_id, text });
+                if let Some(entry) = state.peer_transcript.iter_mut().rev().find(|entry| {
+                    entry.direction == PeerMessageDirection::Sent
+                        && entry.transport_id == Some(request_id)
+                }) {
+                    entry.sequence = Some(stored.sequence);
+                    entry.persisted = true;
+                    entry.transport_id = None;
+                }
+            }
+            Err(error) => {
+                state.peer_pending_sends.remove(&request_id);
+                state.peer_send_status = PeerSendStatus::Failed(format!(
+                    "Peer confirmou a entrega, mas o histórico local falhou: {error}"
+                ));
+            }
+        },
         Message::SendPeerText => {
             if !matches!(state.identity_status, IdentityStatus::Ready(_)) {
                 state.peer_send_status = PeerSendStatus::Failed(
@@ -890,6 +1031,26 @@ async fn load_profile_task() -> Result<Option<storage::LocalProfile>, String> {
         .map_err(|error| format!("local profile task failed: {error}"))?
 }
 
+async fn load_direct_history_task(
+    peer_device: [u8; 32],
+) -> Result<Vec<storage::StoredDirectMessage>, String> {
+    tokio::task::spawn_blocking(move || storage::list_direct_messages(peer_device, 200))
+        .await
+        .map_err(|error| format!("direct history task failed: {error}"))?
+}
+
+async fn store_direct_message_task(
+    peer_device: [u8; 32],
+    direction: storage::DirectMessageDirection,
+    text: String,
+) -> Result<storage::StoredDirectMessage, String> {
+    tokio::task::spawn_blocking(move || {
+        storage::store_direct_message(peer_device, direction, &text)
+    })
+    .await
+    .map_err(|error| format!("direct history task failed: {error}"))?
+}
+
 async fn save_profile_task(profile: storage::LocalProfile) -> Result<(), String> {
     tokio::task::spawn_blocking(move || storage::save_profile(&profile))
         .await
@@ -1023,6 +1184,9 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
             state.peer_transcript.push(PeerTranscriptEntry {
                 direction: PeerMessageDirection::Received,
                 text,
+                persisted: false,
+                sequence: None,
+                transport_id: Some(sequence),
             });
             if let Some(commands) = state.peer_session_commands.as_ref() {
                 let _ = commands.try_send(peer::PeerCommand::AcceptInbound { sequence });
@@ -1034,6 +1198,9 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
                 state.peer_transcript.push(PeerTranscriptEntry {
                     direction: PeerMessageDirection::Sent,
                     text,
+                    persisted: false,
+                    sequence: None,
+                    transport_id: Some(request_id),
                 });
                 if draft_matches_sent_text {
                     state.peer_draft.clear();
@@ -1081,6 +1248,28 @@ async fn load_peer_secret_key_task() -> Result<iroh::SecretKey, String> {
 
 fn view(state: &Slouching) -> Element<'_, Message> {
     ui::view(state)
+}
+
+fn request_peer_history(state: &mut Slouching) -> Task<Message> {
+    let peer_key = state.peer_public_key.clone();
+    if peer_key.is_empty()
+        || state.peer_history_loaded_for.as_deref() == Some(peer_key.as_str())
+        || !matches!(state.identity_status, IdentityStatus::Ready(_))
+    {
+        return Task::none();
+    }
+    let Ok(peer_id) = parse_peer_id(&peer_key) else {
+        return Task::none();
+    };
+    if matches!(state.identity_status, IdentityStatus::Ready(local) if peer_is_local(&peer_id, &local))
+    {
+        return Task::none();
+    }
+    state.peer_history_loaded_for = Some(peer_key.clone());
+    let peer_device = *peer_id.as_bytes();
+    Task::perform(load_direct_history_task(peer_device), move |result| {
+        Message::PeerHistoryLoaded(peer_key, result)
+    })
 }
 
 fn capture_after(delay: Duration) -> Task<Message> {
@@ -1291,7 +1480,7 @@ mod tests {
         );
         assert!(matches!(
             state.peer_transcript.as_slice(),
-            [PeerTranscriptEntry { direction: PeerMessageDirection::Received, text }] if text == "incoming"
+            [PeerTranscriptEntry { direction: PeerMessageDirection::Received, text, .. }] if text == "incoming"
         ));
         assert!(matches!(
             command_rx.try_recv(),
@@ -1309,8 +1498,8 @@ mod tests {
         assert!(matches!(
             state.peer_transcript.as_slice(),
             [
-                PeerTranscriptEntry { direction: PeerMessageDirection::Received, text: incoming },
-                PeerTranscriptEntry { direction: PeerMessageDirection::Sent, text: outgoing }
+                PeerTranscriptEntry { direction: PeerMessageDirection::Received, text: incoming, .. },
+                PeerTranscriptEntry { direction: PeerMessageDirection::Sent, text: outgoing, .. }
             ] if incoming == "incoming" && outgoing == "outgoing"
         ));
 
@@ -1346,7 +1535,7 @@ mod tests {
                 }),
             ),
         );
-        assert_eq!(state.peer_transcript.len(), 3);
+        assert_eq!(state.peer_transcript.len(), 2);
     }
 
     #[test]

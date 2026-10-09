@@ -1,7 +1,7 @@
 # Current frontend slice
 
-**Status:** eleven native Rust/Iced screens, including a user-facing direct-LAN
-Iroh/QUIC text flow with a session-only transcript; MLS messaging and product
+**Status:** eleven native Rust/Iced screens, including direct-LAN Iroh/QUIC
+text with per-peer local history in SQLCipher; MLS messaging and product
 pairing remain open.
 
 The frontend's `src/main.rs` owns application state and local transport;
@@ -12,8 +12,9 @@ gallery reaches every view. Home actions open the lobby preview; invitation
 fields edit in-memory values. The chat screen manually pins a peer device key,
 starts a pinned direct listener or connects to a pinned LAN address, and keeps
 a bidirectional session open for multiple messages with live receive and ACK
-states. Received text is added to memory before ACK; sent text appears only
-after ACK. Familiar selection, settings and share-source tabs, and the interface
+states. Received text is saved in SQLCipher before ACK; sent text is saved
+after ACK. The app reloads the newest 200 messages for the pinned peer.
+Familiar selection, settings and share-source tabs, and the interface
 texture toggle work locally. The familiar screen saves only the display name
 and familiar in SQLCipher
 encrypted SQLite; its random database key is kept in the operating system
@@ -28,7 +29,7 @@ state and indexes its creator as designated committer. No UI publishes
 packages or exposes group creation. Core APIs admit a device-bound KeyPackage,
 merge its Commit into local state, return Commit/Welcome/ratchet-tree bytes, and
 process a Welcome on the joining device; network delivery, MLS application messaging, fingerprint/QR
-derivation, contact pairing, and message history remain unimplemented. If the keyring cannot be read, the screen offers
+derivation, contact pairing, and MLS group history remain unimplemented. If the keyring cannot be read, the screen offers
 a retry that reuses an existing key rather than replacing it. The display
 profile is distinct from identity.
 
@@ -41,11 +42,12 @@ the UI, MLS, or peer transport; only trusted protocol code may record a real
 receipt.
 
 Character scenes and call views remain visual previews. The chat screen sends
-and receives actual multiple-message sessions over pinned-device Iroh/QUIC; it
-does not write to the local event journal. Camera/microphone actions explain their
+and receives actual multiple-message sessions over pinned-device Iroh/QUIC and
+stores its transcript in a separate per-peer table; it does not write to the
+local event journal. Camera/microphone actions explain their
 unavailable state; verification controls still do not verify MLS membership.
-The app does not enumerate devices, create MLS messages, join calls, or persist
-local conversation history. The settings **Rede & P2P** tab exposes
+The app does not enumerate devices, create MLS messages, or join calls. The
+settings **Rede & P2P** tab exposes
 real backend diagnostics separately from the illustrative call routes.
 
 The earlier HTML/CSS/JavaScript preview is retained under
@@ -77,10 +79,10 @@ no device authentication, application traffic, or messaging.
 The chat screen uses a direct-LAN-only Iroh/QUIC transport, separate from the
 Elixir diagnostics. Both sides manually pin the other's Ed25519 device public
 key; QUIC authenticates and encrypts the connection. One bidirectional stream
-exchanges multiple bounded UTF-8 messages with sequence ACKs. ACK means the
-peer added text to its in-memory transcript, not that it read the message. Sent
-and received messages remain only in application memory. This has no relay,
-address lookup, NAT traversal, MLS group, offline delivery, durable history, or trusted contact
-roster. See [LAN text transport v2](../transport/lan-text-v2.md) for framing
+exchanges multiple bounded UTF-8 messages with sequence ACKs. The receiver
+saves inbound text to SQLCipher before ACK; the sender saves after ACK. This
+local transcript is per peer and is not group/MLS history or a synced inbox.
+The transport has no relay, address lookup, NAT traversal, offline delivery,
+or trusted contact roster. See [LAN text transport v2](../transport/lan-text-v2.md) for framing
 and use. Automated tests launch separate OS processes to check multiple messages
 in both directions, wrong-pin rejection, and pending-send status at disconnect.

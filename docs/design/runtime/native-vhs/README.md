@@ -23,8 +23,10 @@ storage primitives are not connected to the screens, MLS, or delivery and do
 not enable chat.
 
 Opening the encrypted database composes OpenMLS RustCrypto with its versioned
-SQLite storage schema through the same SQLCipher connection. No MLS client
-state, credentials, key packages, or groups are created yet.
+SQLite storage schema through the same SQLCipher connection. The Rust core
+persists MLS signing keys and groups, creates device-bound KeyPackages, admits
+members, and processes Welcome messages; no group or invitation flow is
+exposed in the UI.
 
 The storage test uses a temporary SQLCipher database, confirms that opening it
 twice preserves the OpenMLS schema, and composes the RustCrypto and SQL
@@ -32,11 +34,11 @@ providers to save and reload an MLS signature key. It creates no product MLS
 credential or group.
 
 The familiar-screen capture was refreshed after adding the core's signed
-device-to-MLS key binding primitive. The chat capture was refreshed with the
-persistent direct-LAN session UI. This capture's system Secret Service is
-unavailable, so the identity action is shown and sending/listening are gated.
-The key binding primitive is not connected to MLS credentials or peer
-verification.
+device-to-MLS key binding primitive. The chat capture now shows the per-peer
+SQLCipher history UI. The capture's Secret Service is unavailable, so the
+identity action is shown and sending/listening are gated; no conversation data
+is present. The key binding primitive does not verify contacts or provide
+pairing.
 
 The home view keeps the supplied night scenery and call controls, with an
 icon-based feature strip. Its frog mage and gnome foreground cutouts have been

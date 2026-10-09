@@ -64,14 +64,15 @@ path.
    after an ACK; received text appears live after the pinned identity check.
 
 The listener stays available through the session. Either side can use
-**Desconectar sessão** to close it; start a new session to reconnect. ACK
-confirms that the peer accepted text into its in-memory transcript, not that
-the user read it. The transcript contains only actual messages from the
-current app session and disappears when the app closes. This is pairwise QUIC
-channel encryption and pinned device identity, not MLS messaging, contact
-verification, or a durable chat. There is no address discovery, relay,
-cross-NAT support, retry/offline delivery, or media. Allow the chosen UDP port
-through each device's local firewall. The automated
+**Desconectar sessão** to close it; start a new session to reconnect. The
+receiver saves an inbound message to its encrypted local history before ACK;
+the sender saves an outbound message after receiving ACK. ACK confirms
+acceptance into the receiver's local transcript, not that the user read it.
+History stays on each device and is scoped to the pinned peer key; it is not
+synchronized. This is pairwise QUIC channel encryption and pinned device
+identity, not MLS messaging or contact verification. There is no address
+discovery, relay, cross-NAT support, retry/offline delivery, or media. Allow
+the chosen UDP port through each device's local firewall. The automated
 `cargo test --test peer_process` launches separate OS processes, exchanges
 multiple messages in both directions over one connection, checks wrong-pin
 rejection, and verifies a pending send is reported as unknown on disconnect.
@@ -116,8 +117,8 @@ deduplicates identical event IDs and rejects reuse with different ciphertext
 or envelope metadata. Outbound rows have local queued/held/received/expired/
 failed states and bounded cursor-paginated reads; the inbox can also be read
 in bounded pages. No transport or authenticated receipt feeds those states
-yet. The direct-LAN session transcript is separate and is not persisted to this
-journal; MLS and durable inbox/outbox UI remain unimplemented.
+yet. The direct-LAN transcript is persisted in a separate per-peer table, not
+this journal; MLS and durable inbox/outbox UI remain unimplemented.
 
 Opening the same SQLCipher database now composes OpenMLS RustCrypto with the
 SQLite storage provider and initializes its versioned schema. The event
@@ -176,8 +177,8 @@ Assets and font license/provenance notes are in [assets/README.md](assets/README
   storage, peer transport, and media. The encrypted display profile and
   explicit Ed25519 key storage plus initial opaque encrypted-event storage
   are implemented. A pinned-device Iroh/QUIC LAN text exchange is available
-  from the Iced UI with a persistent bidirectional session and session-only
-  transcript; MLS messaging, integrated inbox/history, and media remain unbuilt.
+  from the Iced UI with a persistent bidirectional session and per-peer history
+  in SQLCipher; MLS messaging, event-journal integration, and media remain unbuilt.
 - **Server/backend:** Elixir in
   [`slouching-org/slouching-backend`](https://github.com/slouching-org/slouching-backend).
 - **Current boundary:** loopback HTTP status and binary protobuf WebSocket

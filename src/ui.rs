@@ -1435,7 +1435,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
         crate::PeerSendStatus::AwaitingAck => l.label("Aguardando ACK do peer…", 11.0, GOLD).into(),
         crate::PeerSendStatus::Sent => l
             .label(
-                "ACK recebido; peer aceitou a mensagem no transcript desta sessão.",
+                "ACK recebido e histórico salvo localmente; isso não confirma leitura.",
                 11.0,
                 GREEN,
             )
@@ -1451,7 +1451,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
     let transcript: Element<'_, Message> = if state.peer_transcript.is_empty() {
         container(
             l.label(
-                "Nenhuma mensagem entregue nesta sessão. As mensagens aparecerão aqui somente após o transporte confirmar o envio ou o recebimento.",
+                "Sem mensagens para este peer. O histórico mostra apenas mensagens recebidas ou confirmadas e salvas neste dispositivo.",
                 12.0,
                 MUTED,
             )
@@ -1467,9 +1467,19 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 .peer_transcript
                 .iter()
                 .fold(column![].spacing(l.px(12.0)), |entries, entry| {
-                    let (label, outgoing) = match entry.direction {
-                        crate::PeerMessageDirection::Sent => ("Enviada · sessão atual", true),
-                        crate::PeerMessageDirection::Received => ("Recebida · sessão atual", false),
+                    let (label, outgoing) = match (entry.direction, entry.persisted) {
+                        (crate::PeerMessageDirection::Sent, true) => {
+                            ("Enviada · histórico local", true)
+                        }
+                        (crate::PeerMessageDirection::Received, true) => {
+                            ("Recebida · histórico local", false)
+                        }
+                        (crate::PeerMessageDirection::Sent, false) => {
+                            ("Enviada · sessão atual", true)
+                        }
+                        (crate::PeerMessageDirection::Received, false) => {
+                            ("Recebida · sessão atual", false)
+                        }
                     };
                     entries.push(bubble(l, &entry.text, label, outgoing))
                 });
@@ -1483,7 +1493,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
             ]
             .spacing(l.px(5.0)),
             space().width(Fill),
-            l.label("SEM HISTÓRICO · SÓ ESTA SESSÃO", 10.0, GOLD)
+            l.label("HISTÓRICO LOCAL CIFRADO POR PEER", 10.0, GOLD)
         ]
         .align_y(iced::Center),
         rule(LINE, 1.0),
@@ -1492,7 +1502,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
         rule(LINE, 1.0),
         transcript,
         l.label(
-            "Canal QUIC cifrado com identidade do dispositivo pinada. Sem MLS, descoberta, relay, NAT traversal ou armazenamento; ACK confirma inclusão em memória, não leitura.",
+            "QUIC cifra a sessão com a identidade pinada. O histórico fica no SQLCipher local deste dispositivo; ACK confirma recebimento antes do salvamento local do remetente, não leitura. Sem MLS, relay ou NAT traversal.",
             10.0,
             MUTED
         )

@@ -23,7 +23,8 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 5;
+const PROFILE_SCHEMA_VERSION: u32 = 6;
+const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 type StoredEventEnvelope = (
     Vec<u8>,
     Vec<u8>,
@@ -124,6 +125,141 @@ pub struct StoredOutboundEvent {
 pub struct StoredInboundEvent {
     pub sequence: i64,
     pub event: EncryptedEvent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectMessageDirection {
+    Sent,
+    Received,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredDirectMessage {
+    pub sequence: i64,
+    pub direction: DirectMessageDirection,
+    pub text: String,
+}
+
+/// Saves a delivered direct-LAN message in the per-device SQLCipher database.
+pub fn store_direct_message(
+    peer_device: [u8; 32],
+    direction: DirectMessageDirection,
+    text: &str,
+) -> Result<StoredDirectMessage, String> {
+    let mut connection = open_local_database()?;
+    store_direct_message_in(&mut connection, peer_device, direction, text)
+}
+
+/// Loads the newest local messages with a peer, in display order.
+pub fn list_direct_messages(
+    peer_device: [u8; 32],
+    limit: usize,
+) -> Result<Vec<StoredDirectMessage>, String> {
+    if !(1..=500).contains(&limit) {
+        return Err("direct message history page must be between 1 and 500".to_owned());
+    }
+    let connection = open_local_database()?;
+    list_direct_messages_in(&connection, peer_device, limit)
+}
+
+fn list_direct_messages_in(
+    connection: &Connection,
+    peer_device: [u8; 32],
+    limit: usize,
+) -> Result<Vec<StoredDirectMessage>, String> {
+    if !(1..=500).contains(&limit) {
+        return Err("direct message history page must be between 1 and 500".to_owned());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT sequence, direction, text FROM (
+                 SELECT sequence, direction, text FROM local_direct_messages
+                 WHERE peer_device = ?1 ORDER BY sequence DESC LIMIT ?2
+             ) ORDER BY sequence ASC",
+        )
+        .map_err(|error| format!("could not prepare direct message history query: {error}"))?;
+    let rows = statement
+        .query_map(params![peer_device.as_slice(), limit as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("could not query direct message history: {error}"))?;
+    rows.map(|row| {
+        let (sequence, direction, text) =
+            row.map_err(|error| format!("could not read direct message history: {error}"))?;
+        Ok(StoredDirectMessage {
+            sequence,
+            direction: DirectMessageDirection::try_from(direction.as_str())?,
+            text,
+        })
+    })
+    .collect()
+}
+
+fn store_direct_message_in(
+    connection: &mut Connection,
+    peer_device: [u8; 32],
+    direction: DirectMessageDirection,
+    text: &str,
+) -> Result<StoredDirectMessage, String> {
+    if text.trim().is_empty() || text.len() > 16 * 1024 {
+        return Err("direct message must contain 1 to 16384 UTF-8 bytes".to_owned());
+    }
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| {
+            format!("could not begin encrypted direct history transaction: {error}")
+        })?;
+    transaction
+        .execute(
+            "INSERT INTO local_direct_messages (peer_device, direction, text)
+             VALUES (?1, ?2, ?3)",
+            params![peer_device.as_slice(), direction.as_str(), text],
+        )
+        .map_err(|error| format!("could not save direct message in encrypted history: {error}"))?;
+    let sequence = transaction.last_insert_rowid();
+    transaction
+        .execute(
+            "DELETE FROM local_direct_messages
+             WHERE peer_device = ?1 AND sequence NOT IN (
+                 SELECT sequence FROM local_direct_messages
+                 WHERE peer_device = ?1 ORDER BY sequence DESC LIMIT ?2
+             )",
+            params![peer_device.as_slice(), MAX_DIRECT_HISTORY_PER_PEER],
+        )
+        .map_err(|error| format!("could not enforce direct history limit: {error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("could not commit encrypted direct history: {error}"))?;
+    Ok(StoredDirectMessage {
+        sequence,
+        direction,
+        text: text.to_owned(),
+    })
+}
+
+impl DirectMessageDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::Received => "received",
+        }
+    }
+}
+
+impl TryFrom<&str> for DirectMessageDirection {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "sent" => Ok(Self::Sent),
+            "received" => Ok(Self::Received),
+            _ => Err("saved direct message has an invalid direction".to_owned()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1264,6 +1400,21 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
             )
             .map_err(|error| format!("could not create local MLS group index: {error}"))?;
     }
+    if version < 6 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE local_direct_messages (
+                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                     peer_device BLOB NOT NULL CHECK (length(peer_device) = 32),
+                     direction TEXT NOT NULL CHECK (direction IN ('sent', 'received')),
+                     text TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) BETWEEN 1 AND 16384)
+                 );
+                 CREATE INDEX local_direct_messages_by_peer
+                     ON local_direct_messages (peer_device, sequence);
+                 PRAGMA user_version = 6;",
+            )
+            .map_err(|error| format!("could not create encrypted direct history: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -1333,6 +1484,118 @@ mod tests {
             peer_identity.public().as_bytes(),
             device_identity.verifying_key().as_bytes()
         );
+    }
+
+    #[test]
+    fn direct_message_history_is_encrypted_peer_scoped_and_survives_reopen() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-direct-history-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary database directory should be created");
+        let path = directory.join("profile.sqlite3");
+        let key = [0x35; PROFILE_DB_KEY_LEN];
+        let peer = [0x61; 32];
+        let another_peer = [0x62; 32];
+
+        {
+            let mut connection = open_database(&path, &key)
+                .expect("encrypted database should initialize with local history");
+            let cipher_version: String = connection
+                .query_row("PRAGMA cipher_version", [], |row| row.get(0))
+                .expect("database should use SQLCipher");
+            assert!(!cipher_version.is_empty());
+            store_direct_message_in(
+                &mut connection,
+                peer,
+                DirectMessageDirection::Received,
+                "hello from peer",
+            )
+            .expect("inbound message should persist");
+            store_direct_message_in(
+                &mut connection,
+                peer,
+                DirectMessageDirection::Sent,
+                "hello back",
+            )
+            .expect("outbound message should persist");
+            store_direct_message_in(
+                &mut connection,
+                another_peer,
+                DirectMessageDirection::Received,
+                "separate peer",
+            )
+            .expect("another peer history should persist separately");
+            assert!(store_direct_message_in(
+                &mut connection,
+                peer,
+                DirectMessageDirection::Sent,
+                "   ",
+            )
+            .is_err());
+        }
+
+        let connection = open_database(&path, &key).expect("encrypted history should reopen");
+        let history = list_direct_messages_in(&connection, peer, 200)
+            .expect("history should load for its pinned peer");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].direction, DirectMessageDirection::Received);
+        assert_eq!(history[0].text, "hello from peer");
+        assert_eq!(history[1].direction, DirectMessageDirection::Sent);
+        assert_eq!(history[1].text, "hello back");
+        assert!(
+            list_direct_messages_in(&connection, another_peer, 200)
+                .expect("another peer's history should load separately")
+                .iter()
+                .all(|message| message.text == "separate peer")
+        );
+
+        fs::remove_dir_all(directory).expect("temporary database files should be removed");
+    }
+
+    #[test]
+    fn direct_message_history_retains_only_the_newest_per_peer_limit() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-direct-history-limit-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary database directory should be created");
+        let path = directory.join("profile.sqlite3");
+        let key = [0x34; PROFILE_DB_KEY_LEN];
+        let peer = [0x63; 32];
+        let mut connection = open_database(&path, &key)
+            .expect("encrypted database should initialize with local history");
+        for index in 0..=MAX_DIRECT_HISTORY_PER_PEER {
+            store_direct_message_in(
+                &mut connection,
+                peer,
+                DirectMessageDirection::Sent,
+                &format!("message {index}"),
+            )
+            .expect("message should save and enforce the peer history limit");
+        }
+        let history = list_direct_messages_in(&connection, peer, 500)
+            .expect("bounded history page should load");
+        assert_eq!(history.len(), 500);
+        assert_eq!(history[0].text, "message 501");
+        assert_eq!(history[499].text, "message 1000");
+        let retained: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM local_direct_messages WHERE peer_device = ?1",
+                [peer.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("peer history row count should be queryable");
+        assert_eq!(retained, MAX_DIRECT_HISTORY_PER_PEER);
+        fs::remove_dir_all(directory).expect("temporary database files should be removed");
     }
 
     #[test]

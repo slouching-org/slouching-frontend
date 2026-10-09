@@ -8,7 +8,7 @@ Its Elixir server/backend core and Rust/Iced client direction are retained.
 | --- | --- | --- |
 | Desktop UI | Rust 2024 + pinned Iced 0.14.0 | Native state in `src/main.rs` and eleven screens in `src/ui.rs` |
 | Rendering | Iced/wgpu | Eleven native views with images, SVG icons, and canvas texture; direct-LAN chat is functional, call/media screens remain previews |
-| Local client core | Rust identity, cryptography, storage, transport, media | SQLCipher profile, Ed25519 device identity, OpenMLS key persistence, and opaque encrypted-event/outbox storage are implemented; the Iced chat supports pinned-device direct-LAN Iroh/QUIC text with a session-only transcript; MLS messaging, product pairing, durable history integration, and media remain pending |
+| Local client core | Rust identity, cryptography, storage, transport, media | SQLCipher profile, per-peer direct-chat history, Ed25519 device identity, OpenMLS key persistence, and opaque encrypted-event/outbox storage are implemented; MLS messaging, product pairing, event-journal integration, and media remain pending |
 | Server/backend | Elixir, separately versioned backend repo | Development status and protobuf handshake implemented |
 | State boundary | Versioned protocol | Asynchronous loopback HTTP status and binary protobuf WebSocket handshake v1 integrated; production boundary pending |
 | Browser UI | HTML/CSS/JavaScript | Historical visual prototype in `prototypes/web/`; not product runtime |

@@ -35,8 +35,8 @@ session. Each frame has a 19-byte header followed by a payload when present:
 
 Empty and oversized DATA, invalid UTF-8, unknown types or versions, invalid
 sequence order, nonempty ACK bodies, and unsolicited ACKs terminate the session.
-ACK carries the DATA sequence and no payload. A receiver sends ACK after adding
-the message to its in-memory transcript. ACK confirms acceptance into memory,
+ACK carries the DATA sequence and no payload. A receiver sends ACK only after
+saving the message to its local SQLCipher history. ACK confirms local storage,
 not that the user read it. Each direction allows at most 16 pending messages;
 writes are serialized. CLOSE and CLOSE_ACK provide explicit shutdown. Pending
 sends without ACK at disconnect have unknown delivery status and are never
@@ -53,8 +53,9 @@ displayed LAN endpoint address and port. On the sending device, enter that
 address, type the first message, and click **Conectar e enviar**. After the
 session connects, either side can send more messages over the same connection;
 incoming messages appear live. **Desconectar sessão** ends it. A new session can
-be started by either side. The transcript is session-only and is cleared when
-the app closes.
+be started by either side. The app reloads the latest 200 messages for the
+pinned peer and stores new messages in its per-device SQLCipher database. The
+history is local to that device and is not synchronized.
 
 Allow the selected UDP port through each device's local firewall. Wildcard
 addresses such as `0.0.0.0` cannot be shared. If no LAN address is announced,
@@ -69,10 +70,12 @@ send is pending to verify the delivery status remains unknown.
 
 ## Limits
 
-This does not create MLS credentials, KeyPackages, groups, or product messaging.
-It does not persist messages, retry delivery, support offline peers, discover
-addresses, traverse NAT, or fall back to a relay. It is direct-LAN-only pinned
-device transport, not trusted contact pairing or cross-NAT messaging.
+This does not create MLS credentials, KeyPackages, groups, or group messaging.
+The local direct transcript is not an MLS event journal and does not provide
+offline delivery or cross-device history. The transport does not retry
+delivery, support offline peers, discover addresses, traverse NAT, or fall
+back to a relay. It is direct-LAN-only pinned device transport, not trusted
+contact pairing or cross-NAT messaging.
 
 The older `--lan-listen` and `--lan-send` command-line smoke helpers remain
 available for diagnostics. The supported user-facing flow is in the Iced app.
