@@ -20,6 +20,46 @@ const PROFILE_SCHEMA_VERSION: u32 = 3;
 #[derive(Default)]
 struct OpenMlsJsonCodec;
 
+#[cfg(test)]
+use openmls::prelude::OpenMlsProvider;
+#[cfg(test)]
+use openmls_rust_crypto::RustCrypto;
+
+#[cfg(test)]
+struct LocalOpenMlsProvider<'connection> {
+    crypto: RustCrypto,
+    storage: SqliteStorageProvider<OpenMlsJsonCodec, &'connection Connection>,
+}
+
+#[cfg(test)]
+impl<'connection> LocalOpenMlsProvider<'connection> {
+    fn new(connection: &'connection Connection) -> Self {
+        Self {
+            crypto: RustCrypto::default(),
+            storage: SqliteStorageProvider::new(connection),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<'connection> OpenMlsProvider for LocalOpenMlsProvider<'connection> {
+    type CryptoProvider = RustCrypto;
+    type RandProvider = RustCrypto;
+    type StorageProvider = SqliteStorageProvider<OpenMlsJsonCodec, &'connection Connection>;
+
+    fn storage(&self) -> &Self::StorageProvider {
+        &self.storage
+    }
+
+    fn crypto(&self) -> &Self::CryptoProvider {
+        &self.crypto
+    }
+
+    fn rand(&self) -> &Self::RandProvider {
+        &self.crypto
+    }
+}
+
 impl OpenMlsCodec for OpenMlsJsonCodec {
     type Error = serde_json::Error;
 
@@ -712,8 +752,14 @@ mod tests {
         fs::create_dir_all(&directory).expect("temporary database directory should be created");
         let path = directory.join("profile.sqlite3");
         let key = [0x5a; PROFILE_DB_KEY_LEN];
+        use openmls::prelude::Ciphersuite;
+        use openmls_basic_credential::SignatureKeyPair;
 
-        for _ in 0..2 {
+        let signature_scheme =
+            Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519.signature_algorithm();
+        let mut public_key = None;
+
+        for attempt in 0..2 {
             let connection = open_database(&path, &key)
                 .expect("encrypted profile and OpenMLS migrations should succeed");
             let cipher_version: String = connection
@@ -730,6 +776,32 @@ mod tests {
                 )
                 .expect("OpenMLS signature-key table should be queryable");
             assert_eq!(openmls_table_count, 1);
+
+            let provider = LocalOpenMlsProvider::new(&connection);
+            if attempt == 0 {
+                let signer = SignatureKeyPair::new(signature_scheme)
+                    .expect("MLS signature key should be generated");
+                signer
+                    .store(provider.storage())
+                    .expect("MLS signature key should persist through the SQL provider");
+                public_key = Some(signer.to_public_vec());
+            }
+            let loaded_signer = SignatureKeyPair::read(
+                provider.storage(),
+                public_key
+                    .as_deref()
+                    .expect("MLS public key should be retained for this test"),
+                signature_scheme,
+            )
+            .expect("persisted MLS signature key should load through the SQL provider");
+            assert_eq!(loaded_signer.public(), public_key.as_deref().unwrap());
+            let signature_key_count: i64 = connection
+                .query_row("SELECT COUNT(*) FROM openmls_signature_keys", [], |row| {
+                    row.get(0)
+                })
+                .expect("OpenMLS signature keys should be queryable");
+            assert_eq!(signature_key_count, 1);
+            drop(provider);
         }
 
         fs::remove_dir_all(directory).expect("temporary database files should be removed");

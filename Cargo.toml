@@ -25,5 +25,9 @@ openmls_sqlite_storage = "=0.3.0"
 rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
 zeroize = "=1.9.1"
 
+[dev-dependencies]
+openmls_basic_credential = "=0.6.0"
+openmls_rust_crypto = "=0.6.0"
+
 [build-dependencies]
 prost-build = "=0.14.4"
