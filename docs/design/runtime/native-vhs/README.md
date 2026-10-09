@@ -31,6 +31,10 @@ twice preserves the OpenMLS schema, and composes the RustCrypto and SQL
 providers to save and reload an MLS signature key. It creates no product MLS
 credential or group.
 
+The familiar-screen capture was refreshed after adding the core's signed
+device-to-MLS key binding primitive. The primitive does not change the UI and
+is not yet connected to MLS credentials or peer verification.
+
 The home view keeps the supplied night scenery and call controls, with an
 icon-based feature strip. Its frog mage and gnome foreground cutouts have been
 removed to keep the scene open.

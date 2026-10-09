@@ -51,8 +51,12 @@ SQLCipher encrypted SQLite; the database key is stored in the operating system
 credential store. Saving fails closed when that store is unavailable. The
 screen can also explicitly create and retain an Ed25519 device signing key in
 the system credential store. It displays the public key as unverified; no
-fingerprint format, contact pairing, or MLS state is implemented. The local
-profile remains separate from that key. Every view is labeled as a visual
+fingerprint format, contact pairing, or MLS state is implemented. The core can
+sign a versioned binding from that durable device key to an MLS signing
+public key, including its signature-scheme code, without returning the private
+seed. This primitive is not connected to an MLS credential, key package, peer
+verification, or pairing. The local profile remains separate from that key.
+Every view is labeled as a visual
 preview: character images, messages, and comparison words are illustrative.
 No message is sent, and no camera, microphone, or screen is captured. **Rede &
 P2P** in Settings retains the real Elixir HTTP/WebSocket diagnostics and
@@ -78,7 +82,7 @@ stores then reloads an MLS signing key across database opens in a temporary
 database. The test composes OpenMLS's RustCrypto and SQL storage providers;
 the app does not yet create MLS credentials or groups.
 
-![Native familiar screen showing local profile and identity keyring status, with a retry action when the system keyring is unavailable](docs/design/runtime/native-vhs/01-familiar.png)
+![Actual 1280 × 800 native Iced familiar screen after the device-to-MLS binding core was added; Secret Service is unavailable in this capture](docs/design/runtime/native-vhs/01-familiar.png)
 
 ![Actual native Iced home with open scenery and icon-based feature strip, without the frog mage or gnome cutouts](docs/design/runtime/native-vhs/09-home.png)
 
