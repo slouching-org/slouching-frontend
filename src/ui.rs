@@ -302,6 +302,7 @@ fn screen(state: &Slouching, l: Layout) -> Element<'_, Message> {
         Screen::Connecting => connecting(l),
         Screen::Share => sharing(state, l),
         Screen::Chat => chat(state, l),
+        Screen::Mls => mls(state, l),
         Screen::Incoming => incoming(l),
         Screen::Verify => verification(l),
     };
@@ -1194,6 +1195,152 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
     .spacing(l.px(20.0));
     l.place(l.panel(body), 126.0, 94.0, 1028.0, 646.0)
 }
+fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
+    let inviter = column![
+        l.title("1 · Criar e convidar", 21.0),
+        l.label("O criador do grupo é o committer designado.", 11.0, MUTED),
+        l.control(
+            "plus",
+            "Criar grupo neste dispositivo",
+            Some(Message::CreateMlsGroup),
+            true
+        ),
+        l.label("ID DO GRUPO", 10.0, GOLD),
+        l.input(
+            "ID em hexadecimal",
+            &state.mls_group_id,
+            Message::MlsGroupIdChanged
+        ),
+        l.control(
+            "key",
+            "Copiar ID do grupo",
+            (!state.mls_group_id.is_empty())
+                .then(|| Message::CopyMlsValue(state.mls_group_id.clone())),
+            false
+        ),
+        rule(LINE, 1.0),
+        l.label("KEYPACKAGE RECEBIDO DO CONVIDADO", 10.0, GOLD),
+        l.input(
+            "Cole o KeyPackage público",
+            &state.mls_invite_key_package,
+            Message::MlsInviteKeyPackageChanged
+        ),
+        l.control(
+            "users",
+            "Validar e admitir membro",
+            Some(Message::AdmitMlsMember),
+            true
+        ),
+        l.label("WELCOME · COPIE PARA O DISPOSITIVO CONVIDADO", 10.0, GOLD),
+        l.input(
+            "Welcome hexadecimal",
+            &state.mls_welcome,
+            Message::MlsWelcomeChanged
+        ),
+        l.control(
+            "key",
+            "Copiar Welcome",
+            (!state.mls_welcome.is_empty())
+                .then(|| Message::CopyMlsValue(state.mls_welcome.clone())),
+            false
+        ),
+        l.label("RATCHET TREE · COPIE PARA O CONVIDADO", 10.0, GOLD),
+        l.input(
+            "Ratchet tree hexadecimal",
+            &state.mls_ratchet_tree,
+            Message::MlsRatchetTreeChanged
+        ),
+        l.control(
+            "key",
+            "Copiar ratchet tree",
+            (!state.mls_ratchet_tree.is_empty())
+                .then(|| Message::CopyMlsValue(state.mls_ratchet_tree.clone())),
+            false
+        )
+    ]
+    .spacing(l.px(9.0));
+    let invitee = column![
+        l.title("2 · Entrar em um grupo", 21.0),
+        l.label(
+            "Prepare o pacote neste dispositivo e envie ao committer.",
+            11.0,
+            MUTED
+        ),
+        l.control(
+            "key",
+            "Gerar meu KeyPackage",
+            Some(Message::PrepareMlsKeyPackage),
+            true
+        ),
+        l.input(
+            "KeyPackage público hexadecimal",
+            &state.mls_key_package,
+            Message::MlsKeyPackageChanged
+        ),
+        l.control(
+            "key",
+            "Copiar KeyPackage para convidar",
+            (!state.mls_key_package.is_empty())
+                .then(|| Message::CopyMlsValue(state.mls_key_package.clone())),
+            false
+        ),
+        rule(LINE, 1.0),
+        l.label("COLE O WELCOME RECEBIDO", 10.0, GOLD),
+        l.input(
+            "Welcome hexadecimal",
+            &state.mls_welcome,
+            Message::MlsWelcomeChanged
+        ),
+        l.label("COLE O RATCHET TREE RECEBIDO", 10.0, GOLD),
+        l.input(
+            "Ratchet tree hexadecimal",
+            &state.mls_ratchet_tree,
+            Message::MlsRatchetTreeChanged
+        ),
+        l.control(
+            "users",
+            "Validar Welcome e entrar",
+            Some(Message::JoinMlsGroup),
+            true
+        ),
+        l.label("ID DO GRUPO APÓS ENTRAR", 10.0, GOLD),
+        l.input(
+            "ID em hexadecimal",
+            &state.mls_group_id,
+            Message::MlsGroupIdChanged
+        ),
+        l.control(
+            "key",
+            "Copiar ID do grupo",
+            (!state.mls_group_id.is_empty())
+                .then(|| Message::CopyMlsValue(state.mls_group_id.clone())),
+            false
+        )
+    ]
+    .spacing(l.px(9.0));
+    let body = column![
+        row![
+            column![l.title("Grupo MLS", 28.0), l.label("OpenMLS · SQLCipher local · sem transporte de grupo", 11.0, MUTED)].spacing(l.px(5.0)),
+            space().width(Fill),
+            l.label("INVITE MANUAL · CHAVES NÃO SAEM DO DISPOSITIVO", 10.0, GOLD)
+        ].align_y(iced::Center),
+        rule(LINE, 1.0),
+        row![
+            scrollable(inviter).height(Fill).width(Fill),
+            rule(LINE, 1.0),
+            scrollable(invitee).height(Fill).width(Fill)
+        ].spacing(l.px(18.0)).height(Fill),
+        l.label(state.mls_status.clone(), 11.0, GREEN),
+        l.label(
+            "Este fluxo valida MLS e persiste o grupo neste dispositivo. Troque os bytes por um canal confiável; mensagens de grupo ainda não são enviadas pela rede nem exibidas na tela de chat.",
+            10.0,
+            MUTED
+        )
+    ]
+    .spacing(l.px(12.0));
+    l.place(l.panel(body), 24.0, 80.0, 1232.0, 676.0)
+}
+
 fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
     let identity_ready = matches!(state.identity_status, crate::IdentityStatus::Ready(_));
     let listener_active = matches!(
@@ -1307,7 +1454,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
                         GREEN
                     ),
                     l.control(
-                        "copy",
+                        "key",
                         "Copiar endereço LAN",
                         Some(Message::CopyPeerListenAddress(lan_address.to_string())),
                         false,

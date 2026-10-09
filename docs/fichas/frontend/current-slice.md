@@ -3,10 +3,11 @@
 **Status:** eleven native Rust/Iced screens, including direct-LAN Iroh/QUIC
 text with per-peer local history in SQLCipher. Core MLS membership and atomic
 application-message encryption plus inbound/outbound journal processing now
-work; product UI and network delivery remain open.
+work. An additional Iced screen exposes local group creation and admission;
+network delivery and MLS chat presentation remain open.
 
 The frontend's `src/main.rs` owns application state and local transport;
-`src/ui.rs` composes the eleven source-board views with native widgets,
+`src/ui.rs` composes the eleven source-board views and an MLS setup screen with native widgets,
 original scenery, familiar portraits and cutouts, source-derived SVG icons,
 embedded fonts, translucent panels, scanlines, and vignette. The **Telas**
 gallery reaches every view. Home actions open the lobby preview; invitation
@@ -27,8 +28,8 @@ as unverified. The core can sign the MLS signing key selected for an OpenMLS
 ciphersuite with this long-term device key. The core can create a one-use
 OpenMLS KeyPackage whose BasicCredential embeds this binding; OpenMLS keeps its
 private bundle in SQLCipher. The core creates and persists local MLS group
-state and indexes its creator as designated committer. No UI publishes
-packages or exposes group creation. Core APIs admit a device-bound KeyPackage,
+state and indexes its creator as designated committer. The MLS setup screen
+exposes group creation and public-artifact exchange. Core APIs admit a device-bound KeyPackage,
 merge its Commit into local state, return Commit/Welcome/ratchet-tree bytes, and
 process a Welcome on the joining device. It can encrypt an application payload
 at the current epoch and persist the serialized MLS message as a queued outbox

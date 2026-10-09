@@ -92,6 +92,7 @@ enum Screen {
     Connecting,
     Share,
     Chat,
+    Mls,
     Incoming,
     Verify,
     #[default]
@@ -100,7 +101,7 @@ enum Screen {
 }
 
 impl Screen {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::Components,
         Self::Familiar,
         Self::Settings,
@@ -108,6 +109,7 @@ impl Screen {
         Self::Connecting,
         Self::Share,
         Self::Chat,
+        Self::Mls,
         Self::Incoming,
         Self::Verify,
         Self::Home,
@@ -123,6 +125,7 @@ impl Screen {
             Self::Connecting => "04-connecting",
             Self::Share => "05-share",
             Self::Chat => "06-chat",
+            Self::Mls => "11-mls",
             Self::Incoming => "07-incoming",
             Self::Verify => "08-verify",
             Self::Home => "09-home",
@@ -139,6 +142,7 @@ impl Screen {
             Self::Connecting => "Conectando & fallback",
             Self::Share => "Escolher tela",
             Self::Chat => "Texto direto · LAN",
+            Self::Mls => "Grupo MLS · local",
             Self::Incoming => "Chamada recebida",
             Self::Verify => "Verificar selo",
             Self::Home => "Início",
@@ -185,6 +189,12 @@ struct Slouching {
     peer_pending_sends: std::collections::HashMap<u64, String>,
     peer_next_request_id: u64,
     identity_key_copied: bool,
+    mls_group_id: String,
+    mls_key_package: String,
+    mls_invite_key_package: String,
+    mls_welcome: String,
+    mls_ratchet_tree: String,
+    mls_status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +305,12 @@ impl Default for Slouching {
             peer_pending_sends: std::collections::HashMap::new(),
             peer_next_request_id: 1,
             identity_key_copied: false,
+            mls_group_id: String::new(),
+            mls_key_package: String::new(),
+            mls_invite_key_package: String::new(),
+            mls_welcome: String::new(),
+            mls_ratchet_tree: String::new(),
+            mls_status: "Crie uma identidade do dispositivo para começar.".to_owned(),
         }
     }
 }
@@ -346,6 +362,20 @@ enum Message {
     PeerOutboundStored(u64, String, Result<storage::StoredDirectMessage, String>),
     SendPeerText,
     PeerCommandSent(Result<(), String>),
+    MlsGroupIdChanged(String),
+    MlsKeyPackageChanged(String),
+    MlsInviteKeyPackageChanged(String),
+    MlsWelcomeChanged(String),
+    MlsRatchetTreeChanged(String),
+    CreateMlsGroup,
+    MlsGroupCreated(Result<storage::CreatedMlsGroup, String>),
+    PrepareMlsKeyPackage,
+    MlsKeyPackagePrepared(Result<storage::PreparedMlsKeyPackage, String>),
+    AdmitMlsMember,
+    MlsMemberAdded(Result<storage::AddedMlsMember, String>),
+    JoinMlsGroup,
+    MlsGroupJoined(Result<storage::JoinedMlsGroup, String>),
+    CopyMlsValue(String),
 }
 
 fn update(state: &mut Slouching, message: Message) -> Task<Message> {
@@ -877,6 +907,108 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.peer_send_status =
                 PeerSendStatus::Failed(format!("Não foi possível enviar na sessão: {error}"));
         }
+        Message::MlsGroupIdChanged(value) => state.mls_group_id = value,
+        Message::MlsKeyPackageChanged(value) => state.mls_key_package = value,
+        Message::MlsInviteKeyPackageChanged(value) => state.mls_invite_key_package = value,
+        Message::MlsWelcomeChanged(value) => state.mls_welcome = value,
+        Message::MlsRatchetTreeChanged(value) => state.mls_ratchet_tree = value,
+        Message::CreateMlsGroup => {
+            if !matches!(state.identity_status, IdentityStatus::Ready(_)) {
+                state.mls_status = "Crie ou carregue a identidade do dispositivo primeiro.".into();
+                return Task::none();
+            }
+            state.mls_status = "Criando grupo MLS local…".into();
+            return Task::perform(create_mls_group_task(), Message::MlsGroupCreated);
+        }
+        Message::MlsGroupCreated(result) => match result {
+            Ok(group) => {
+                state.mls_group_id = hex_encode_bytes(&group.group_id);
+                state.mls_status = format!(
+                    "Grupo criado no epoch {}. Este dispositivo é o committer designado.",
+                    group.epoch
+                );
+            }
+            Err(error) => state.mls_status = format!("Falha ao criar grupo: {error}"),
+        },
+        Message::PrepareMlsKeyPackage => {
+            if !matches!(state.identity_status, IdentityStatus::Ready(_)) {
+                state.mls_status = "Crie ou carregue a identidade do dispositivo primeiro.".into();
+                return Task::none();
+            }
+            state.mls_status = "Preparando KeyPackage de uso único…".into();
+            return Task::perform(
+                create_mls_key_package_task(),
+                Message::MlsKeyPackagePrepared,
+            );
+        }
+        Message::MlsKeyPackagePrepared(result) => match result {
+            Ok(package) => {
+                state.mls_key_package = hex_encode_bytes(&package.public_bytes);
+                state.mls_status = "KeyPackage público pronto. Compartilhe-o com o committer por um canal confiável.".into();
+            }
+            Err(error) => state.mls_status = format!("Falha ao preparar pacote: {error}"),
+        },
+        Message::AdmitMlsMember => {
+            let group_id = match hex_decode_bytes(&state.mls_group_id) {
+                Ok(value) => value,
+                Err(error) => {
+                    state.mls_status = format!("ID do grupo inválido: {error}");
+                    return Task::none();
+                }
+            };
+            let package = match hex_decode_bytes(&state.mls_invite_key_package) {
+                Ok(value) => value,
+                Err(error) => {
+                    state.mls_status = format!("KeyPackage inválido: {error}");
+                    return Task::none();
+                }
+            };
+            state.mls_status = "Validando pacote e criando Commit/Welcome…".into();
+            return Task::perform(
+                admit_mls_member_task(group_id, package),
+                Message::MlsMemberAdded,
+            );
+        }
+        Message::MlsMemberAdded(result) => match result {
+            Ok(admission) => {
+                state.mls_welcome = hex_encode_bytes(&admission.welcome);
+                state.mls_ratchet_tree = hex_encode_bytes(&admission.ratchet_tree);
+                state.mls_status = format!(
+                    "Membro admitido no epoch {}. Envie Welcome e ratchet tree ao convidado.",
+                    admission.epoch
+                );
+            }
+            Err(error) => state.mls_status = format!("Falha ao admitir membro: {error}"),
+        },
+        Message::JoinMlsGroup => {
+            let welcome = match hex_decode_bytes(&state.mls_welcome) {
+                Ok(value) => value,
+                Err(error) => {
+                    state.mls_status = format!("Welcome inválido: {error}");
+                    return Task::none();
+                }
+            };
+            let tree = match hex_decode_bytes(&state.mls_ratchet_tree) {
+                Ok(value) => value,
+                Err(error) => {
+                    state.mls_status = format!("Ratchet tree inválida: {error}");
+                    return Task::none();
+                }
+            };
+            state.mls_status = "Validando Welcome com a chave privada local…".into();
+            return Task::perform(join_mls_group_task(welcome, tree), Message::MlsGroupJoined);
+        }
+        Message::MlsGroupJoined(result) => match result {
+            Ok(group) => {
+                state.mls_group_id = hex_encode_bytes(&group.group_id);
+                state.mls_status = format!(
+                    "Grupo ingressado no epoch {}. O grupo e as chaves estão no SQLCipher local.",
+                    group.epoch
+                );
+            }
+            Err(error) => state.mls_status = format!("Falha ao ingressar no grupo: {error}"),
+        },
+        Message::CopyMlsValue(value) => return iced::clipboard::write(value),
     }
     Task::none()
 }
@@ -1141,6 +1273,76 @@ async fn create_identity_task() -> Result<[u8; 32], String> {
     tokio::task::spawn_blocking(storage::create_or_load_identity_public_key)
         .await
         .map_err(|error| format!("device identity task failed: {error}"))?
+}
+
+async fn create_mls_group_task() -> Result<storage::CreatedMlsGroup, String> {
+    tokio::task::spawn_blocking(|| {
+        storage::create_mls_group(
+            openmls::prelude::Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519,
+        )
+    })
+    .await
+    .map_err(|error| format!("MLS group task failed: {error}"))?
+}
+
+async fn create_mls_key_package_task() -> Result<storage::PreparedMlsKeyPackage, String> {
+    tokio::task::spawn_blocking(|| {
+        storage::create_mls_key_package(
+            openmls::prelude::Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519,
+        )
+    })
+    .await
+    .map_err(|error| format!("MLS KeyPackage task failed: {error}"))?
+}
+
+async fn admit_mls_member_task(
+    group_id: Vec<u8>,
+    package: Vec<u8>,
+) -> Result<storage::AddedMlsMember, String> {
+    tokio::task::spawn_blocking(move || storage::add_mls_group_member(&group_id, &package))
+        .await
+        .map_err(|error| format!("MLS member admission task failed: {error}"))?
+}
+
+async fn join_mls_group_task(
+    welcome: Vec<u8>,
+    tree: Vec<u8>,
+) -> Result<storage::JoinedMlsGroup, String> {
+    tokio::task::spawn_blocking(move || storage::join_mls_group_from_welcome(&welcome, &tree))
+        .await
+        .map_err(|error| format!("MLS Welcome task failed: {error}"))?
+}
+
+fn hex_encode_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn hex_decode_bytes(value: &str) -> Result<Vec<u8>, String> {
+    let value = value.trim();
+    if value.is_empty() || !value.len().is_multiple_of(2) || value.len() > 256 * 1024 {
+        return Err("cole bytes hexadecimais completos".to_owned());
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let digit = |byte: u8| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            };
+            let high = digit(pair[0]).ok_or_else(|| "contém caractere que não é hex".to_owned())?;
+            let low = digit(pair[1]).ok_or_else(|| "contém caractere que não é hex".to_owned())?;
+            Ok((high << 4) | low)
+        })
+        .collect()
 }
 
 fn peer_listener_task(
@@ -1483,6 +1685,18 @@ fn hex_encode_key(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mls_artifact_hex_encoding_round_trips_and_rejects_malformed_input() {
+        let bytes = [0, 1, 0x7f, 0x80, 0xfe, 0xff];
+        let encoded = hex_encode_bytes(&bytes);
+        assert_eq!(encoded, "00017f80feff");
+        assert_eq!(hex_decode_bytes(&encoded).unwrap(), bytes);
+        assert_eq!(hex_decode_bytes("A0b1").unwrap(), [0xa0, 0xb1]);
+        assert!(hex_decode_bytes("abc").is_err());
+        assert!(hex_decode_bytes("0x").is_err());
+        assert!(hex_decode_bytes(&"00".repeat(128 * 1024 + 1)).is_err());
+    }
 
     #[test]
     fn detects_when_the_peer_pin_is_the_local_device_key() {

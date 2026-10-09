@@ -5,8 +5,8 @@ window screenshot API. Every numbered image corresponds to the supplied
 design-board view. These are rendered widgets and source assets, not screen
 PNGs pasted into an app. `compact/` keeps representative 960 × 640 captures.
 
-The window gallery, familiar selection, preview fields, tabs, and texture
-control work locally. The familiar screen now persists the display name and
+The window gallery, familiar selection, preview fields, tabs, texture
+control, and local MLS group invitation flow work locally. The familiar screen now persists the display name and
 familiar using SQLCipher encrypted SQLite with a key in the system credential
 store. A missing credential store appears as an unavailable state; no
 plaintext fallback is used. A separate explicit action creates and stores an
@@ -18,15 +18,17 @@ messages, and comparison words are marked as illustrative. No peer route,
 media capture, messaging, or call is established by these images.
 Exact parity and accessibility remain open.
 
-These captures show only the native UI. The separate encrypted event-journal
-storage primitives are not connected to the screens, MLS, or delivery and do
-not enable chat.
+The MLS screen lets two devices manually exchange a public KeyPackage,
+Welcome, and ratchet tree through a separately trusted channel. It is a local
+MLS group setup flow; MLS application messages still have no network path or
+chat UI.
 
 Opening the encrypted database composes OpenMLS RustCrypto with its versioned
 SQLite storage schema through the same SQLCipher connection. The Rust core
 persists MLS signing keys and groups, creates device-bound KeyPackages, admits
-members, and processes Welcome messages; no group or invitation flow is
-exposed in the UI.
+members, processes Welcome messages, and encrypts/decrypts events transactionally
+with the journal. The group setup flow is now exposed as an additional native
+screen; the original eleven design-board views remain available.
 
 The storage test uses a temporary SQLCipher database, confirms that opening it
 twice preserves the OpenMLS schema, and composes the RustCrypto and SQL
@@ -48,5 +50,5 @@ Reproduce with `cargo run -- --capture-dir /tmp/slouching-captures`.
 Request a size with `SLOUCHING_WINDOW_SIZE=1280x800`; a tiling compositor may
 need this window floated and resized before the six-second capture delay;
 `SLOUCHING_CAPTURE_DELAY_MS` can extend the delay.
-The command visits all eleven views and exits after saving them.
+The command visits all twelve views and exits after saving them.
 Use `cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 01-familiar` to capture one view at the requested size.

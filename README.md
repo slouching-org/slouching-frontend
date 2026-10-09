@@ -83,6 +83,13 @@ widgets, original characters and scenery, extracted outline SVG icons,
 Bricolage Grotesque and JetBrains Mono, translucent panels, scanlines, and
 vignette. The top-right **Telas** button opens the screen gallery.
 
+An additional **Grupo MLS · local** screen exposes two-device group setup:
+create the group on one device; generate a KeyPackage on the other; exchange
+it with the group committer; then exchange Welcome and ratchet tree back to the
+joining device. The screen copies each public artifact and accepts pasted hex.
+Use a trusted channel for this exchange. MLS messages are not yet sent over the
+network or shown in the chat UI.
+
 Familiar selection, invitation/draft fields, screen navigation, settings
 tabs, illustrative share-source selection, and interface texture work locally.
 The familiar screen saves the display name and familiar as a local profile in
@@ -95,8 +102,8 @@ sign a versioned binding from that durable device key to an MLS signing public
 key, including its signature-scheme code, without returning the private seed.
 It can now create a one-use OpenMLS KeyPackage whose BasicCredential carries
 that binding; OpenMLS stores its private bundle in the encrypted database and
-returns only the public package bytes. No UI flow publishes or consumes
-KeyPackages yet, and there is no trusted contact roster. The core can also
+returns only the public package bytes. There is no directory or trusted
+contact roster. The core can also
 create and persist a local single-member MLS group with this device as its
 creator and designated committer. The core can admit a device-bound KeyPackage,
 merge its Commit into local group state, return Commit/Welcome/ratchet-tree
@@ -106,9 +113,9 @@ the serialized message in the queued outbox alongside the MLS ratchet update.
 Inbound processing authenticates the sender binding and event metadata, stores
 ciphertext before returning plaintext, and deduplicates exact redelivery in the
 same SQLCipher transaction as the MLS ratchet update. Two-database tests verify
-delivery, deduplication, and rejection without partial state. The Iced UI does
-not expose group creation, invitation, or MLS messaging; network delivery
-remains unimplemented. The direct-LAN screen
+delivery, deduplication, and rejection without partial state. The Iced UI now
+exposes local group creation, KeyPackage exchange, admission, and Welcome
+processing. Network delivery and MLS chat presentation remain unimplemented. The direct-LAN screen
 manually pins device public keys separately. The local profile remains
 separate from that key. Character scenes, call views, and design-board examples
 remain visual previews. The dedicated chat screen shows only real direct-LAN
@@ -117,16 +124,12 @@ P2P** in Settings retains the real Elixir HTTP/WebSocket diagnostics and
 manual refresh. On Linux, this uses Secret Service, so a desktop password
 vault must be installed and available in the user session.
 
-The encrypted local database now has an event journal schema and storage
-primitives for opaque, already-encrypted inbound and outbound events. It
-deduplicates identical event IDs and rejects reuse with different ciphertext
-or envelope metadata. Outbound rows have local queued/held/received/expired/
-failed states and bounded cursor-paginated reads; the inbox can also be read
-in bounded pages. No transport or authenticated remote receipt feeds those
-states yet. The direct-LAN transcript is persisted in a separate per-peer
-table, not this journal. OpenMLS outbound and inbound application processing
-now updates its ratchet and writes the opaque event in one SQLCipher
-transaction; there is no product UI or delivery transport for these events.
+The encrypted local database has a bounded event journal. OpenMLS outbound
+and inbound application processing updates its ratchet and writes the opaque
+event in one SQLCipher transaction. Exact event redelivery is deduplicated and
+envelope conflicts are rejected. No transport or authenticated remote receipt
+feeds the delivery states yet. The direct-LAN transcript remains in a separate
+per-peer table, and MLS messages have no chat UI.
 
 Opening the same SQLCipher database now composes OpenMLS RustCrypto with the
 SQLite storage provider and initializes its versioned schema. The event
@@ -134,10 +137,10 @@ journal receives encrypted MLS application messages on send and receive, but
 is not connected to the UI or a delivery transport. Inbound processing
 authenticates event metadata and sender credentials, persists before returning
 plaintext, and safely deduplicates exact redelivery. The core creates and persists a
-local group and indexes its creator as designated committer. It can admit a
-device-bound KeyPackage, merge its Commit into local state, return
-Commit/Welcome/ratchet-tree bytes, and process a Welcome on the joining client.
-There is no UI group or invitation flow, or network event delivery integration.
+local group and indexes its creator as designated committer. The additional
+MLS setup screen admits a device-bound KeyPackage, merges its Commit into local
+state, copies Welcome/ratchet-tree bytes, and processes a Welcome on the joining
+client. There is no network event delivery integration.
 A caller can explicitly create or load a distinct MLS signing key for a
 chosen OpenMLS ciphersuite. Its public key is signed by the long-term device
 identity and the MLS key is stored in the encrypted database. Repeated calls
@@ -157,7 +160,9 @@ Commit or Welcome messages or establish a user-approved contact relationship.
 
 ![Actual native Iced group-call preview; media and sample messages are illustrative](docs/design/runtime/native-vhs/10-call.png)
 
-The eleven runtime captures are in [native-vhs](docs/design/runtime/native-vhs/).
+![Actual native Iced MLS group setup screen; idle capture without a created group](docs/design/runtime/native-vhs/11-mls.png)
+
+The eleven design-board views and additional MLS screen are captured in [native-vhs](docs/design/runtime/native-vhs/).
 These are a first implementation of the visual direction, with comparison
 at 1280 × 800 and a compact 960 × 640 window. Exact visual parity,
 accessibility, and live media integration remain to be completed.
@@ -170,7 +175,7 @@ SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-capture
 SLOUCHING_WINDOW_SIZE=960x640 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 01-familiar
 ```
 
-The capture command renders all eleven screens, saves screenshots through
+The capture command renders all twelve screens, saves screenshots through
 Iced's window screenshot API, and exits. Add `--capture-screen <slug>` to
 capture one view, such as the familiar screen, instead of the full gallery. A tiling compositor may override
 the requested window size; float/resize that window before the capture delay.

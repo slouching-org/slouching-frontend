@@ -6,13 +6,13 @@ Its Elixir server/backend core and Rust/Iced client direction are retained.
 
 | Layer | Choice | Current state |
 | --- | --- | --- |
-| Desktop UI | Rust 2024 + pinned Iced 0.14.0 | Native state in `src/main.rs` and eleven screens in `src/ui.rs` |
-| Rendering | Iced/wgpu | Eleven native views with images, SVG icons, and canvas texture; direct-LAN chat is functional, call/media screens remain previews |
-| Local client core | Rust identity, cryptography, storage, transport, media | SQLCipher profile, per-peer direct-chat history, Ed25519 device identity, OpenMLS key persistence, and opaque encrypted-event/outbox storage are implemented; MLS messaging, product pairing, event-journal integration, and media remain pending |
+| Desktop UI | Rust 2024 + pinned Iced 0.14.0 | Native state in `src/main.rs`; eleven design-board views plus an MLS group setup screen |
+| Rendering | Iced/wgpu | Native views with images, SVG icons, and canvas texture; direct-LAN chat is functional, call/media screens remain previews |
+| Local client core | Rust identity, cryptography, storage, transport, media | SQLCipher profile, per-peer direct-chat history, OpenMLS group lifecycle, and transactional MLS application event journal are implemented; product pairing, network delivery, and media remain pending |
 | Server/backend | Elixir, separately versioned backend repo | Development status and protobuf handshake implemented |
 | State boundary | Versioned protocol | Asynchronous loopback HTTP status and binary protobuf WebSocket handshake v1 integrated; production boundary pending |
 | Browser UI | HTML/CSS/JavaScript | Historical visual prototype in `prototypes/web/`; not product runtime |
-| Identity, MLS, storage, transport, calls | Client and server responsibilities per source PDF | Device-bound MLS signer, one-use KeyPackage, local group persistence, designated-committer admission, Commit creation, and Welcome processing exist in the Rust core; no UI group flow, message delivery/application messaging, fingerprint verification, production transport, or calls yet |
+| Identity, MLS, storage, transport, calls | Client and server responsibilities per source PDF | Device-bound MLS signer, KeyPackage exchange UI, local group persistence, designated-committer admission, Welcome processing, and authenticated application message core; network event delivery, fingerprint verification, production transport, and calls remain unimplemented |
 
 The frontend must render authoritative implemented state. It must not generate
 security claims, route badges, presence, or capture status independently.
