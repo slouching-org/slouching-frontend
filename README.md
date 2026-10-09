@@ -77,10 +77,14 @@ SQLite storage provider and initializes its versioned schema. This is only a
 persistence foundation: the app does not yet create credentials, key
 packages, groups, or live MLS state. MLS remains unconnected to the event
 journal and UI.
+A caller can explicitly create or load a distinct MLS signing key for a
+chosen OpenMLS ciphersuite. Its public key is signed by the long-term device
+identity and the MLS key is stored in the encrypted database. Repeated calls
+reuse the key; this still does not create a KeyPackage or authenticate a peer.
 A storage test verifies the encrypted schema, repeats both migrations, and
 stores then reloads an MLS signing key across database opens in a temporary
 database. The test composes OpenMLS's RustCrypto and SQL storage providers;
-the app does not yet create MLS credentials or groups.
+the app does not yet create MLS credentials, KeyPackages, or groups.
 
 ![Actual 1280 × 800 native Iced familiar screen after the device-to-MLS binding core was added; Secret Service is unavailable in this capture](docs/design/runtime/native-vhs/01-familiar.png)
 
