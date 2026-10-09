@@ -3213,15 +3213,38 @@ mod tests {
             second_admission.commit_event_id.as_slice(),
             &blake3::hash(&second_admission.commit).as_bytes()[..16]
         );
+        let fourth_identity = SigningKey::from_bytes(&[0x57; 32]);
+        let mut fourth_device = open_database(
+            &directory.join("fourth.sqlite3"),
+            &[0x58; PROFILE_DB_KEY_LEN],
+        )
+        .expect("fourth device database should initialize");
+        let fourth_package =
+            create_mls_key_package_in(&mut fourth_device, ciphersuite, &fourth_identity)
+                .expect("fourth device should prepare a KeyPackage");
+        let third_admission = add_mls_group_member_in(
+            &mut creator,
+            &group.group_id,
+            &fourth_package.public_bytes,
+            &creator_identity,
+        )
+        .expect("designated committer should generate the following Commit");
+        assert_eq!(third_admission.epoch, 3);
         let invitee_device = invitee_identity.verifying_key().to_bytes();
         let recipient_commits =
             list_queued_mls_commits_for_peer_in(&mut creator, &group.group_id, &invitee_device, 10)
-                .expect("predecessor member should receive the next Commit");
-        assert_eq!(recipient_commits.len(), 1);
+                .expect("predecessor member should receive its eligible Commit chain");
+        assert_eq!(recipient_commits.len(), 2);
         assert_eq!(
             recipient_commits[0].event_id,
             second_admission.commit_event_id
         );
+        assert_eq!(
+            recipient_commits[1].event_id,
+            third_admission.commit_event_id
+        );
+        assert_eq!(recipient_commits[0].epoch, 2);
+        assert_eq!(recipient_commits[1].epoch, 3);
         mark_mls_commit_delivered_in(
             &mut creator,
             second_admission.commit_event_id,
@@ -3239,22 +3262,35 @@ mod tests {
             .expect("recipient ACK ledger should survive an encrypted database reopen");
         let recipient_status = list_mls_commit_recipient_status_in(&creator, &group.group_id, 20)
             .expect("per-device Commit delivery state should reload");
-        assert_eq!(recipient_status.len(), 1);
-        assert_eq!(
-            recipient_status[0].event_id,
-            second_admission.commit_event_id
-        );
-        assert_eq!(recipient_status[0].epoch, 2);
-        assert_eq!(recipient_status[0].device_public_key, invitee_device);
-        assert!(recipient_status[0].delivered);
-        assert!(list_queued_mls_commits_for_peer_in(
-            &mut creator,
-            &group.group_id,
-            &invitee_device,
-            10,
-        )
-        .unwrap()
-        .is_empty());
+        let invitee_status: Vec<_> = recipient_status
+            .iter()
+            .filter(|status| status.device_public_key == invitee_device)
+            .collect();
+        assert_eq!(invitee_status.len(), 2);
+        let delivered_status = recipient_status
+            .iter()
+            .find(|status| {
+                status.event_id == second_admission.commit_event_id
+                    && status.device_public_key == invitee_device
+            })
+            .expect("first Commit should remain visible in delivery history");
+        assert_eq!(delivered_status.epoch, 2);
+        assert_eq!(delivered_status.device_public_key, invitee_device);
+        assert!(delivered_status.delivered);
+        let queued_status = recipient_status
+            .iter()
+            .find(|status| {
+                status.event_id == third_admission.commit_event_id
+                    && status.device_public_key == invitee_device
+            })
+            .expect("next Commit should remain visible until its own ACK");
+        assert_eq!(queued_status.epoch, 3);
+        assert!(!queued_status.delivered);
+        let next_commit =
+            list_queued_mls_commits_for_peer_in(&mut creator, &group.group_id, &invitee_device, 10)
+                .expect("unacknowledged next Commit should be available after database reopen");
+        assert_eq!(next_commit.len(), 1);
+        assert_eq!(next_commit[0].event_id, third_admission.commit_event_id);
         assert!(
             mark_mls_commit_delivered_in(
                 &mut creator,
@@ -3362,6 +3398,7 @@ mod tests {
         assert!(unauthorized.contains("designated MLS committer"));
 
         drop(another_device);
+        drop(fourth_device);
         drop(invitee);
         drop(creator);
         fs::remove_dir_all(directory).expect("temporary database directory should be removed");

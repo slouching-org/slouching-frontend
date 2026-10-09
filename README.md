@@ -104,7 +104,9 @@ is harmless. One click drains that recipient's pending Commits in epoch order,
 waiting for each durable ACK before sending the next. Repeat after connecting
 to another member; automatic multi-member fan-out and offline delivery remain
 in progress. The MLS screen
-shows each eligible device's persisted adoption ACK. New members join with the
+shows each eligible device's persisted adoption ACK. Storage regression tests
+build a two-Commit chain, verify epoch order, and confirm that the next Commit
+remains queued after the first recipient ACK and a database reopen. New members join with the
 matching Welcome and ratchet tree. The transcript reloads locally, and **Reenviar pendentes**
 sends queued events for the selected group after reconnecting.
 
