@@ -177,6 +177,9 @@ struct Slouching {
     peer_transcript: Vec<PeerTranscriptEntry>,
     peer_listener_handle: Option<Handle>,
     peer_listener_generation: u64,
+    peer_session_commands: Option<tokio::sync::mpsc::Sender<peer::PeerCommand>>,
+    peer_pending_sends: std::collections::HashMap<u64, String>,
+    peer_next_request_id: u64,
     identity_key_copied: bool,
 }
 
@@ -208,14 +211,17 @@ enum PeerListenStatus {
         port: u16,
         addresses: Vec<std::net::SocketAddr>,
     },
-    Received,
+    Connected,
+    Disconnected(String),
+    Unauthorized(String),
     Failed(String),
 }
 
 #[derive(Debug, Clone)]
 enum PeerSendStatus {
     Idle,
-    Sending,
+    Connecting,
+    AwaitingAck,
     Sent,
     Failed(String),
 }
@@ -237,7 +243,8 @@ enum PeerListenEvent {
     Bound {
         addresses: Vec<std::net::SocketAddr>,
     },
-    Received(String),
+    SessionCommands(tokio::sync::mpsc::Sender<peer::PeerCommand>),
+    Session(peer::PeerEvent),
     Failed(String),
 }
 
@@ -273,6 +280,9 @@ impl Default for Slouching {
             peer_transcript: Vec::new(),
             peer_listener_handle: None,
             peer_listener_generation: 0,
+            peer_session_commands: None,
+            peer_pending_sends: std::collections::HashMap::new(),
+            peer_next_request_id: 1,
             identity_key_copied: false,
         }
     }
@@ -312,7 +322,7 @@ enum Message {
     StopPeerListener,
     PeerListenEvent(u64, PeerListenEvent),
     SendPeerText,
-    PeerSendCompleted(String, Result<String, String>),
+    PeerCommandSent(Result<(), String>),
 }
 
 fn update(state: &mut Slouching, message: Message) -> Task<Message> {
@@ -520,14 +530,27 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.peer_listen_status = PeerListenStatus::Starting { port };
             let (task, handle) = peer_listener_task(generation, port, expected_peer);
             state.peer_listener_handle = Some(handle);
+            state.peer_session_commands = None;
             return task;
         }
         Message::StopPeerListener => {
-            if let Some(handle) = state.peer_listener_handle.take() {
+            if matches!(
+                state.peer_listen_status,
+                PeerListenStatus::Connected
+                    | PeerListenStatus::Listening { .. }
+                    | PeerListenStatus::Unauthorized(_)
+            ) {
+                if let Some(commands) = state.peer_session_commands.take() {
+                    let _ = commands.try_send(peer::PeerCommand::Disconnect);
+                }
+            } else if let Some(handle) = state.peer_listener_handle.take() {
+                // While accept is pending, no session command receiver is active;
+                // dropping this task closes the listener endpoint.
                 handle.abort();
+                state.peer_session_commands = None;
+                state.peer_listener_generation = state.peer_listener_generation.saturating_add(1);
+                state.peer_listen_status = PeerListenStatus::Idle;
             }
-            state.peer_listener_generation = state.peer_listener_generation.saturating_add(1);
-            state.peer_listen_status = PeerListenStatus::Idle;
         }
         Message::PeerListenEvent(generation, event)
             if generation == state.peer_listener_generation =>
@@ -541,17 +564,23 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     };
                     state.peer_listen_status = PeerListenStatus::Listening { port, addresses };
                 }
-                PeerListenEvent::Received(text) => {
-                    state.peer_transcript.push(PeerTranscriptEntry {
-                        direction: PeerMessageDirection::Received,
-                        text,
-                    });
-                    state.peer_listen_status = PeerListenStatus::Received;
-                    state.peer_listener_handle = None;
+                PeerListenEvent::SessionCommands(commands) => {
+                    state.peer_session_commands = Some(commands);
+                }
+                PeerListenEvent::Session(event) => {
+                    apply_peer_event(state, event);
                 }
                 PeerListenEvent::Failed(error) => {
                     state.peer_listen_status = PeerListenStatus::Failed(error);
                     state.peer_listener_handle = None;
+                    state.peer_session_commands = None;
+                    if matches!(state.peer_send_status, PeerSendStatus::Connecting) {
+                        state.peer_pending_sends.clear();
+                        state.peer_send_status = PeerSendStatus::Failed(
+                            "Não foi possível conectar ao peer; a mensagem não foi enviada."
+                                .to_owned(),
+                        );
+                    }
                 }
             }
         }
@@ -563,6 +592,29 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 );
                 return Task::none();
             }
+            let text = state.peer_draft.trim().to_owned();
+            if text.is_empty() || text.len() > 16 * 1024 {
+                state.peer_send_status = PeerSendStatus::Failed(
+                    "A mensagem precisa ter entre 1 e 16 KiB em UTF-8.".to_owned(),
+                );
+                return Task::none();
+            }
+            if let Some(commands) = state.peer_session_commands.as_ref() {
+                let request_id = state.peer_next_request_id;
+                state.peer_next_request_id = state.peer_next_request_id.saturating_add(1);
+                state.peer_pending_sends.insert(request_id, text.clone());
+                state.peer_send_status = PeerSendStatus::AwaitingAck;
+                let commands = commands.clone();
+                return Task::perform(
+                    async move {
+                        commands
+                            .send(peer::PeerCommand::Send { request_id, text })
+                            .await
+                            .map_err(|error| error.to_string())
+                    },
+                    Message::PeerCommandSent,
+                );
+            }
             let expected_peer = match parse_peer_id(&state.peer_public_key) {
                 Ok(peer) => peer,
                 Err(error) => {
@@ -573,39 +625,27 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             let address = match state.peer_address.parse::<std::net::SocketAddr>() {
                 Ok(address) if !address.ip().is_unspecified() && address.port() != 0 => address,
                 _ => {
-                    state.peer_send_status = PeerSendStatus::Failed(
-                        "Informe o IP LAN e a porta UDP do outro dispositivo, por exemplo 192.168.1.20:45873.".to_owned(),
-                    );
+                    state.peer_send_status = PeerSendStatus::Failed("Informe o IP LAN e a porta UDP do outro dispositivo, por exemplo 192.168.1.20:45873.".to_owned());
                     return Task::none();
                 }
             };
-            let text = state.peer_draft.trim().to_owned();
-            if text.is_empty() || text.len() > 16 * 1024 {
-                state.peer_send_status = PeerSendStatus::Failed(
-                    "A mensagem precisa ter entre 1 e 16 KiB em UTF-8.".to_owned(),
-                );
-                return Task::none();
-            }
-            state.peer_send_status = PeerSendStatus::Sending;
-            return Task::perform(
-                send_peer_text_task(expected_peer, address, text.clone()),
-                move |result| Message::PeerSendCompleted(text, result),
-            );
+            state.peer_send_status = PeerSendStatus::Connecting;
+            let generation = state.peer_listener_generation.saturating_add(1);
+            state.peer_listener_generation = generation;
+            let request_id = state.peer_next_request_id;
+            state.peer_next_request_id = state.peer_next_request_id.saturating_add(1);
+            state.peer_pending_sends.insert(request_id, text.clone());
+            let (task, handle) =
+                peer_connect_task(generation, expected_peer, address, request_id, text);
+            state.peer_listener_handle = Some(handle);
+            return task;
         }
-        Message::PeerSendCompleted(text, result) => match result {
-            Ok(_) => {
-                let draft_matches_sent_text = state.peer_draft.trim() == text;
-                state.peer_transcript.push(PeerTranscriptEntry {
-                    direction: PeerMessageDirection::Sent,
-                    text,
-                });
-                state.peer_send_status = PeerSendStatus::Sent;
-                if draft_matches_sent_text {
-                    state.peer_draft.clear();
-                }
-            }
-            Err(error) => state.peer_send_status = PeerSendStatus::Failed(error),
-        },
+        Message::PeerCommandSent(Ok(())) => {}
+        Message::PeerCommandSent(Err(error)) => {
+            state.peer_pending_sends.clear();
+            state.peer_send_status =
+                PeerSendStatus::Failed(format!("Não foi possível enviar na sessão: {error}"));
+        }
     }
     Task::none()
 }
@@ -872,8 +912,74 @@ fn peer_listener_task(
         };
         let addresses = listener.direct_addresses();
         yield PeerListenEvent::Bound { addresses };
-        match listener.receive_once().await {
-            Ok(text) => yield PeerListenEvent::Received(text),
+        let (commands, mut command_rx) = tokio::sync::mpsc::channel(32);
+        yield PeerListenEvent::SessionCommands(commands);
+        loop {
+            let accepted = tokio::select! {
+                result = listener.accept_session() => Some(result),
+                command = command_rx.recv() => {
+                    if matches!(command, Some(peer::PeerCommand::Disconnect) | None) {
+                        listener.close().await;
+                        yield PeerListenEvent::Session(peer::PeerEvent::Disconnected { reason: "listener stopped".to_owned() });
+                        return;
+                    }
+                    None
+                }
+            };
+            let Some(accepted) = accepted else { continue; };
+            match accepted {
+                Ok(session) => {
+                    let mut events = Box::pin(session.run(command_rx));
+                    while let Some(event) = events.next().await {
+                        let disconnected = matches!(event, peer::PeerEvent::Disconnected { .. });
+                        yield PeerListenEvent::Session(event);
+                        if disconnected { break; }
+                    }
+                    return;
+                }
+                Err(peer::PeerAcceptError::Unauthorized(peer_id)) => {
+                    yield PeerListenEvent::Session(peer::PeerEvent::Unauthorized { peer_id });
+                }
+                Err(peer::PeerAcceptError::Failed(error)) => {
+                    yield PeerListenEvent::Failed(error);
+                    return;
+                }
+            }
+        }
+    };
+    Task::run(events, move |event| {
+        Message::PeerListenEvent(generation, event)
+    })
+    .abortable()
+}
+
+fn peer_connect_task(
+    generation: u64,
+    expected_peer: iroh::EndpointId,
+    address: std::net::SocketAddr,
+    request_id: u64,
+    first_text: String,
+) -> (Task<Message>, Handle) {
+    let events = async_stream::stream! {
+        let local_identity = match load_peer_secret_key_task().await {
+            Ok(identity) => identity,
+            Err(error) => { yield PeerListenEvent::Failed(error); return; }
+        };
+        match peer::connect_peer(local_identity, expected_peer, address).await {
+            Ok(session) => {
+                let (commands, command_rx) = tokio::sync::mpsc::channel(32);
+                if let Err(error) = commands.send(peer::PeerCommand::Send { request_id, text: first_text }).await {
+                    yield PeerListenEvent::Failed(format!("could not queue initial message: {error}"));
+                    return;
+                }
+                yield PeerListenEvent::SessionCommands(commands);
+                let mut events = Box::pin(session.run(command_rx));
+                while let Some(event) = events.next().await {
+                    let disconnected = matches!(event, peer::PeerEvent::Disconnected { .. });
+                    yield PeerListenEvent::Session(event);
+                    if disconnected { break; }
+                }
+            }
             Err(error) => yield PeerListenEvent::Failed(error),
         }
     };
@@ -883,13 +989,66 @@ fn peer_listener_task(
     .abortable()
 }
 
-async fn send_peer_text_task(
-    expected_peer: iroh::EndpointId,
-    address: std::net::SocketAddr,
-    text: String,
-) -> Result<String, String> {
-    let local_identity = load_peer_secret_key_task().await?;
-    peer::send_once(local_identity, expected_peer, address, &text).await
+fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
+    match event {
+        peer::PeerEvent::Connected { .. } => {
+            state.peer_listen_status = PeerListenStatus::Connected;
+            if matches!(state.peer_send_status, PeerSendStatus::Connecting) {
+                state.peer_send_status = PeerSendStatus::Idle;
+            }
+        }
+        peer::PeerEvent::Received { sequence, text } => {
+            state.peer_transcript.push(PeerTranscriptEntry {
+                direction: PeerMessageDirection::Received,
+                text,
+            });
+            if let Some(commands) = state.peer_session_commands.as_ref() {
+                let _ = commands.try_send(peer::PeerCommand::AcceptInbound { sequence });
+            }
+        }
+        peer::PeerEvent::Acknowledged { request_id, text } => {
+            if state.peer_pending_sends.remove(&request_id).is_some() {
+                let draft_matches_sent_text = state.peer_draft.trim() == text;
+                state.peer_transcript.push(PeerTranscriptEntry {
+                    direction: PeerMessageDirection::Sent,
+                    text,
+                });
+                if draft_matches_sent_text {
+                    state.peer_draft.clear();
+                }
+            }
+            state.peer_send_status = if state.peer_pending_sends.is_empty() {
+                PeerSendStatus::Sent
+            } else {
+                PeerSendStatus::AwaitingAck
+            };
+        }
+        peer::PeerEvent::Rejected { request_id, reason } => {
+            state.peer_pending_sends.remove(&request_id);
+            state.peer_send_status = PeerSendStatus::Failed(reason);
+        }
+        peer::PeerEvent::DeliveryUnknown { request_id, text } => {
+            state.peer_pending_sends.remove(&request_id);
+            state.peer_send_status =
+                PeerSendStatus::Failed(format!("Entrega não confirmada: {text}"));
+        }
+        peer::PeerEvent::Unauthorized { .. } => {
+            state.peer_listen_status = PeerListenStatus::Unauthorized(
+                "peer não corresponde à chave pública fixada".to_owned(),
+            );
+        }
+        peer::PeerEvent::Disconnected { reason } => {
+            state.peer_listen_status = PeerListenStatus::Disconnected(reason);
+            state.peer_session_commands = None;
+            state.peer_listener_handle = None;
+            if !state.peer_pending_sends.is_empty() {
+                state.peer_pending_sends.clear();
+                state.peer_send_status = PeerSendStatus::Failed(
+                    "Conexão encerrada antes da confirmação; entrega desconhecida.".to_owned(),
+                );
+            }
+        }
+    }
 }
 
 async fn load_peer_secret_key_task() -> Result<iroh::SecretKey, String> {
@@ -1084,57 +1243,76 @@ mod tests {
     }
 
     #[test]
-    fn peer_transcript_only_records_confirmed_sends_and_current_listener_receives() {
+    fn peer_transcript_records_inbound_before_ack_and_outbound_only_after_ack() {
         let mut state = Slouching::default();
-        let _ = update(
+        let (commands, mut command_rx) = tokio::sync::mpsc::channel(4);
+        state.peer_session_commands = Some(commands);
+        state.peer_pending_sends.insert(7, "outgoing".to_owned());
+        apply_peer_event(
             &mut state,
-            Message::PeerSendCompleted(
-                "not delivered".to_owned(),
-                Err("peer unavailable".to_owned()),
-            ),
+            peer::PeerEvent::Received {
+                sequence: 3,
+                text: "incoming".to_owned(),
+            },
         );
-        assert!(state.peer_transcript.is_empty());
-        assert!(matches!(state.peer_send_status, PeerSendStatus::Failed(_)));
+        assert!(matches!(
+            state.peer_transcript.as_slice(),
+            [PeerTranscriptEntry { direction: PeerMessageDirection::Received, text }] if text == "incoming"
+        ));
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(peer::PeerCommand::AcceptInbound { sequence: 3 })
+        ));
 
-        let _ = update(
+        apply_peer_event(
             &mut state,
-            Message::PeerSendCompleted(
-                "delivered text".to_owned(),
-                Ok("received 14 bytes".to_owned()),
-            ),
+            peer::PeerEvent::Acknowledged {
+                request_id: 7,
+                text: "outgoing".to_owned(),
+            },
         );
         assert!(matches!(state.peer_send_status, PeerSendStatus::Sent));
         assert!(matches!(
             state.peer_transcript.as_slice(),
-            [PeerTranscriptEntry {
-                direction: PeerMessageDirection::Sent,
-                text
-            }] if text == "delivered text"
+            [
+                PeerTranscriptEntry { direction: PeerMessageDirection::Received, text: incoming },
+                PeerTranscriptEntry { direction: PeerMessageDirection::Sent, text: outgoing }
+            ] if incoming == "incoming" && outgoing == "outgoing"
         ));
 
+        state.peer_pending_sends.insert(8, "unknown".to_owned());
+        apply_peer_event(
+            &mut state,
+            peer::PeerEvent::DeliveryUnknown {
+                request_id: 8,
+                text: "unknown".to_owned(),
+            },
+        );
+        assert_eq!(state.peer_transcript.len(), 2);
+        assert!(matches!(state.peer_send_status, PeerSendStatus::Failed(_)));
         state.peer_listener_generation = 2;
         let _ = update(
             &mut state,
-            Message::PeerListenEvent(1, PeerListenEvent::Received("stale".to_owned())),
+            Message::PeerListenEvent(
+                1,
+                PeerListenEvent::Session(peer::PeerEvent::Received {
+                    sequence: 4,
+                    text: "stale".to_owned(),
+                }),
+            ),
         );
-        assert_eq!(state.peer_transcript.len(), 1);
+        assert_eq!(state.peer_transcript.len(), 2);
         let _ = update(
             &mut state,
-            Message::PeerListenEvent(2, PeerListenEvent::Received("incoming".to_owned())),
+            Message::PeerListenEvent(
+                2,
+                PeerListenEvent::Session(peer::PeerEvent::Received {
+                    sequence: 5,
+                    text: "current".to_owned(),
+                }),
+            ),
         );
-        assert!(matches!(
-            state.peer_transcript.as_slice(),
-            [
-                PeerTranscriptEntry {
-                    direction: PeerMessageDirection::Sent,
-                    text: sent
-                },
-                PeerTranscriptEntry {
-                    direction: PeerMessageDirection::Received,
-                    text: received
-                }
-            ] if sent == "delivered text" && received == "incoming"
-        ));
+        assert_eq!(state.peer_transcript.len(), 3);
     }
 
     #[test]

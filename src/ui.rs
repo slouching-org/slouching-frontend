@@ -1198,8 +1198,12 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
     let identity_ready = matches!(state.identity_status, crate::IdentityStatus::Ready(_));
     let listener_active = matches!(
         state.peer_listen_status,
-        crate::PeerListenStatus::Starting { .. } | crate::PeerListenStatus::Listening { .. }
+        crate::PeerListenStatus::Starting { .. }
+            | crate::PeerListenStatus::Listening { .. }
+            | crate::PeerListenStatus::Connected
+            | crate::PeerListenStatus::Unauthorized(_)
     );
+    let session_connected = matches!(state.peer_listen_status, crate::PeerListenStatus::Connected);
     let (identity_detail, copy_message, copy_label) = match &state.identity_status {
         crate::IdentityStatus::Ready(public_key) => (
             public_key
@@ -1261,7 +1265,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
     let listener_status: Element<'_, Message> = match &state.peer_listen_status {
         crate::PeerListenStatus::Idle => l
             .label(
-                "Listener parado. Ao iniciar, este app aceita uma mensagem do peer pinado.",
+                "Listener parado. Ao iniciar, aceita uma sessão persistente do peer pinado.",
                 11.0,
                 MUTED,
             )
@@ -1277,21 +1281,24 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 .collect::<Vec<_>>();
             let detail = if direct.is_empty() {
                 format!(
-                    "Aguardando uma mensagem · UDP {port}. Nenhum IP LAN foi anunciado; consulte as interfaces de rede. Não compartilhe 0.0.0.0: é um endereço curinga."
+                    "Aguardando sessão · UDP {port}. Nenhum IP LAN foi anunciado; consulte as interfaces de rede. Não compartilhe 0.0.0.0: é um endereço curinga."
                 )
             } else {
-                format!(
-                    "Aguardando uma mensagem · compartilhe: {}",
-                    direct.join("  ou  ")
-                )
+                format!("Aguardando sessão · compartilhe: {}", direct.join("  ou  "))
             };
             l.label(detail, 11.0, GREEN).into()
         }
-        crate::PeerListenStatus::Received => l
+        crate::PeerListenStatus::Connected => l
+            .label("Conectado · sessão direta ativa", 11.0, GREEN)
+            .into(),
+        crate::PeerListenStatus::Disconnected(reason) => l
+            .label(format!("Desconectado: {reason}"), 11.0, MUTED)
+            .into(),
+        crate::PeerListenStatus::Unauthorized(reason) => l
             .label(
-                "Mensagem recebida e confirmada. O listener de uma mensagem foi encerrado.",
+                format!("Peer recusado: {reason}"),
                 11.0,
-                GREEN,
+                Color::from_rgb8(255, 145, 159),
             )
             .into(),
         crate::PeerListenStatus::Failed(error) => l
@@ -1303,17 +1310,23 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
             .into(),
     };
     let listen_button = match state.peer_listen_status {
-        crate::PeerListenStatus::Starting { .. } | crate::PeerListenStatus::Listening { .. } => l
-            .control(
-                "close",
-                "Parar de aguardar",
-                Some(Message::StopPeerListener),
-                false,
-            ),
+        crate::PeerListenStatus::Starting { .. }
+        | crate::PeerListenStatus::Listening { .. }
+        | crate::PeerListenStatus::Unauthorized(_)
+        | crate::PeerListenStatus::Connected => l.control(
+            "close",
+            if session_connected {
+                "Desconectar sessão"
+            } else {
+                "Parar listener"
+            },
+            Some(Message::StopPeerListener),
+            false,
+        ),
         _ => l.control(
             "headphones",
             if identity_ready {
-                "Aguardar uma mensagem"
+                "Aguardar peer"
             } else {
                 "Identidade necessária para escutar"
             },
@@ -1333,12 +1346,14 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
     .spacing(l.px(9.0));
     let local = l.panel(column![identity, rule(LINE, 1.0), listening].spacing(l.px(13.0)));
 
-    let send_action =
-        if identity_ready && !matches!(state.peer_send_status, crate::PeerSendStatus::Sending) {
-            Some(Message::SendPeerText)
-        } else {
-            None
-        };
+    let send_action = if identity_ready
+        && !listener_active
+        && !matches!(state.peer_send_status, crate::PeerSendStatus::Connecting)
+    {
+        Some(Message::SendPeerText)
+    } else {
+        session_connected.then_some(Message::SendPeerText)
+    };
     let send_address = row![
         column![
             l.label("ENDEREÇO LAN DO PEER", 10.0, GOLD),
@@ -1360,28 +1375,38 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
         ]
         .spacing(l.px(6.0))
         .width(Fill),
-        l.control("arrow", "Enviar", send_action, true)
+        l.control(
+            "arrow",
+            if session_connected {
+                "Enviar"
+            } else {
+                "Conectar e enviar"
+            },
+            send_action,
+            true
+        )
     ]
     .spacing(l.px(10.0))
     .align_y(iced::Bottom);
     let send_status: Element<'_, Message> = match &state.peer_send_status {
         crate::PeerSendStatus::Idle => l
             .label(
-                "Envio direto · o peer precisa estar aguardando na mesma LAN.",
+                if session_connected {
+                    "Sessão ativa · envie várias mensagens pela mesma conexão."
+                } else {
+                    "Envio direto · conecte ao peer na mesma LAN para iniciar a sessão."
+                },
                 11.0,
                 MUTED,
             )
             .into(),
-        crate::PeerSendStatus::Sending => l
-            .label(
-                "Conectando ao peer pinado e aguardando confirmação…",
-                11.0,
-                GOLD,
-            )
-            .into(),
+        crate::PeerSendStatus::Connecting => {
+            l.label("Conectando ao peer pinado…", 11.0, GOLD).into()
+        }
+        crate::PeerSendStatus::AwaitingAck => l.label("Aguardando ACK do peer…", 11.0, GOLD).into(),
         crate::PeerSendStatus::Sent => l
             .label(
-                "Mensagem entregue; o peer confirmou o recebimento.",
+                "ACK recebido; peer aceitou a mensagem no transcript desta sessão.",
                 11.0,
                 GREEN,
             )
@@ -1438,7 +1463,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
         rule(LINE, 1.0),
         transcript,
         l.label(
-            "Canal QUIC cifrado com chave do dispositivo pinada. Sem descoberta, relay, NAT traversal ou armazenamento.",
+            "Canal QUIC cifrado com identidade do dispositivo pinada. Sem MLS, descoberta, relay, NAT traversal ou armazenamento; ACK confirma inclusão em memória, não leitura.",
             10.0,
             MUTED
         )

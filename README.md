@@ -41,7 +41,7 @@ the HTTP diagnostic and WebSocket handshake.
 
 ## Direct LAN messages
 
-The **chat** button in the Iced app opens a one-shot direct-text screen. This
+The **chat** button in the Iced app opens a persistent direct-text screen. This
 path sends real text over Iroh/QUIC between devices on a reachable LAN; it is
 separate from the Elixir diagnostics and has no hosted service in the data
 path.
@@ -53,24 +53,27 @@ path.
 2. On both devices, paste the other device's public key into **Chave pública do
    peer · pin manual**. This manually pins the peer for both sending and receiving.
 3. On the receiving device, choose a UDP port (for example `45873`) and click
-   **Aguardar uma mensagem**. Share one of the displayed LAN endpoint addresses
+   **Aguardar peer**. Share one of the displayed LAN endpoint addresses
    and the port with the sender. Wildcard addresses such as `0.0.0.0` cannot be
    shared; if no LAN address is announced, check the device's network
    interfaces.
 4. On the sending device, enter the receiver's LAN address and port, type a
-   message, and click **Enviar**. The screen shows a sent message only after the
-   receiver confirms it; received text appears on the listener device after
-   the same pinned identity check.
+   message, and click **Conectar e enviar**. After connection, either device
+   can send multiple messages over the same session. Sent text appears only
+   after an ACK; received text appears live after the pinned identity check.
 
-The listener accepts one message, then stops; click **Aguardar uma mensagem**
-again to receive another. The transcript contains only real messages from the
+The listener stays available through the session. Either side can use
+**Desconectar sessão** to close it; start a new session to reconnect. ACK
+confirms that the peer accepted text into its in-memory transcript, not that
+the user read it. The transcript contains only actual messages from the
 current app session and disappears when the app closes. This is pairwise QUIC
 channel encryption and pinned device identity, not MLS messaging, contact
 verification, or a durable chat. There is no address discovery, relay,
 cross-NAT support, retry/offline delivery, or media. Allow the chosen UDP port
 through each device's local firewall. The automated
-`cargo test --test peer_process` launches two separate OS processes, checks a
-text exchange, and confirms that a listener rejects an unpinned device.
+`cargo test --test peer_process` launches separate OS processes, exchanges
+multiple messages in both directions over one connection, checks wrong-pin
+rejection, and verifies a pending send is reported as unknown on disconnect.
 
 The native app now recreates all eleven design-board views with real Iced
 widgets, original characters and scenery, extracted outline SVG icons,
@@ -122,7 +125,7 @@ the app does not yet create MLS credentials, KeyPackages, or groups.
 
 ![Actual refreshed 1280 × 800 native Iced familiar screen from this transport milestone; Secret Service is unavailable in this capture](docs/design/runtime/native-vhs/01-familiar.png)
 
-![Actual Iced direct-LAN messaging UI; this capture has Secret Service unavailable, so send and listen are disabled](docs/design/runtime/native-vhs/06-chat.png)
+![Actual 1884 × 1000 Iced persistent LAN session UI; Secret Service is unavailable in this capture, so listening and sending are gated](docs/design/runtime/native-vhs/06-chat.png)
 
 ![Actual native Iced home with open scenery and icon-based feature strip, without the frog mage or gnome cutouts](docs/design/runtime/native-vhs/09-home.png)
 
@@ -158,8 +161,8 @@ Assets and font license/provenance notes are in [assets/README.md](assets/README
   storage, peer transport, and media. The encrypted display profile and
   explicit Ed25519 key storage plus initial opaque encrypted-event storage
   are implemented. A pinned-device Iroh/QUIC LAN text exchange is available
-  from the Iced UI with a one-shot listener and session-only transcript; MLS
-  messaging, integrated inbox/history, and media remain unbuilt.
+  from the Iced UI with a persistent bidirectional session and session-only
+  transcript; MLS messaging, integrated inbox/history, and media remain unbuilt.
 - **Server/backend:** Elixir in
   [`slouching-org/slouching-backend`](https://github.com/slouching-org/slouching-backend).
 - **Current boundary:** loopback HTTP status and binary protobuf WebSocket

@@ -27,11 +27,12 @@ routing, MLS transitions, and capture state.
 
 Direct peer messaging uses Iroh/QUIC independently from that local server
 diagnostic. The LAN flow uses the durable Ed25519 device key as the Iroh
-EndpointId and manually pins the expected peer ID on both sides. It sends one
-bounded UTF-8 frame and acknowledgement with relay mode disabled. This provides
+EndpointId and manually pins the expected peer ID on both sides. It sends
+multiple bounded UTF-8 messages over one session stream, with sequence
+acknowledgements and relay mode disabled. This provides
 direct pairwise transport encryption and pinned endpoint authentication only;
 it does not create an MLS group or establish contact pairing. See the
-[LAN text transport contract](../transport/lan-text-v1.md).
+[LAN text transport v2 contract](../transport/lan-text-v2.md).
 
 See [ADR 0003](adr-0003-native-client.md) and the
 [backend stack ficha](https://github.com/slouching-org/slouching-backend/blob/main/docs/fichas/architecture/tech-stack.md).

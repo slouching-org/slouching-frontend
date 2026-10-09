@@ -10,10 +10,12 @@ original scenery, familiar portraits and cutouts, source-derived SVG icons,
 embedded fonts, translucent panels, scanlines, and vignette. The **Telas**
 gallery reaches every view. Home actions open the lobby preview; invitation
 fields edit in-memory values. The chat screen manually pins a peer device key,
-starts a one-message listener, sends text to a LAN address, and shows confirmed
-sends and received messages only in the current session. Familiar selection,
-settings and share-source tabs, and the interface texture toggle work locally. The
-familiar screen saves only the display name and familiar in SQLCipher
+starts a pinned direct listener or connects to a pinned LAN address, and keeps
+a bidirectional session open for multiple messages with live receive and ACK
+states. Received text is added to memory before ACK; sent text appears only
+after ACK. Familiar selection, settings and share-source tabs, and the interface
+texture toggle work locally. The familiar screen saves only the display name
+and familiar in SQLCipher
 encrypted SQLite; its random database key is kept in the operating system
 credential store. Linux requires Secret Service in the user session. A
 separate explicit action generates a local Ed25519 device signing key and
@@ -33,8 +35,8 @@ the UI, MLS, or peer transport; only trusted protocol code may record a real
 receipt.
 
 Character scenes and call views remain visual previews. The chat screen sends
-and receives actual one-shot text over pinned-device Iroh/QUIC; it does not
-write to the local event journal. Camera/microphone actions explain their
+and receives actual multiple-message sessions over pinned-device Iroh/QUIC; it
+does not write to the local event journal. Camera/microphone actions explain their
 unavailable state; verification controls still do not verify MLS membership.
 The app does not enumerate devices, create MLS messages, join calls, or persist
 local conversation history. The settings **Rede & P2P** tab exposes
@@ -68,10 +70,11 @@ no device authentication, application traffic, or messaging.
 
 The chat screen uses a direct-LAN-only Iroh/QUIC transport, separate from the
 Elixir diagnostics. Both sides manually pin the other's Ed25519 device public
-key; QUIC TLS authenticates and encrypts the connection. The listener accepts
-one bounded UTF-8 text frame and acknowledges it. Sent and received messages
-remain only in application memory. This has no relay, address lookup, NAT
-traversal, MLS group, offline delivery, durable history, or trusted contact
-roster. See [LAN text transport v1](../transport/lan-text-v1.md) for framing
-and use. An automated test launches two separate OS processes and checks
-delivery and rejection of an unpinned peer.
+key; QUIC authenticates and encrypts the connection. One bidirectional stream
+exchanges multiple bounded UTF-8 messages with sequence ACKs. ACK means the
+peer added text to its in-memory transcript, not that it read the message. Sent
+and received messages remain only in application memory. This has no relay,
+address lookup, NAT traversal, MLS group, offline delivery, durable history, or trusted contact
+roster. See [LAN text transport v2](../transport/lan-text-v2.md) for framing
+and use. Automated tests launch separate OS processes to check multiple messages
+in both directions, wrong-pin rejection, and pending-send status at disconnect.
