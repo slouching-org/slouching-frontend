@@ -855,7 +855,8 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         );
                     }
                     peer::PeerEvent::MlsCommitAcknowledged { request_id } => {
-                        let Some(event_id) = state.mls_sending_commits.remove(&request_id) else {
+                        let Some(event_id) = state.mls_sending_commits.get(&request_id).copied()
+                        else {
                             state.mls_status =
                                 "ACK de Commit desconhecido; sessão encerrada.".to_owned();
                             if let Some(commands) = state.peer_session_commands.as_ref() {
@@ -1163,6 +1164,12 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         Message::MlsCommitChanged(value) => state.mls_commit = value,
         Message::MlsReceivedCommitChanged(value) => state.mls_received_commit = value,
         Message::DistributeMlsCommit => {
+            if !state.mls_sending_commits.is_empty() {
+                state.mls_status =
+                    "Aguardando a confirmação do Commit atual antes de avançar a cadeia."
+                        .to_owned();
+                return Task::none();
+            }
             if state.peer_session_commands.is_none()
                 || !matches!(state.peer_listen_status, PeerListenStatus::Connected)
             {
@@ -1262,15 +1269,30 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.mls_status = format!("Commit permanece pendente localmente: {error}");
         }
         Message::MlsCommitDelivered(request_id, Ok(())) => {
+            state.mls_sending_commits.remove(&request_id);
             state.mls_status =
                 format!("Commit {request_id} aplicado pelo membro; ACK salvo localmente.");
             if let Ok(group_id) = hex_decode_bytes(&state.mls_group_id)
                 && group_id.len() == 16
             {
-                return load_mls_history(state, group_id);
+                let history = load_mls_history(state, group_id.clone());
+                if matches!(state.peer_listen_status, PeerListenStatus::Connected)
+                    && let Ok(peer) = parse_peer_id(&state.peer_public_key)
+                {
+                    let peer_device = *peer.as_bytes();
+                    return Task::batch([
+                        history,
+                        Task::perform(
+                            load_mls_commits_for_peer_task(group_id.clone(), peer_device),
+                            move |result| Message::MlsCommitsReadyToSend(group_id, result),
+                        ),
+                    ]);
+                }
+                return history;
             }
         }
         Message::MlsCommitDelivered(request_id, Err(error)) => {
+            state.mls_sending_commits.remove(&request_id);
             state.mls_status = format!(
                 "Peer aplicou o Commit {request_id}, mas o ACK local não persistiu: {error}. A redelivery é segura."
             );

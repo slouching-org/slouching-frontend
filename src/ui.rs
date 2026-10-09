@@ -1281,7 +1281,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
         ),
         l.control(
             "arrow",
-            "Enviar próximo Commit ao membro conectado",
+            "Enviar Commits pendentes ao membro conectado",
             Some(Message::DistributeMlsCommit),
             true
         ),

@@ -481,28 +481,6 @@ fn list_queued_mls_commits_for_peer_in(
     if group_id.len() != 16 || !(1..=100).contains(&limit) {
         return Err("MLS group ID must be 16 bytes and limit must be 1..100".to_owned());
     }
-    let group_identifier = GroupId::from_slice(group_id);
-    let group = {
-        let provider = LocalOpenMlsProvider::new(connection);
-        MlsGroup::load(provider.storage(), &group_identifier)
-            .map_err(|error| format!("could not load MLS group membership: {error}"))?
-            .ok_or_else(|| "MLS group state is missing".to_owned())?
-    };
-    let is_member = group.members().any(|member| {
-        MlsSigningKeyBinding::from_bytes(member.credential.serialized_content()).is_some_and(
-            |binding| {
-                binding.device_public_key.as_slice() == peer_device
-                    && binding.verifies_mls_credential(
-                        &binding.device_public_key,
-                        group.ciphersuite().signature_algorithm() as u16,
-                        member.signature_key.as_slice(),
-                    )
-            },
-        )
-    });
-    if !is_member {
-        return Err("o dispositivo conectado não é membro autenticado deste grupo MLS".to_owned());
-    }
     let commits = list_queued_mls_commits_in(connection, group_id, limit)?;
     let mut eligible = Vec::new();
     for commit in commits {
@@ -3115,7 +3093,8 @@ mod tests {
         );
         assert!(
             list_queued_mls_commits_for_peer_in(&mut creator, &group.group_id, &[0x99; 32], 10,)
-                .is_err()
+                .unwrap()
+                .is_empty()
         );
 
         {

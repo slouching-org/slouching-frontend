@@ -95,12 +95,15 @@ sending the transport ACK. The sender marks the outbox event held by the peer
 only after that ACK. Membership Commits are also saved atomically with the
 group epoch in a separate local outbox; the latest pending Commit is restored
 from SQLCipher and can be sent from the MLS screen over an active direct
-session. The sender checks that the pinned peer is an authenticated group
-member recorded at the Commit's predecessor epoch; a newly invited device is
-not sent that older Commit. The recipient validates it and persists the new
+session. The sender matches the pinned peer key to the device snapshot taken
+at the Commit's predecessor epoch; a newly invited device is not sent that
+older Commit, while a removed device can still receive its removal Commit.
+The recipient validates it and persists the new
 epoch before ACK, and the sender stores that ACK per recipient. Exact redelivery
-is harmless. This sends to one connected member at a time; automatic
-multi-member fan-out and offline delivery are still in progress. The MLS screen
+is harmless. One click drains that recipient's pending Commits in epoch order,
+waiting for each durable ACK before sending the next. Repeat after connecting
+to another member; automatic multi-member fan-out and offline delivery remain
+in progress. The MLS screen
 shows each eligible device's persisted adoption ACK. New members join with the
 matching Welcome and ratchet tree. The transcript reloads locally, and **Reenviar pendentes**
 sends queued events for the selected group after reconnecting.
