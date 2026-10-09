@@ -59,6 +59,12 @@ P2P** in Settings retains the real Elixir HTTP/WebSocket diagnostics and
 manual refresh. On Linux, this uses Secret Service, so a desktop password
 vault must be installed and available in the user session.
 
+The encrypted local database now has an event journal schema and storage
+primitives for opaque, already-encrypted inbound and outbound events. It
+deduplicates identical event IDs and rejects reuse with different ciphertext
+or envelope metadata. MLS, inbox/outbox UI, delivery, and transport are not
+connected to these primitives yet; this does not enable chat.
+
 ![Native familiar screen showing local profile and identity keyring status, with a retry action when the system keyring is unavailable](docs/design/runtime/native-vhs/01-familiar.png)
 
 ![Actual native Iced home using the supplied scenery and characters](docs/design/runtime/native-vhs/09-home.png)
@@ -93,8 +99,9 @@ Assets and font license/provenance notes are in [assets/README.md](assets/README
 - **UI:** Rust 2024, Iced 0.14.0 (pinned), wgpu renderer.
 - **Local client core:** Rust owns local identity, cryptography, encrypted
   storage, peer transport, and media. The encrypted display profile and
-  explicit Ed25519 key storage are implemented; authenticated messaging,
-  local inbox/history, direct peer networking, and media remain unbuilt.
+  explicit Ed25519 key storage plus initial opaque encrypted-event storage
+  are implemented; authenticated messaging, integrated inbox/history, direct
+  peer networking, and media remain unbuilt.
 - **Server/backend:** Elixir in
   [`slouching-org/slouching-backend`](https://github.com/slouching-org/slouching-backend).
 - **Current boundary:** loopback HTTP status and binary protobuf WebSocket

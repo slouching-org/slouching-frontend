@@ -18,6 +18,10 @@ messages, and comparison words are marked as illustrative. No peer route,
 media capture, messaging, or call is established by these images.
 Exact parity and accessibility remain open.
 
+These captures show only the native UI. The separate encrypted event-journal
+storage primitives are not connected to the screens, MLS, or delivery and do
+not enable chat.
+
 Reproduce with `cargo run -- --capture-dir /tmp/slouching-captures`.
 Request a size with `SLOUCHING_WINDOW_SIZE=1280x800`; a tiling compositor may
 need this window floated and resized before the six-second capture delay;

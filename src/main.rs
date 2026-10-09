@@ -1,7 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use iced::{Element, Task, Theme, task::Handle};
 
-mod storage;
+pub mod storage;
 mod ui;
 use prost::Message as ProstMessage;
 use serde::Deserialize;

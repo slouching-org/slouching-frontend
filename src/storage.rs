@@ -13,6 +13,24 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
+const PROFILE_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Clone)]
+pub struct EncryptedEvent {
+    pub event_id: [u8; 16],
+    pub author_device: [u8; 32],
+    pub group_id: Vec<u8>,
+    pub epoch: u64,
+    pub checkpoint: Option<Vec<u8>>,
+    pub expires_at_unix: i64,
+    pub ciphertext: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreEventResult {
+    Stored,
+    AlreadyStored,
+}
 
 #[derive(Debug, Clone)]
 pub struct LocalProfile {
@@ -72,29 +90,7 @@ pub fn save_profile(profile: &LocalProfile) -> Result<(), String> {
     if display_name.is_empty() || display_name.chars().count() > 40 {
         return Err("local display name must contain between 1 and 40 characters".to_owned());
     }
-    let entry = key_entry()?;
-    let key = match entry.get_secret() {
-        Ok(bytes) => secret_key(bytes)?,
-        Err(KeyringError::NoEntry) => {
-            let mut key = Zeroizing::new([0_u8; PROFILE_DB_KEY_LEN]);
-            getrandom::fill(key.as_mut())
-                .map_err(|error| format!("could not generate local database key: {error}"))?;
-            entry.set_secret(key.as_ref()).map_err(|error| {
-                format!(
-                    "could not save the local database key in the system credential store: {error}"
-                )
-            })?;
-            key
-        }
-        Err(error) => {
-            return Err(format!(
-                "could not access the system credential store: {error}"
-            ));
-        }
-    };
-
-    let path = database_path()?;
-    let connection = open_database(&path, &key)?;
+    let connection = open_local_database()?;
     connection
         .execute(
             "INSERT INTO local_profile (id, display_name, familiar) VALUES (1, ?1, ?2)
@@ -104,6 +100,109 @@ pub fn save_profile(profile: &LocalProfile) -> Result<(), String> {
         )
         .map_err(|error| format!("could not save encrypted local profile: {error}"))?;
     Ok(())
+}
+
+pub fn new_event_id() -> Result<[u8; 16], String> {
+    loop {
+        let mut event_id = [0_u8; 16];
+        getrandom::fill(&mut event_id)
+            .map_err(|error| format!("could not generate local event id: {error}"))?;
+        if event_id.iter().any(|byte| *byte != 0) {
+            return Ok(event_id);
+        }
+    }
+}
+
+pub fn store_outbound_event(event: &EncryptedEvent) -> Result<StoreEventResult, String> {
+    store_encrypted_event(event, "outbound")
+}
+
+pub fn store_inbound_event(event: &EncryptedEvent) -> Result<StoreEventResult, String> {
+    store_encrypted_event(event, "inbound")
+}
+
+fn store_encrypted_event(
+    event: &EncryptedEvent,
+    direction: &'static str,
+) -> Result<StoreEventResult, String> {
+    if event.event_id.iter().all(|byte| *byte == 0)
+        || event.author_device.iter().all(|byte| *byte == 0)
+        || event.group_id.is_empty()
+        || event.epoch > i64::MAX as u64
+        || event.expires_at_unix <= 0
+        || event.ciphertext.is_empty()
+    {
+        return Err("encrypted event envelope is incomplete or invalid".to_owned());
+    }
+
+    let digest = blake3::hash(&event.ciphertext);
+    let mut connection = open_local_database()?;
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("could not begin local event transaction: {error}"))?;
+    let existing: Option<(Vec<u8>, Vec<u8>, Vec<u8>, i64, Option<Vec<u8>>, i64)> = transaction
+        .query_row(
+            "SELECT ciphertext_digest, ciphertext, group_id, epoch, checkpoint,
+                    expires_at_unix
+             FROM local_events WHERE event_id = ?1",
+            [event.event_id.as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("could not check local event deduplication: {error}"))?;
+
+    if let Some((saved_digest, saved_ciphertext, group_id, epoch, checkpoint, expires_at)) =
+        existing
+    {
+        let saved_digest = blake3::Hash::from_slice(&saved_digest)
+            .map_err(|_| "saved local event has an invalid digest".to_owned())?;
+        if saved_digest != digest
+            || saved_ciphertext != event.ciphertext
+            || group_id != event.group_id
+            || epoch != event.epoch as i64
+            || checkpoint != event.checkpoint
+            || expires_at != event.expires_at_unix
+        {
+            return Err("event id was reused with different ciphertext".to_owned());
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("could not finish local event transaction: {error}"))?;
+        return Ok(StoreEventResult::AlreadyStored);
+    }
+
+    transaction
+        .execute(
+            "INSERT INTO local_events (
+                 event_id, direction, author_device, group_id, epoch, checkpoint,
+                 ciphertext_digest, ciphertext, expires_at_unix
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                event.event_id.as_slice(),
+                direction,
+                event.author_device.as_slice(),
+                event.group_id,
+                event.epoch as i64,
+                event.checkpoint,
+                digest.as_bytes().as_slice(),
+                event.ciphertext,
+                event.expires_at_unix,
+            ],
+        )
+        .map_err(|error| format!("could not persist local encrypted event: {error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("could not commit local encrypted event: {error}"))?;
+    Ok(StoreEventResult::Stored)
 }
 
 pub fn load_identity_public_key() -> Result<Option<[u8; 32]>, String> {
@@ -169,6 +268,30 @@ fn secret_key(bytes: Vec<u8>) -> Result<Zeroizing<[u8; PROFILE_DB_KEY_LEN]>, Str
     Ok(key)
 }
 
+fn open_local_database() -> Result<Connection, String> {
+    let entry = key_entry()?;
+    let key = match entry.get_secret() {
+        Ok(bytes) => secret_key(bytes)?,
+        Err(KeyringError::NoEntry) => {
+            let mut key = Zeroizing::new([0_u8; PROFILE_DB_KEY_LEN]);
+            getrandom::fill(key.as_mut())
+                .map_err(|error| format!("could not generate local database key: {error}"))?;
+            entry.set_secret(key.as_ref()).map_err(|error| {
+                format!(
+                    "could not save the local database key in the system credential store: {error}"
+                )
+            })?;
+            key
+        }
+        Err(error) => {
+            return Err(format!(
+                "could not access the system credential store: {error}"
+            ));
+        }
+    };
+    open_database(&database_path()?, &key)
+}
+
 fn database_path() -> Result<PathBuf, String> {
     let project = ProjectDirs::from("org", "slouching", "Slouching")
         .ok_or_else(|| "could not locate the per-user application data directory".to_owned())?;
@@ -196,23 +319,46 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| format!("could not read local profile schema version: {error}"))?;
-    if version > 1 {
+    if version > PROFILE_SCHEMA_VERSION {
         return Err(format!(
             "local profile database version {version} is newer than this app"
         ));
     }
-    connection
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("could not initialize local profile schema: {error}"))?;
+    transaction
         .execute_batch(
-            "BEGIN IMMEDIATE;
-             CREATE TABLE IF NOT EXISTS local_profile (
+            "CREATE TABLE IF NOT EXISTS local_profile (
                  id INTEGER PRIMARY KEY CHECK (id = 1),
                  display_name TEXT NOT NULL CHECK (length(display_name) BETWEEN 1 AND 40),
                  familiar TEXT NOT NULL CHECK (familiar IN ('frog', 'gnome', 'orb'))
-             );
-             PRAGMA user_version = 1;
-             COMMIT;",
+             );",
         )
         .map_err(|error| format!("could not initialize local profile schema: {error}"))?;
+    if version < 2 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE local_events (
+                     event_id BLOB PRIMARY KEY NOT NULL CHECK (length(event_id) = 16),
+                     direction TEXT NOT NULL CHECK (direction IN ('inbound', 'outbound')),
+                     author_device BLOB NOT NULL CHECK (length(author_device) = 32),
+                     group_id BLOB NOT NULL CHECK (length(group_id) > 0),
+                     epoch INTEGER NOT NULL CHECK (epoch >= 0),
+                     checkpoint BLOB,
+                     ciphertext_digest BLOB NOT NULL CHECK (length(ciphertext_digest) = 32),
+                     ciphertext BLOB NOT NULL CHECK (length(ciphertext) > 0),
+                     expires_at_unix INTEGER NOT NULL CHECK (expires_at_unix > 0)
+                 );
+                 CREATE INDEX local_events_by_group
+                     ON local_events (group_id, epoch, event_id);
+                 PRAGMA user_version = 2;",
+            )
+            .map_err(|error| format!("could not create local event storage: {error}"))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("could not finish local profile migration: {error}"))?;
     Ok(connection)
 }
 
