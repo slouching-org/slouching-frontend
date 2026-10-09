@@ -426,39 +426,17 @@ fn home(state: &Slouching, l: Layout) -> Element<'_, Message> {
         l.label("Explore a prévia · chamadas indisponíveis", 10.0, MUTED)
     ]
     .spacing(l.px(14.0));
-    let frog = l.place(
-        image(assets().images["frog-cutout"].clone())
-            .width(Fill)
-            .height(Fill)
-            .content_fit(ContentFit::Contain),
-        985.0,
-        380.0,
-        230.0,
-        325.0,
-    );
-    let gnome = l.place(
-        image(assets().images["gnome-cutout"].clone())
-            .width(Fill)
-            .height(Fill)
-            .content_fit(ContentFit::Contain),
-        465.0,
-        558.0,
-        83.0,
-        128.0,
-    );
     let features = row![
-        feature(l, "frog", "P2P", "Rotas diretas · planejado"),
-        feature(l, "orb-avatar", "Private", "MLS · planejado"),
-        feature(l, "wizard", "For your crew", "Voice, video, screen"),
-        feature(l, "gnome", "Just vibes", "Always")
+        feature(l, "arrow", "P2P", "Rotas diretas · planejado"),
+        feature(l, "shield", "Private", "MLS · planejado"),
+        feature(l, "users", "For your crew", "Voice, video, screen"),
+        feature(l, "headphones", "Just vibes", "Always")
     ]
     .spacing(l.px(22.0));
     stack![
         title,
         subtitle,
         l.place(actions, 490.0, 366.0, 300.0, 225.0),
-        frog,
-        gnome,
         l.place(l.panel(features), 28.0, 700.0, 1224.0, 78.0)
     ]
     .width(Fill)
@@ -467,12 +445,12 @@ fn home(state: &Slouching, l: Layout) -> Element<'_, Message> {
 }
 fn feature(
     l: Layout,
-    art: &'static str,
+    icon: &'static str,
     title: &'static str,
     detail: &'static str,
 ) -> Element<'static, Message> {
     row![
-        l.picture(art, 40.0, 40.0),
+        l.icon(icon, VIOLET, 34.0),
         column![l.label(title, 13.0, PAPER), l.label(detail, 10.0, MUTED)].spacing(l.px(5.0))
     ]
     .spacing(l.px(14.0))

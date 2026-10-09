@@ -70,7 +70,7 @@ primitives; this does not enable chat.
 
 ![Native familiar screen showing local profile and identity keyring status, with a retry action when the system keyring is unavailable](docs/design/runtime/native-vhs/01-familiar.png)
 
-![Actual native Iced home using the supplied scenery and characters](docs/design/runtime/native-vhs/09-home.png)
+![Actual native Iced home with open scenery and icon-based feature strip, without the frog mage or gnome cutouts](docs/design/runtime/native-vhs/09-home.png)
 
 ![Actual native Iced group-call preview; all media and chat content is illustrative](docs/design/runtime/native-vhs/10-call.png)
 
