@@ -61,6 +61,12 @@ Welcome and ratchet tree to the joining client. Both devices open **Grupo MLS**
 and select the same group ID. Establish the pinned direct LAN session in
 **Texto direto · LAN**, then return to the group screen to send or retry
 messages. Messages are retained in each device's local SQLCipher database.
+When adding later members, copy the committer's pending Commit to each current
+member. They paste it into **Autenticar e aplicar Commit**, which validates the
+MLS signature, designated committer, group and next epoch before persistence.
+The new member uses the matching Welcome and ratchet tree. Commit distribution
+is manual, and each active peer session carries traffic to one remote device;
+automatic group fan-out and helper delivery are not implemented.
 
 Allow the selected UDP port through each device's firewall. Wildcard addresses
 such as `0.0.0.0` cannot be shared. If no LAN address is announced, inspect the
@@ -76,7 +82,10 @@ with a pending send to verify that delivery remains unknown.
 ## Limits
 
 This is direct-LAN-only. It has no relay, address discovery, NAT traversal,
-offline delivery, group event distribution service, Commit distribution, or
-cross-device history sync. MLS group setup remains manual. The protocol v3 ALPN
+offline delivery, group event distribution service, automatic Commit fan-out,
+or cross-device history sync. MLS group setup and membership Commit
+distribution remain manual. The group screen lets existing members authenticate
+and atomically apply a copied Commit before sending in the new epoch; new
+members join through the matching Welcome/ratchet tree. The protocol v3 ALPN
 and frame version are not compatible with v2 peers. The older command-line
 helpers are diagnostic; the supported user-facing flow is in Iced.

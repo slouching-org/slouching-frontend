@@ -23,7 +23,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 8;
+const PROFILE_SCHEMA_VERSION: u32 = 9;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 type StoredEventEnvelope = (
@@ -474,6 +474,12 @@ pub enum ProcessedMlsApplicationEvent {
     Duplicate,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessedMlsCommit {
+    Applied { epoch: u64 },
+    Duplicate { epoch: u64 },
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalProfile {
     pub display_name: String,
@@ -884,6 +890,226 @@ fn process_inbound_mls_application_event_in(
         Ok(ProcessedMlsApplicationEvent::Received(plaintext))
     })();
     finish_sql_transaction(connection, result, "inbound MLS event")
+}
+
+pub fn process_inbound_mls_commit(
+    group_id: &[u8],
+    commit_bytes: &[u8],
+) -> Result<ProcessedMlsCommit, String> {
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let device_identity = signing_key_from_secret(secret)?;
+    let mut connection = open_local_database()?;
+    process_inbound_mls_commit_in(&mut connection, group_id, commit_bytes, &device_identity)
+}
+
+fn process_inbound_mls_commit_in(
+    connection: &mut Connection,
+    group_id: &[u8],
+    commit_bytes: &[u8],
+    device_identity: &SigningKey,
+) -> Result<ProcessedMlsCommit, String> {
+    use openmls::prelude::{
+        MlsMessageIn, ProcessedMessageContent, tls_codec::Deserialize as TlsCodecDeserialize,
+    };
+
+    if group_id.len() != 16 || commit_bytes.is_empty() || commit_bytes.len() > 64 * 1024 {
+        return Err("inbound MLS Commit has an invalid group ID or size".to_owned());
+    }
+    let incoming = MlsMessageIn::tls_deserialize_exact(commit_bytes)
+        .map_err(|error| format!("invalid serialized MLS Commit: {error}"))?
+        .try_into_protocol_message()
+        .map_err(|error| format!("MLS Commit is not a protocol message: {error}"))?;
+    if incoming.group_id().as_slice() != group_id {
+        return Err("MLS Commit belongs to another group".to_owned());
+    }
+    let predecessor_epoch = incoming.epoch().as_u64();
+    let commit_hash = *blake3::hash(commit_bytes).as_bytes();
+    let mut event_id = [0; 16];
+    event_id.copy_from_slice(&commit_hash[..16]);
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| format!("could not begin inbound MLS Commit transaction: {error}"))?;
+    let result = (|| {
+        let policy: (Vec<u8>, i64) = connection
+            .query_row(
+                "SELECT designated_committer_device, epoch
+                 FROM local_mls_groups WHERE group_id = ?1",
+                [group_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| format!("could not load MLS group policy: {error}"))?;
+        if predecessor_epoch < policy.1 as u64 {
+            let existing: Option<(Vec<u8>, Vec<u8>)> = connection
+                .query_row(
+                    "SELECT commit_hash, commit_bytes
+                     FROM local_mls_inbound_commits
+                     WHERE group_id = ?1 AND predecessor_epoch = ?2",
+                    params![group_id, predecessor_epoch as i64],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|error| format!("could not check MLS Commit redelivery: {error}"))?;
+            if let Some((digest, bytes)) = existing {
+                if digest.as_slice() == commit_hash && bytes == commit_bytes {
+                    return Ok(ProcessedMlsCommit::Duplicate {
+                        epoch: predecessor_epoch.saturating_add(1),
+                    });
+                }
+                return Err("conflicting Commit bytes target an already-applied predecessor; authenticated committer evidence is required before quarantine".to_owned());
+            }
+            return Err("MLS Commit predecessor is older than local state but has no matching journal entry".to_owned());
+        }
+        if predecessor_epoch > policy.1 as u64 {
+            return Err(format!(
+                "MLS Commit is out of order: expected predecessor epoch {}, received {predecessor_epoch}",
+                policy.1
+            ));
+        }
+        let collision: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT commit_hash FROM local_mls_inbound_commits WHERE event_id = ?1",
+                [event_id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("could not check MLS Commit event ID: {error}"))?;
+        if collision.is_some() {
+            return Err("MLS Commit event ID collision".to_owned());
+        }
+
+        let (epoch, author_device) = {
+            let provider = LocalOpenMlsProvider::new(connection);
+            let group_identifier = GroupId::from_slice(group_id);
+            let mut group = MlsGroup::load(provider.storage(), &group_identifier)
+                .map_err(|error| format!("could not load MLS group for Commit: {error}"))?
+                .ok_or_else(|| "MLS group state is missing".to_owned())?;
+            if group.epoch().as_u64() != predecessor_epoch {
+                return Err("MLS group epoch disagrees with its local group index".to_owned());
+            }
+            let own_leaf = group
+                .own_leaf()
+                .ok_or_else(|| "local MLS member leaf is missing".to_owned())?;
+            let own_binding =
+                MlsSigningKeyBinding::from_bytes(own_leaf.credential().serialized_content())
+                    .ok_or_else(|| {
+                        "local MLS credential has no device identity binding".to_owned()
+                    })?;
+            if own_binding.device_public_key != device_identity.verifying_key().to_bytes()
+                || !own_binding.verifies_mls_credential(
+                    &own_binding.device_public_key,
+                    group.ciphersuite().signature_algorithm() as u16,
+                    own_leaf.signature_key().as_slice(),
+                )
+            {
+                return Err("MLS group is not bound to this device identity".to_owned());
+            }
+            let processed = group
+                .process_message(&provider, incoming)
+                .map_err(|error| format!("could not authenticate MLS Commit: {error:?}"))?;
+            let sender_binding =
+                MlsSigningKeyBinding::from_bytes(processed.credential().serialized_content())
+                    .ok_or_else(|| "MLS Commit sender has no device identity binding".to_owned())?;
+            let sender_member = group
+                .members()
+                .find(|member| {
+                    member.credential.serialized_content()
+                        == processed.credential().serialized_content()
+                })
+                .ok_or_else(|| "MLS Commit sender is not a current group member".to_owned())?;
+            let author_device = sender_binding.device_public_key;
+            if author_device.as_slice() != policy.0
+                || !sender_binding.verifies_mls_credential(
+                    &author_device,
+                    group.ciphersuite().signature_algorithm() as u16,
+                    sender_member.signature_key.as_slice(),
+                )
+            {
+                return Err("MLS Commit author is not the bound designated committer".to_owned());
+            }
+            let staged_commit = match processed.into_content() {
+                ProcessedMessageContent::StagedCommitMessage(staged) => *staged,
+                _ => return Err("inbound MLS message is not a staged Commit".to_owned()),
+            };
+            if staged_commit.epoch().as_u64() != predecessor_epoch.saturating_add(1) {
+                return Err("MLS Commit does not advance exactly one epoch".to_owned());
+            }
+            for proposal in staged_commit.add_proposals() {
+                let key_package = proposal.add_proposal().key_package();
+                validate_mls_credential_binding(
+                    key_package.leaf_node().credential(),
+                    key_package.leaf_node().signature_key().as_slice(),
+                    group.ciphersuite().signature_algorithm() as u16,
+                )?;
+            }
+            for proposal in staged_commit.update_proposals() {
+                let leaf = proposal.update_proposal().leaf_node();
+                validate_mls_credential_binding(
+                    leaf.credential(),
+                    leaf.signature_key().as_slice(),
+                    group.ciphersuite().signature_algorithm() as u16,
+                )?;
+            }
+            if let Some(leaf) = staged_commit.update_path_leaf_node() {
+                validate_mls_credential_binding(
+                    leaf.credential(),
+                    leaf.signature_key().as_slice(),
+                    group.ciphersuite().signature_algorithm() as u16,
+                )?;
+            }
+            group
+                .merge_staged_commit(&provider, staged_commit)
+                .map_err(|error| format!("could not merge authenticated MLS Commit: {error:?}"))?;
+            (group.epoch().as_u64(), author_device)
+        };
+        if epoch != predecessor_epoch.saturating_add(1) {
+            return Err("merged MLS Commit produced an unexpected group epoch".to_owned());
+        }
+        connection
+            .execute(
+                "INSERT INTO local_mls_inbound_commits
+                    (event_id, group_id, predecessor_epoch, epoch, author_device,
+                     commit_hash, commit_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    event_id.as_slice(),
+                    group_id,
+                    predecessor_epoch as i64,
+                    epoch as i64,
+                    author_device.as_slice(),
+                    commit_hash.as_slice(),
+                    commit_bytes
+                ],
+            )
+            .map_err(|error| format!("could not persist inbound MLS Commit: {error}"))?;
+        let updated = connection
+            .execute(
+                "UPDATE local_mls_groups SET epoch = ?1 WHERE group_id = ?2 AND epoch = ?3",
+                params![epoch as i64, group_id, predecessor_epoch as i64],
+            )
+            .map_err(|error| format!("could not advance indexed MLS group epoch: {error}"))?;
+        if updated != 1 {
+            return Err("MLS group index changed during Commit processing".to_owned());
+        }
+        Ok(ProcessedMlsCommit::Applied { epoch })
+    })();
+    finish_sql_transaction(connection, result, "inbound MLS Commit")
+}
+
+fn validate_mls_credential_binding(
+    credential: &openmls::prelude::Credential,
+    signature_key: &[u8],
+    signature_scheme: u16,
+) -> Result<(), String> {
+    let binding = MlsSigningKeyBinding::from_bytes(credential.serialized_content())
+        .ok_or_else(|| "MLS Commit contains a credential without device binding".to_owned())?;
+    if !binding.verifies_mls_credential(&binding.device_public_key, signature_scheme, signature_key)
+    {
+        return Err("MLS Commit contains an invalid device-bound credential".to_owned());
+    }
+    Ok(())
 }
 
 fn insert_mls_history_in(
@@ -2015,6 +2241,23 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
             )
             .map_err(|error| format!("could not create durable MLS Commit outbox: {error}"))?;
     }
+    if version < 9 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE local_mls_inbound_commits (
+                     event_id BLOB PRIMARY KEY NOT NULL CHECK (length(event_id) = 16),
+                     group_id BLOB NOT NULL CHECK (length(group_id) = 16),
+                     predecessor_epoch INTEGER NOT NULL CHECK (predecessor_epoch >= 0),
+                     epoch INTEGER NOT NULL CHECK (epoch = predecessor_epoch + 1),
+                     author_device BLOB NOT NULL CHECK (length(author_device) = 32),
+                     commit_hash BLOB NOT NULL CHECK (length(commit_hash) = 32),
+                     commit_bytes BLOB NOT NULL CHECK (length(commit_bytes) > 0),
+                     UNIQUE(group_id, predecessor_epoch)
+                 );
+                 PRAGMA user_version = 9;",
+            )
+            .map_err(|error| format!("could not create inbound MLS Commit journal: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -2604,10 +2847,140 @@ mod tests {
             assert_eq!(loaded.members().count(), 2);
         }
 
+        let another_path = directory.join("third.sqlite3");
+        let another_key = [0x56; PROFILE_DB_KEY_LEN];
         let another_identity = SigningKey::from_bytes(&[0x55; 32]);
+        let mut another_device = open_database(&another_path, &another_key)
+            .expect("third device database should initialize");
         let another_package =
-            create_mls_key_package_in(&mut invitee, ciphersuite, &another_identity)
+            create_mls_key_package_in(&mut another_device, ciphersuite, &another_identity)
                 .expect("third device should prepare a KeyPackage");
+        let invitee_binding =
+            create_or_load_mls_signing_key_binding_in(&mut invitee, ciphersuite, &invitee_identity)
+                .expect("existing noncommitter should have a device-bound MLS signer");
+        let noncommitter_commit = {
+            use openmls::prelude::{
+                KeyPackageIn,
+                tls_codec::{Deserialize as TlsCodecDeserialize, Serialize as TlsCodecSerialize},
+            };
+            let provider = LocalOpenMlsProvider::new(&mut invitee);
+            let signer = SignatureKeyPair::read(
+                provider.storage(),
+                &invitee_binding.mls_signing_public_key,
+                ciphersuite.signature_algorithm(),
+            )
+            .expect("noncommitter MLS signing key should load");
+            let key_package = KeyPackageIn::tls_deserialize_exact(&another_package.public_bytes)
+                .expect("third device KeyPackage should decode")
+                .validate(provider.crypto(), ProtocolVersion::Mls10)
+                .expect("third device KeyPackage should validate");
+            let mut group =
+                MlsGroup::load(provider.storage(), &GroupId::from_slice(&group.group_id))
+                    .expect("existing member group should load")
+                    .expect("existing member should have joined the group");
+            let (commit, _, _) = group
+                .add_members(&provider, &signer, &[key_package])
+                .expect("test noncommitter can create a cryptographically valid Commit");
+            commit
+                .tls_serialize_detached()
+                .expect("noncommitter Commit should serialize")
+        };
+        let rejected_noncommitter = process_inbound_mls_commit_in(
+            &mut creator,
+            &group.group_id,
+            &noncommitter_commit,
+            &creator_identity,
+        )
+        .expect_err("a valid MLS Commit from a non-designated member must be rejected");
+        assert!(rejected_noncommitter.contains("designated committer"));
+        {
+            let provider = LocalOpenMlsProvider::new(&mut invitee);
+            let mut local_group =
+                MlsGroup::load(provider.storage(), &GroupId::from_slice(&group.group_id))
+                    .expect("existing member group should reload")
+                    .expect("existing member group should remain stored");
+            local_group
+                .clear_pending_commit(provider.storage())
+                .expect("test should clear its intentionally forged local pending Commit");
+        }
+        let second_admission = add_mls_group_member_in(
+            &mut creator,
+            &group.group_id,
+            &another_package.public_bytes,
+            &creator_identity,
+        )
+        .expect("designated committer should generate the next membership Commit");
+        assert_eq!(second_admission.epoch, 2);
+        let mut tampered_commit = second_admission.commit.clone();
+        let last = tampered_commit
+            .last_mut()
+            .expect("serialized Commit should not be empty");
+        *last ^= 1;
+        assert!(
+            process_inbound_mls_commit_in(
+                &mut invitee,
+                &group.group_id,
+                &tampered_commit,
+                &invitee_identity,
+            )
+            .is_err()
+        );
+        invitee
+            .execute_batch(
+                "CREATE TRIGGER force_inbound_commit_journal_failure
+                 BEFORE INSERT ON local_mls_inbound_commits
+                 BEGIN SELECT RAISE(ABORT, 'simulated inbound journal failure'); END;",
+            )
+            .expect("test should install an inbound Commit journal failure");
+        assert!(
+            process_inbound_mls_commit_in(
+                &mut invitee,
+                &group.group_id,
+                &second_admission.commit,
+                &invitee_identity,
+            )
+            .is_err()
+        );
+        let epoch_after_failed_journal: i64 = invitee
+            .query_row(
+                "SELECT epoch FROM local_mls_groups WHERE group_id = ?1",
+                [&group.group_id],
+                |row| row.get(0),
+            )
+            .expect("local group epoch should remain queryable after rollback");
+        assert_eq!(epoch_after_failed_journal, 1);
+        invitee
+            .execute_batch("DROP TRIGGER force_inbound_commit_journal_failure;")
+            .expect("test should remove inbound journal failure");
+        assert_eq!(
+            process_inbound_mls_commit_in(
+                &mut invitee,
+                &group.group_id,
+                &second_admission.commit,
+                &invitee_identity,
+            )
+            .expect("existing member should authenticate and merge the committer's Commit"),
+            ProcessedMlsCommit::Applied { epoch: 2 }
+        );
+        assert_eq!(
+            process_inbound_mls_commit_in(
+                &mut invitee,
+                &group.group_id,
+                &second_admission.commit,
+                &invitee_identity,
+            )
+            .expect("exact Commit redelivery should be idempotent"),
+            ProcessedMlsCommit::Duplicate { epoch: 2 }
+        );
+        let invitee_group_epoch: i64 = invitee
+            .query_row(
+                "SELECT epoch FROM local_mls_groups WHERE group_id = ?1",
+                [&group.group_id],
+                |row| row.get(0),
+            )
+            .expect("existing member's group index should advance with the Commit");
+        assert_eq!(invitee_group_epoch, 2);
+
         let unauthorized = add_mls_group_member_in(
             &mut invitee,
             &group.group_id,
@@ -2617,6 +2990,7 @@ mod tests {
         .expect_err("a non-designated member must not create the group Commit");
         assert!(unauthorized.contains("designated MLS committer"));
 
+        drop(another_device);
         drop(invitee);
         drop(creator);
         fs::remove_dir_all(directory).expect("temporary database directory should be removed");

@@ -94,9 +94,11 @@ ciphertext, ratchet update, and plaintext transcript in SQLCipher before
 sending the transport ACK. The sender marks the outbox event held by the peer
 only after that ACK. Membership Commits are also saved atomically with the
 group epoch in a separate local outbox; the latest pending Commit is restored
-from SQLCipher and can be copied for distribution to existing members. Commit
-transport and adoption by existing members are still in progress. The transcript
-reloads locally, and **Reenviar pendentes**
+from SQLCipher and can be copied for distribution to existing members. Current
+members paste it into **Autenticar e aplicar Commit** before sending at the new
+epoch. New members join with the matching Welcome and ratchet tree. Commit
+distribution is manual; automatic fan-out is still in progress. Each direct
+session addresses one remote device. The transcript reloads locally, and **Reenviar pendentes**
 sends queued events for the selected group after reconnecting.
 
 Familiar selection, invitation/draft fields, screen navigation, settings
@@ -158,8 +160,8 @@ Assets and font license/provenance notes are in [assets/README.md](assets/README
   from the Iced UI with a persistent bidirectional session and per-peer history
   in SQLCipher. MLS application messages use the direct pinned Iroh/QUIC session with a
   local SQLCipher transcript and retryable outbox. Membership Commit bytes are
-  atomically journaled with group state; Commit distribution/adoption, helper
-  delivery, and media remain in progress.
+  atomically journaled with group state; manual import/apply is available, while
+  automatic Commit fan-out, helper delivery, and media remain in progress.
 - **Server/backend:** Elixir in
   [`slouching-org/slouching-backend`](https://github.com/slouching-org/slouching-backend).
 - **Current boundary:** loopback HTTP status and binary protobuf WebSocket

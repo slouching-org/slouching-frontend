@@ -193,6 +193,7 @@ struct Slouching {
     mls_key_package: String,
     mls_invite_key_package: String,
     mls_commit: String,
+    mls_received_commit: String,
     mls_welcome: String,
     mls_ratchet_tree: String,
     mls_status: String,
@@ -316,6 +317,7 @@ impl Default for Slouching {
             mls_key_package: String::new(),
             mls_invite_key_package: String::new(),
             mls_commit: String::new(),
+            mls_received_commit: String::new(),
             mls_welcome: String::new(),
             mls_ratchet_tree: String::new(),
             mls_status: "Crie uma identidade do dispositivo para começar.".to_owned(),
@@ -380,6 +382,9 @@ enum Message {
     MlsKeyPackageChanged(String),
     MlsInviteKeyPackageChanged(String),
     MlsCommitChanged(String),
+    MlsReceivedCommitChanged(String),
+    ApplyMlsCommit,
+    MlsCommitProcessed(Result<storage::ProcessedMlsCommit, String>),
     MlsWelcomeChanged(String),
     MlsRatchetTreeChanged(String),
     CreateMlsGroup,
@@ -1098,6 +1103,43 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         Message::CopyMlsValue(value) => return iced::clipboard::write(value),
         Message::MlsMessageDraftChanged(value) => state.mls_message_draft = value,
         Message::MlsCommitChanged(value) => state.mls_commit = value,
+        Message::MlsReceivedCommitChanged(value) => state.mls_received_commit = value,
+        Message::ApplyMlsCommit => {
+            let group_id = match hex_decode_bytes(&state.mls_group_id) {
+                Ok(group_id) if group_id.len() == 16 => group_id,
+                _ => {
+                    state.mls_status =
+                        "Informe o ID do grupo MLS ingressado neste dispositivo.".to_owned();
+                    return Task::none();
+                }
+            };
+            let commit = match hex_decode_bytes(&state.mls_received_commit) {
+                Ok(commit) => commit,
+                Err(error) => {
+                    state.mls_status = format!("Commit recebido inválido: {error}");
+                    return Task::none();
+                }
+            };
+            state.mls_status = "Autenticando o Commit e avançando o epoch local…".to_owned();
+            return Task::perform(
+                process_mls_commit_task(group_id, commit),
+                Message::MlsCommitProcessed,
+            );
+        }
+        Message::MlsCommitProcessed(Ok(result)) => {
+            state.mls_received_commit.clear();
+            state.mls_status = match result {
+                storage::ProcessedMlsCommit::Applied { epoch } => {
+                    format!("Commit autenticado e aplicado; grupo agora está no epoch {epoch}.")
+                }
+                storage::ProcessedMlsCommit::Duplicate { epoch } => {
+                    format!("Commit já aplicado anteriormente; grupo permanece no epoch {epoch}.")
+                }
+            };
+        }
+        Message::MlsCommitProcessed(Err(error)) => {
+            state.mls_status = format!("Commit MLS rejeitado sem avançar o grupo: {error}");
+        }
         Message::MlsHistoryLoaded(group_id, result) => {
             if state.mls_history_group.as_deref() == Some(group_id.as_slice()) {
                 match result {
@@ -1709,6 +1751,15 @@ async fn update_mls_outbound_state_task(event_id: [u8; 16]) -> Result<(), String
     })
     .await
     .map_err(|error| format!("MLS delivery state task failed: {error}"))?
+}
+
+async fn process_mls_commit_task(
+    group_id: Vec<u8>,
+    commit: Vec<u8>,
+) -> Result<storage::ProcessedMlsCommit, String> {
+    tokio::task::spawn_blocking(move || storage::process_inbound_mls_commit(&group_id, &commit))
+        .await
+        .map_err(|error| format!("MLS Commit task failed: {error}"))?
 }
 
 fn hex_decode_bytes(value: &str) -> Result<Vec<u8>, String> {

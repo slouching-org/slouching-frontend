@@ -1268,6 +1268,19 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             (!state.mls_ratchet_tree.is_empty())
                 .then(|| Message::CopyMlsValue(state.mls_ratchet_tree.clone())),
             false
+        ),
+        rule(LINE, 1.0),
+        l.label("COMMIT RECEBIDO DO MEMBRO DESIGNADO", 10.0, GOLD),
+        l.input(
+            "Cole o Commit hexadecimal",
+            &state.mls_received_commit,
+            Message::MlsReceivedCommitChanged
+        ),
+        l.control(
+            "check",
+            "Autenticar e aplicar Commit",
+            Some(Message::ApplyMlsCommit),
+            true
         )
     ]
     .spacing(l.px(9.0));
