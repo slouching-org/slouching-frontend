@@ -2,7 +2,8 @@ use crate::identity::MlsSigningKeyBinding;
 use directories::ProjectDirs;
 use ed25519_dalek::SigningKey;
 use keyring::{Entry, Error as KeyringError};
-use openmls::prelude::OpenMlsProvider;
+use openmls::prelude::{Ciphersuite, OpenMlsProvider};
+use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
 use openmls_sqlite_storage::{Codec as OpenMlsCodec, SqliteStorageProvider};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -18,7 +19,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 3;
+const PROFILE_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Default)]
 struct OpenMlsJsonCodec;
@@ -562,6 +563,91 @@ pub fn sign_mls_identity_binding(
     )
 }
 
+/// Creates or loads this device's MLS signing key for the caller-selected suite,
+/// persists it in the encrypted local database, and signs its public key with
+/// the existing long-term device identity.
+pub fn create_or_load_mls_signing_key_binding(
+    ciphersuite: Ciphersuite,
+) -> Result<MlsSigningKeyBinding, String> {
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let device_identity = signing_key_from_secret(secret)?;
+    let mut connection = open_local_database()?;
+    create_or_load_mls_signing_key_binding_in(&mut connection, ciphersuite, &device_identity)
+}
+
+fn create_or_load_mls_signing_key_binding_in(
+    connection: &mut Connection,
+    ciphersuite: Ciphersuite,
+    device_identity: &SigningKey,
+) -> Result<MlsSigningKeyBinding, String> {
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| format!("could not begin MLS signing-key transaction: {error}"))?;
+    let result = (|| {
+        let signature_scheme = ciphersuite.signature_algorithm();
+        let ciphersuite_id = ciphersuite as u16;
+        let stored_public_key = connection
+            .query_row(
+                "SELECT public_key FROM local_mls_signing_keys WHERE ciphersuite = ?1",
+                [ciphersuite_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|error| format!("could not read MLS signing-key index: {error}"))?;
+        let (binding, new_public_key) = {
+            let storage = SqliteStorageProvider::<OpenMlsJsonCodec, _>::new(&mut *connection);
+            let signer = if let Some(public_key) = stored_public_key.as_ref() {
+                SignatureKeyPair::read(&storage, public_key, signature_scheme).ok_or_else(|| {
+                    "MLS signing-key index points to missing key material; refusing to rotate identity silently".to_owned()
+                })?
+            } else {
+                let signer = SignatureKeyPair::new(signature_scheme)
+                    .map_err(|error| format!("could not generate MLS signing key: {error:?}"))?;
+                signer
+                    .store(&storage)
+                    .map_err(|error| format!("could not persist MLS signing key: {error}"))?;
+                signer
+            };
+            let binding = MlsSigningKeyBinding::sign(
+                device_identity,
+                signature_scheme as u16,
+                signer.public(),
+            )
+            .ok_or_else(|| "OpenMLS returned an invalid signing public key".to_owned())?;
+            let public_key = if stored_public_key.is_none() {
+                Some(signer.to_public_vec())
+            } else {
+                None
+            };
+            (binding, public_key)
+        };
+        if let Some(public_key) = new_public_key {
+            connection
+                .execute(
+                    "INSERT INTO local_mls_signing_keys (ciphersuite, public_key) VALUES (?1, ?2)",
+                    params![ciphersuite_id, public_key],
+                )
+                .map_err(|error| format!("could not index MLS signing key: {error}"))?;
+        }
+        Ok(binding)
+    })();
+    match result {
+        Ok(binding) => {
+            connection.execute_batch("COMMIT").map_err(|error| {
+                format!("could not commit MLS signing-key transaction: {error}")
+            })?;
+            Ok(binding)
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 fn key_entry() -> Result<Entry, String> {
     Entry::new(SERVICE, KEY_NAME)
         .map_err(|error| format!("system credential store is unavailable: {error}"))
@@ -700,6 +786,17 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
             )
             .map_err(|error| format!("could not migrate local outbox state: {error}"))?;
     }
+    if version < 4 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE local_mls_signing_keys (
+                     ciphersuite INTEGER PRIMARY KEY NOT NULL CHECK (ciphersuite BETWEEN 1 AND 65535),
+                     public_key BLOB NOT NULL CHECK (length(public_key) > 0)
+                 );
+                 PRAGMA user_version = 4;",
+            )
+            .map_err(|error| format!("could not create local MLS signing-key index: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -757,6 +854,7 @@ fn restrict_directory_permissions(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::BINDING_VERSION;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -824,6 +922,65 @@ mod tests {
             assert_eq!(signature_key_count, 1);
         }
 
+        fs::remove_dir_all(directory).expect("temporary database files should be removed");
+    }
+
+    #[test]
+    fn mls_signing_binding_is_stable_across_database_reopen() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-mls-binding-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary database directory should be created");
+        let path = directory.join("profile.sqlite3");
+        let database_key = [0x4c; PROFILE_DB_KEY_LEN];
+        let device_identity = SigningKey::from_bytes(&[0x27; 32]);
+        let device_public_key = device_identity.verifying_key().to_bytes();
+        let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+
+        let mut connection = open_database(&path, &database_key)
+            .expect("temporary database should initialize with SQLCipher and OpenMLS");
+        let first = create_or_load_mls_signing_key_binding_in(
+            &mut connection,
+            ciphersuite,
+            &device_identity,
+        )
+        .expect("MLS signer and device-signed binding should be created");
+        assert_eq!(
+            first.signature_scheme,
+            ciphersuite.signature_algorithm() as u16
+        );
+        assert_eq!(first.version, BINDING_VERSION);
+        assert!(first.verify(&device_public_key));
+        drop(connection);
+
+        let mut reopened = open_database(&path, &database_key)
+            .expect("encrypted database should reopen with stored MLS key");
+        let second =
+            create_or_load_mls_signing_key_binding_in(&mut reopened, ciphersuite, &device_identity)
+                .expect("stored MLS signer and binding should load");
+        assert_eq!(second, first);
+        assert!(second.verify(&device_public_key));
+
+        let p256_suite = Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256;
+        let p256_binding =
+            create_or_load_mls_signing_key_binding_in(&mut reopened, p256_suite, &device_identity)
+                .expect("caller-selected P-256 suite should create its own MLS signing key");
+        assert_eq!(
+            p256_binding.signature_scheme,
+            p256_suite.signature_algorithm() as u16
+        );
+        assert_ne!(
+            p256_binding.mls_signing_public_key,
+            second.mls_signing_public_key
+        );
+        assert!(p256_binding.verify(&device_public_key));
+
+        drop(reopened);
         fs::remove_dir_all(directory).expect("temporary database files should be removed");
     }
 }
