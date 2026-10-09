@@ -3,8 +3,9 @@ use directories::ProjectDirs;
 use ed25519_dalek::SigningKey;
 use keyring::{Entry, Error as KeyringError};
 use openmls::prelude::{
-    BasicCredential, Ciphersuite, CredentialWithKey, GroupId, KeyPackage, MlsGroup,
-    MlsGroupCreateConfig, OpenMlsProvider, tls_codec::Serialize as TlsCodecSerialize,
+    BasicCredential, Ciphersuite, CredentialWithKey, GroupId, KeyPackage, KeyPackageIn, MlsGroup,
+    MlsGroupCreateConfig, MlsGroupJoinConfig, MlsMessageBodyIn, MlsMessageIn, OpenMlsProvider,
+    ProtocolVersion, RatchetTreeIn, StagedWelcome, tls_codec::Serialize as TlsCodecSerialize,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
@@ -135,6 +136,26 @@ pub struct PreparedMlsKeyPackage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedMlsGroup {
+    pub group_id: Vec<u8>,
+    pub ciphersuite: u16,
+    pub epoch: u64,
+    pub designated_committer_device: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddedMlsMember {
+    pub group_id: Vec<u8>,
+    pub epoch: u64,
+    /// Public MLS Commit bytes to distribute alongside the Welcome.
+    pub commit: Vec<u8>,
+    /// Encrypted MLS Welcome bytes for the admitted member.
+    pub welcome: Vec<u8>,
+    /// Public ratchet tree required to process the Welcome.
+    pub ratchet_tree: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinedMlsGroup {
     pub group_id: Vec<u8>,
     pub ciphersuite: u16,
     pub epoch: u64,
@@ -678,6 +699,258 @@ pub fn create_mls_group(ciphersuite: Ciphersuite) -> Result<CreatedMlsGroup, Str
     let device_identity = signing_key_from_secret(secret)?;
     let mut connection = open_local_database()?;
     create_mls_group_in(&mut connection, ciphersuite, &device_identity)
+}
+
+/// Admit one device-bound KeyPackage to a local MLS group. The local creator
+/// device is the only device allowed to create the Commit; callers must deliver
+/// both returned public messages to the invitee and existing group members.
+pub fn add_mls_group_member(
+    group_id: &[u8],
+    serialized_key_package: &[u8],
+) -> Result<AddedMlsMember, String> {
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let device_identity = signing_key_from_secret(secret)?;
+    let mut connection = open_local_database()?;
+    add_mls_group_member_in(
+        &mut connection,
+        group_id,
+        serialized_key_package,
+        &device_identity,
+    )
+}
+
+fn add_mls_group_member_in(
+    connection: &mut Connection,
+    group_id: &[u8],
+    serialized_key_package: &[u8],
+    device_identity: &SigningKey,
+) -> Result<AddedMlsMember, String> {
+    use openmls::prelude::tls_codec::Deserialize as TlsCodecDeserialize;
+
+    let group_id = GroupId::from_slice(group_id);
+    let device_public_key = device_identity.verifying_key().to_bytes();
+    let designated_committer: Vec<u8> = connection
+        .query_row(
+            "SELECT designated_committer_device FROM local_mls_groups WHERE group_id = ?1",
+            [group_id.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("could not load local MLS group policy: {error}"))?;
+    if designated_committer.as_slice() != device_public_key {
+        return Err("this device is not the designated MLS committer".to_owned());
+    }
+
+    let incoming = KeyPackageIn::tls_deserialize_exact(serialized_key_package)
+        .map_err(|error| format!("invalid serialized MLS KeyPackage: {error}"))?;
+    let (package, ciphersuite, candidate_device) = {
+        let provider = LocalOpenMlsProvider::new(connection);
+        let package = incoming
+            .validate(provider.crypto(), ProtocolVersion::Mls10)
+            .map_err(|error| format!("MLS KeyPackage validation failed: {error:?}"))?;
+        let ciphersuite = package.ciphersuite();
+        let binding =
+            MlsSigningKeyBinding::from_bytes(package.leaf_node().credential().serialized_content())
+                .ok_or_else(|| "KeyPackage credential has no valid device binding".to_owned())?;
+        if !binding.verifies_mls_credential(
+            &binding.device_public_key,
+            ciphersuite.signature_algorithm() as u16,
+            package.leaf_node().signature_key().as_slice(),
+        ) {
+            return Err("KeyPackage MLS key does not match its device binding".to_owned());
+        }
+        (package, ciphersuite, binding.device_public_key)
+    };
+    let committer_binding =
+        create_or_load_mls_signing_key_binding_in(connection, ciphersuite, device_identity)?;
+
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| format!("could not begin MLS member-add transaction: {error}"))?;
+    let result = (|| {
+        let (added, epoch) = {
+            let provider = LocalOpenMlsProvider::new(connection);
+            let mut group = MlsGroup::load(provider.storage(), &group_id)
+                .map_err(|error| format!("could not load MLS group: {error}"))?
+                .ok_or_else(|| "MLS group state is missing".to_owned())?;
+            if group.ciphersuite() != ciphersuite {
+                return Err("KeyPackage ciphersuite does not match the MLS group".to_owned());
+            }
+            if candidate_device == device_public_key {
+                return Err("the designated committer cannot invite its own device".to_owned());
+            }
+            if group.members().any(|member| {
+                MlsSigningKeyBinding::from_bytes(member.credential.serialized_content())
+                    .is_some_and(|binding| binding.device_public_key == candidate_device)
+            }) {
+                return Err("this device is already a member of the MLS group".to_owned());
+            }
+            let signer = SignatureKeyPair::read(
+                provider.storage(),
+                &committer_binding.mls_signing_public_key,
+                ciphersuite.signature_algorithm(),
+            )
+            .ok_or_else(|| "designated committer signing key is missing".to_owned())?;
+            let (commit, welcome, _) = group
+                .add_members(&provider, &signer, &[package])
+                .map_err(|error| format!("could not add MLS group member: {error:?}"))?;
+            group
+                .merge_pending_commit(&provider)
+                .map_err(|error| format!("could not persist MLS membership commit: {error:?}"))?;
+            let added = AddedMlsMember {
+                group_id: group.group_id().to_vec(),
+                epoch: group.epoch().as_u64(),
+                commit: commit
+                    .tls_serialize_detached()
+                    .map_err(|error| format!("could not serialize MLS Commit: {error}"))?,
+                welcome: welcome
+                    .tls_serialize_detached()
+                    .map_err(|error| format!("could not serialize MLS Welcome: {error}"))?,
+                ratchet_tree: group
+                    .export_ratchet_tree()
+                    .tls_serialize_detached()
+                    .map_err(|error| format!("could not serialize MLS ratchet tree: {error}"))?,
+            };
+            (added, group.epoch().as_u64())
+        };
+        let updated = connection
+            .execute(
+                "UPDATE local_mls_groups SET epoch = ?1 WHERE group_id = ?2",
+                params![epoch as i64, group_id.as_slice()],
+            )
+            .map_err(|error| format!("could not update local MLS group epoch: {error}"))?;
+        if updated != 1 {
+            return Err("local MLS group index disappeared during member addition".to_owned());
+        }
+        Ok(added)
+    })();
+    finish_sql_transaction(connection, result, "MLS member-add")
+}
+
+/// Process an MLS Welcome for a locally stored KeyPackage and persist the
+/// admitted group in this device's encrypted database.
+pub fn join_mls_group_from_welcome(
+    serialized_welcome: &[u8],
+    serialized_ratchet_tree: &[u8],
+) -> Result<JoinedMlsGroup, String> {
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let device_identity = signing_key_from_secret(secret)?;
+    let mut connection = open_local_database()?;
+    join_mls_group_from_welcome_in(
+        &mut connection,
+        serialized_welcome,
+        serialized_ratchet_tree,
+        &device_identity,
+    )
+}
+
+fn join_mls_group_from_welcome_in(
+    connection: &mut Connection,
+    serialized_welcome: &[u8],
+    serialized_ratchet_tree: &[u8],
+    device_identity: &SigningKey,
+) -> Result<JoinedMlsGroup, String> {
+    use openmls::prelude::tls_codec::Deserialize as TlsCodecDeserialize;
+
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| format!("could not begin MLS Welcome transaction: {error}"))?;
+    let result = (|| {
+        let joined = {
+            let provider = LocalOpenMlsProvider::new(connection);
+            let message = MlsMessageIn::tls_deserialize_exact(serialized_welcome)
+                .map_err(|error| format!("invalid serialized MLS Welcome: {error}"))?;
+            let welcome = match message.extract() {
+                MlsMessageBodyIn::Welcome(welcome) => welcome,
+                _ => return Err("MLS message is not a Welcome".to_owned()),
+            };
+            let ratchet_tree = RatchetTreeIn::tls_deserialize_exact(serialized_ratchet_tree)
+                .map_err(|error| format!("invalid serialized MLS ratchet tree: {error}"))?;
+            let staged = StagedWelcome::new_from_welcome(
+                &provider,
+                &MlsGroupJoinConfig::default(),
+                welcome,
+                Some(ratchet_tree),
+            )
+            .map_err(|error| format!("could not process MLS Welcome: {error:?}"))?;
+            let device_public_key = device_identity.verifying_key().to_bytes();
+            let suite = staged.group_context().ciphersuite();
+            let own_leaf = staged
+                .own_leaf_node()
+                .ok_or_else(|| "MLS Welcome has no local member leaf".to_owned())?;
+            let own_binding =
+                MlsSigningKeyBinding::from_bytes(own_leaf.credential().serialized_content())
+                    .ok_or_else(|| "Welcome member credential has no device binding".to_owned())?;
+            if !own_binding.verifies_mls_credential(
+                &device_public_key,
+                suite.signature_algorithm() as u16,
+                own_leaf.signature_key().as_slice(),
+            ) {
+                return Err("Welcome KeyPackage does not belong to this device".to_owned());
+            }
+            let sender = staged
+                .welcome_sender()
+                .map_err(|error| format!("could not inspect MLS Welcome sender: {error}"))?;
+            let sender_binding =
+                MlsSigningKeyBinding::from_bytes(sender.credential().serialized_content())
+                    .ok_or_else(|| "Welcome sender credential has no device binding".to_owned())?;
+            if !sender_binding.verifies_mls_credential(
+                &sender_binding.device_public_key,
+                suite.signature_algorithm() as u16,
+                sender.signature_key().as_slice(),
+            ) {
+                return Err("Welcome sender MLS key does not match its device binding".to_owned());
+            }
+            let group = staged
+                .into_group(&provider)
+                .map_err(|error| format!("could not persist joined MLS group: {error:?}"))?;
+            JoinedMlsGroup {
+                group_id: group.group_id().to_vec(),
+                ciphersuite: group.ciphersuite() as u16,
+                epoch: group.epoch().as_u64(),
+                designated_committer_device: sender_binding.device_public_key,
+            }
+        };
+        connection
+            .execute(
+                "INSERT INTO local_mls_groups
+                    (group_id, ciphersuite, designated_committer_device, epoch)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    joined.group_id,
+                    joined.ciphersuite,
+                    joined.designated_committer_device.as_slice(),
+                    joined.epoch as i64
+                ],
+            )
+            .map_err(|error| format!("could not index joined MLS group: {error}"))?;
+        Ok(joined)
+    })();
+    finish_sql_transaction(connection, result, "MLS Welcome")
+}
+
+fn finish_sql_transaction<T>(
+    connection: &Connection,
+    result: Result<T, String>,
+    operation: &str,
+) -> Result<T, String> {
+    match result {
+        Ok(value) => {
+            connection
+                .execute_batch("COMMIT")
+                .map_err(|error| format!("could not commit {operation} transaction: {error}"))?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 fn create_mls_group_in(
@@ -1309,5 +1582,95 @@ mod tests {
 
         drop(connection);
         fs::remove_dir_all(directory).expect("temporary database files should be removed");
+    }
+
+    #[test]
+    fn designated_committer_adds_device_bound_member_and_invitee_joins_welcome() {
+        use openmls::prelude::{Ciphersuite, GroupId, MlsGroup};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-mls-admission-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary database directory should be created");
+        let creator_path = directory.join("creator.sqlite3");
+        let invitee_path = directory.join("invitee.sqlite3");
+        let creator_key = [0x51; PROFILE_DB_KEY_LEN];
+        let invitee_key = [0x52; PROFILE_DB_KEY_LEN];
+        let creator_identity = SigningKey::from_bytes(&[0x53; 32]);
+        let invitee_identity = SigningKey::from_bytes(&[0x54; 32]);
+        let creator_public_key = creator_identity.verifying_key().to_bytes();
+        let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+
+        let mut creator =
+            open_database(&creator_path, &creator_key).expect("creator database should initialize");
+        let group = create_mls_group_in(&mut creator, ciphersuite, &creator_identity)
+            .expect("creator should create a local MLS group");
+
+        let mut invitee =
+            open_database(&invitee_path, &invitee_key).expect("invitee database should initialize");
+        let package = create_mls_key_package_in(&mut invitee, ciphersuite, &invitee_identity)
+            .expect("invitee should prepare a device-bound KeyPackage");
+        let admission = add_mls_group_member_in(
+            &mut creator,
+            &group.group_id,
+            &package.public_bytes,
+            &creator_identity,
+        )
+        .expect("designated committer should add the valid KeyPackage");
+        assert_eq!(admission.group_id, group.group_id);
+        assert_eq!(admission.epoch, 1);
+        assert!(!admission.commit.is_empty());
+        assert!(!admission.welcome.is_empty());
+
+        let joined = join_mls_group_from_welcome_in(
+            &mut invitee,
+            &admission.welcome,
+            &admission.ratchet_tree,
+            &invitee_identity,
+        )
+        .expect("invitee should process Welcome using its stored KeyPackage bundle");
+        assert_eq!(joined.group_id, group.group_id);
+        assert_eq!(joined.ciphersuite, ciphersuite as u16);
+        assert_eq!(joined.epoch, 1);
+        assert_eq!(joined.designated_committer_device, creator_public_key);
+
+        {
+            let provider = LocalOpenMlsProvider::new(&mut creator);
+            let loaded = MlsGroup::load(provider.storage(), &GroupId::from_slice(&group.group_id))
+                .expect("creator group should reload")
+                .expect("creator group should persist");
+            assert_eq!(loaded.epoch().as_u64(), 1);
+            assert_eq!(loaded.members().count(), 2);
+        }
+        {
+            let provider = LocalOpenMlsProvider::new(&mut invitee);
+            let loaded = MlsGroup::load(provider.storage(), &GroupId::from_slice(&group.group_id))
+                .expect("invitee group should reload")
+                .expect("Welcome should persist joined group");
+            assert_eq!(loaded.epoch().as_u64(), 1);
+            assert_eq!(loaded.members().count(), 2);
+        }
+
+        let another_identity = SigningKey::from_bytes(&[0x55; 32]);
+        let another_package =
+            create_mls_key_package_in(&mut invitee, ciphersuite, &another_identity)
+                .expect("third device should prepare a KeyPackage");
+        let unauthorized = add_mls_group_member_in(
+            &mut invitee,
+            &group.group_id,
+            &another_package.public_bytes,
+            &invitee_identity,
+        )
+        .expect_err("a non-designated member must not create the group Commit");
+        assert!(unauthorized.contains("designated MLS committer"));
+
+        drop(invitee);
+        drop(creator);
+        fs::remove_dir_all(directory).expect("temporary database directory should be removed");
     }
 }

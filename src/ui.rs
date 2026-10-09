@@ -1277,16 +1277,45 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
             let direct = addresses
                 .iter()
                 .filter(|address| !address.ip().is_unspecified() && !address.ip().is_loopback())
-                .map(ToString::to_string)
                 .collect::<Vec<_>>();
-            let detail = if direct.is_empty() {
-                format!(
-                    "Aguardando sessão · UDP {port}. Nenhum IP LAN foi anunciado; consulte as interfaces de rede. Não compartilhe 0.0.0.0: é um endereço curinga."
+            if direct.is_empty() {
+                l.label(
+                    format!(
+                        "Aguardando sessão · UDP {port}. Nenhum IP LAN foi anunciado; consulte as interfaces de rede. Não compartilhe 0.0.0.0: é um endereço curinga."
+                    ),
+                    11.0,
+                    GREEN,
                 )
+                .into()
             } else {
-                format!("Aguardando sessão · compartilhe: {}", direct.join("  ou  "))
-            };
-            l.label(detail, 11.0, GREEN).into()
+                let lan_address = direct
+                    .iter()
+                    .find(|address| {
+                        matches!(address.ip(), std::net::IpAddr::V4(ip) if ip.is_private())
+                    })
+                    .copied()
+                    .unwrap_or(direct[0]);
+                let addresses = direct
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("  ou  ");
+                column![
+                    l.label(
+                        format!("Aguardando sessão · compartilhe: {addresses}"),
+                        11.0,
+                        GREEN
+                    ),
+                    l.control(
+                        "copy",
+                        "Copiar endereço LAN",
+                        Some(Message::CopyPeerListenAddress(lan_address.to_string())),
+                        false,
+                    )
+                ]
+                .spacing(l.px(6.0))
+                .into()
+            }
         }
         crate::PeerListenStatus::Connected => l
             .label("Conectado · sessão direta ativa", 11.0, GREEN)

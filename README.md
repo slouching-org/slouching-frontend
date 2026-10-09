@@ -53,10 +53,11 @@ path.
 2. On both devices, paste the other device's public key into **Chave pública do
    peer · pin manual**. This manually pins the peer for both sending and receiving.
 3. On the receiving device, choose a UDP port (for example `45873`) and click
-   **Aguardar peer**. Share one of the displayed LAN endpoint addresses
-   and the port with the sender. Wildcard addresses such as `0.0.0.0` cannot be
-   shared; if no LAN address is announced, check the device's network
-   interfaces.
+   **Aguardar peer**. Use **Copiar endereço LAN** to copy the announced socket
+   address and share it with the sender. If the app lists several addresses,
+   the button prefers a private IPv4 address. Wildcard addresses such as
+   `0.0.0.0` cannot be shared; if no LAN address is announced, check the
+   device's network interfaces.
 4. On the sending device, enter the receiver's LAN address and port, type a
    message, and click **Conectar e enviar**. After connection, either device
    can send multiple messages over the same session. Sent text appears only
@@ -95,9 +96,12 @@ that binding; OpenMLS stores its private bundle in the encrypted database and
 returns only the public package bytes. No UI flow publishes or consumes
 KeyPackages yet, and there is no trusted contact roster. The core can also
 create and persist a local single-member MLS group with this device as its
-creator and designated committer. The UI does not expose group creation or
-invitation, and adding members, processing Welcome messages, and MLS messaging
-are not implemented. The direct-LAN screen
+creator and designated committer. The core can admit a device-bound KeyPackage,
+merge its Commit into local group state, return Commit/Welcome/ratchet-tree
+bytes, and process the invitee's Welcome against its locally stored private
+package. The Iced UI does
+not expose group creation or invitation, and MLS application messaging and
+network delivery are not implemented. The direct-LAN screen
 manually pins device public keys separately. The local profile remains
 separate from that key. Character scenes, call views, and design-board examples
 remain visual previews. The dedicated chat screen shows only real direct-LAN
@@ -117,23 +121,26 @@ journal; MLS and durable inbox/outbox UI remain unimplemented.
 
 Opening the same SQLCipher database now composes OpenMLS RustCrypto with the
 SQLite storage provider and initializes its versioned schema. The event
-journal is not yet connected to MLS or the UI. The core can create and persist
-a local single-member group and index its creator as designated committer.
-There is no UI group flow, member addition, Welcome processing, protected
-application messaging, or event delivery integration.
+journal is not yet connected to MLS or the UI. The core creates and persists a
+local group and indexes its creator as designated committer. It can admit a
+device-bound KeyPackage, merge its Commit into local state, return
+Commit/Welcome/ratchet-tree bytes, and process a Welcome on the joining client.
+There is no UI group or invitation flow, MLS application messaging, or event
+delivery integration.
 A caller can explicitly create or load a distinct MLS signing key for a
 chosen OpenMLS ciphersuite. Its public key is signed by the long-term device
 identity and the MLS key is stored in the encrypted database. Repeated calls
 reuse the key. The core also creates a one-use KeyPackage that embeds the
 device-signed binding in its BasicCredential and stores its private bundle in
 SQLCipher. Tests validate the exported public package and persisted private
-bundle, and verify that a single-member group reloads with its device-bound
-credential and creator index. These local primitives do not publish a package
-to a peer or establish trust by themselves.
+bundle, verify that a single-member group reloads with its device-bound
+credential and creator index, and exercise admission/Welcome processing with
+two isolated encrypted databases. These local primitives do not distribute
+Commit or Welcome messages or establish a user-approved contact relationship.
 
 ![Actual refreshed 1280 × 800 native Iced familiar screen from this transport milestone; Secret Service is unavailable in this capture](docs/design/runtime/native-vhs/01-familiar.png)
 
-![Actual 1884 × 1000 Iced persistent LAN session UI; Secret Service is unavailable in this capture, so listening and sending are gated](docs/design/runtime/native-vhs/06-chat.png)
+![Actual 1884 × 1000 Iced chat capture; Secret Service was unavailable in the capture session, so identity-gated controls are disabled. When listening, the UI offers a button to copy the chosen LAN socket address.](docs/design/runtime/native-vhs/06-chat.png)
 
 ![Actual native Iced home with open scenery and icon-based feature strip, without the frog mage or gnome cutouts](docs/design/runtime/native-vhs/09-home.png)
 

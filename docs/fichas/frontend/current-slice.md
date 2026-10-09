@@ -23,11 +23,12 @@ stores its seed in the system credential store; the public key is displayed
 as unverified. The core can sign the MLS signing key selected for an OpenMLS
 ciphersuite with this long-term device key. The core can create a one-use
 OpenMLS KeyPackage whose BasicCredential embeds this binding; OpenMLS keeps its
-private bundle in SQLCipher. The core can create and persist a local
-single-member group and index its creator as designated committer. No UI
-publishes packages or exposes group creation; member addition, Welcome
-processing, MLS messaging, fingerprint/QR derivation, contact pairing, and
-message history remain unimplemented. If the keyring cannot be read, the screen offers
+private bundle in SQLCipher. The core creates and persists local MLS group
+state and indexes its creator as designated committer. No UI publishes
+packages or exposes group creation. Core APIs admit a device-bound KeyPackage,
+merge its Commit into local state, return Commit/Welcome/ratchet-tree bytes, and
+process a Welcome on the joining device; network delivery, MLS application messaging, fingerprint/QR
+derivation, contact pairing, and message history remain unimplemented. If the keyring cannot be read, the screen offers
 a retry that reuses an existing key rather than replacing it. The display
 profile is distinct from identity.
 

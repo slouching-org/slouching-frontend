@@ -314,6 +314,7 @@ enum Message {
     CreateIdentity,
     IdentityCreated(Result<[u8; 32], String>),
     CopyDeviceKey,
+    CopyPeerListenAddress(String),
     PeerPublicKeyChanged(String),
     PeerListenPortChanged(String),
     PeerAddressChanged(String),
@@ -495,6 +496,9 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 return iced::clipboard::write(hex_encode_key(&public_key));
             }
         }
+        Message::CopyPeerListenAddress(address) => {
+            return iced::clipboard::write(address);
+        }
         Message::PeerPublicKeyChanged(value) => state.peer_public_key = value,
         Message::PeerListenPortChanged(value) => state.peer_listen_port = value,
         Message::PeerAddressChanged(value) => state.peer_address = value,
@@ -525,6 +529,15 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     return Task::none();
                 }
             };
+            if let IdentityStatus::Ready(local_public_key) = state.identity_status
+                && peer_is_local(&expected_peer, &local_public_key)
+            {
+                state.peer_listen_status = PeerListenStatus::Failed(
+                    "A chave do peer é a sua própria chave. Cole a chave do outro dispositivo."
+                        .to_owned(),
+                );
+                return Task::none();
+            }
             state.peer_listener_generation = state.peer_listener_generation.saturating_add(1);
             let generation = state.peer_listener_generation;
             state.peer_listen_status = PeerListenStatus::Starting { port };
@@ -571,15 +584,15 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     apply_peer_event(state, event);
                 }
                 PeerListenEvent::Failed(error) => {
-                    state.peer_listen_status = PeerListenStatus::Failed(error);
                     state.peer_listener_handle = None;
                     state.peer_session_commands = None;
                     if matches!(state.peer_send_status, PeerSendStatus::Connecting) {
                         state.peer_pending_sends.clear();
-                        state.peer_send_status = PeerSendStatus::Failed(
-                            "Não foi possível conectar ao peer; a mensagem não foi enviada."
-                                .to_owned(),
-                        );
+                        state.peer_send_status = PeerSendStatus::Failed(format!(
+                            "Envio falhou: {error}. A mensagem não foi enviada."
+                        ));
+                    } else {
+                        state.peer_listen_status = PeerListenStatus::Failed(error);
                     }
                 }
             }
@@ -622,6 +635,15 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     return Task::none();
                 }
             };
+            if let IdentityStatus::Ready(local_public_key) = state.identity_status
+                && peer_is_local(&expected_peer, &local_public_key)
+            {
+                state.peer_send_status = PeerSendStatus::Failed(
+                    "A chave do peer é a sua própria chave. Cole a chave do outro dispositivo."
+                        .to_owned(),
+                );
+                return Task::none();
+            }
             let address = match state.peer_address.parse::<std::net::SocketAddr>() {
                 Ok(address) if !address.ip().is_unspecified() && address.port() != 0 => address,
                 _ => {
@@ -1172,6 +1194,10 @@ fn parse_peer_id(value: &str) -> Result<iroh::EndpointId, String> {
         .map_err(|error| format!("invalid peer identity key: {error}"))
 }
 
+fn peer_is_local(peer_id: &iroh::EndpointId, local_public_key: &[u8; 32]) -> bool {
+    peer_id.as_bytes() == local_public_key
+}
+
 fn hex_decode_key(value: &str) -> Result<[u8; 32], String> {
     if value.len() != 64 {
         return Err("device public key must be exactly 64 hexadecimal characters".to_owned());
@@ -1192,6 +1218,14 @@ fn hex_encode_key(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_when_the_peer_pin_is_the_local_device_key() {
+        let local = iroh::SecretKey::from_bytes(&[0x41; 32]).public();
+        let remote = iroh::SecretKey::from_bytes(&[0x42; 32]).public();
+        assert!(peer_is_local(&local, local.as_bytes()));
+        assert!(!peer_is_local(&remote, local.as_bytes()));
+    }
 
     #[test]
     fn accepts_only_elixir_status_contract_v1() {
