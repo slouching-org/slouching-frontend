@@ -1,6 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
-use iced::widget::{button, column, container, image, row, text, text_input};
-use iced::{Color, Element, Fill, Length, Task, Theme, task::Handle};
+use iced::{Element, Task, Theme, task::Handle};
+
+mod ui;
 use prost::Message as ProstMessage;
 use serde::Deserialize;
 use std::time::Duration;
@@ -79,12 +80,68 @@ enum TransportEvent {
     ProtocolError(String),
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum Screen {
+    Components,
+    Familiar,
+    Settings,
+    Lobby,
+    Connecting,
+    Share,
+    Chat,
+    Incoming,
+    Verify,
     #[default]
     Home,
-    Familiar,
     Call,
+}
+
+impl Screen {
+    const ALL: [Self; 11] = [
+        Self::Components,
+        Self::Familiar,
+        Self::Settings,
+        Self::Lobby,
+        Self::Connecting,
+        Self::Share,
+        Self::Chat,
+        Self::Incoming,
+        Self::Verify,
+        Self::Home,
+        Self::Call,
+    ];
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Components => "00-components",
+            Self::Familiar => "01-familiar",
+            Self::Settings => "02-settings",
+            Self::Lobby => "03-lobby",
+            Self::Connecting => "04-connecting",
+            Self::Share => "05-share",
+            Self::Chat => "06-chat",
+            Self::Incoming => "07-incoming",
+            Self::Verify => "08-verify",
+            Self::Home => "09-home",
+            Self::Call => "10-call",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Components => "Identidade & componentes",
+            Self::Familiar => "Escolha seu familiar",
+            Self::Settings => "Configurações",
+            Self::Lobby => "Lobby",
+            Self::Connecting => "Conectando & fallback",
+            Self::Share => "Escolher tela",
+            Self::Chat => "Conversa pessoal",
+            Self::Incoming => "Chamada recebida",
+            Self::Verify => "Verificar selo",
+            Self::Home => "Início",
+            Self::Call => "Chamada em grupo",
+        }
+    }
 }
 
 struct Slouching {
@@ -96,6 +153,15 @@ struct Slouching {
     invite: String,
     name: String,
     familiar: &'static str,
+    show_gallery: bool,
+    settings_tab: u8,
+    share_tab: u8,
+    selected_source: u8,
+    draft: String,
+    texture: bool,
+    note: Option<&'static str>,
+    capture_dir: Option<std::path::PathBuf>,
+    capture_index: usize,
 }
 
 impl Default for Slouching {
@@ -108,7 +174,16 @@ impl Default for Slouching {
             screen: Screen::Home,
             invite: String::new(),
             name: String::new(),
-            familiar: "Wizard",
+            familiar: "Sapo Mago",
+            show_gallery: false,
+            settings_tab: 1,
+            share_tab: 0,
+            selected_source: 0,
+            draft: String::new(),
+            texture: true,
+            note: None,
+            capture_dir: None,
+            capture_index: 0,
         }
     }
 }
@@ -122,6 +197,16 @@ enum Message {
     InviteChanged(String),
     NameChanged(String),
     ChooseFamiliar(&'static str),
+    ToggleGallery,
+    SettingsTab(u8),
+    ShareTab(u8),
+    SelectSource(u8),
+    DraftChanged(String),
+    ToggleTexture,
+    PreviewAction(&'static str),
+    DismissNote,
+    Capture,
+    Captured(iced::window::Screenshot),
 }
 
 fn update(state: &mut Slouching, message: Message) -> Task<Message> {
@@ -174,10 +259,57 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             };
         }
         Message::TransportEvent(_, _) => {}
-        Message::Navigate(screen) => state.screen = screen,
+        Message::Navigate(screen) => {
+            state.screen = screen;
+            state.show_gallery = false;
+            state.note = None;
+        }
         Message::InviteChanged(value) => state.invite = value,
         Message::NameChanged(value) => state.name = value,
         Message::ChooseFamiliar(value) => state.familiar = value,
+        Message::ToggleGallery => state.show_gallery = !state.show_gallery,
+        Message::SettingsTab(value) => state.settings_tab = value,
+        Message::ShareTab(value) => {
+            state.share_tab = value;
+            state.selected_source = 0;
+        }
+        Message::SelectSource(value) => state.selected_source = value,
+        Message::DraftChanged(value) => state.draft = value,
+        Message::ToggleTexture => state.texture = !state.texture,
+        Message::PreviewAction(note) => state.note = Some(note),
+        Message::DismissNote => state.note = None,
+        Message::Capture => {
+            return iced::window::latest()
+                .and_then(iced::window::screenshot)
+                .map(Message::Captured);
+        }
+        Message::Captured(screenshot) => {
+            if let Some(dir) = &state.capture_dir {
+                let path = dir.join(format!("{}.png", state.screen.slug()));
+                if let Err(error) = image_codec::save_buffer(
+                    &path,
+                    &screenshot.rgba,
+                    screenshot.size.width,
+                    screenshot.size.height,
+                    image_codec::ColorType::Rgba8,
+                ) {
+                    eprintln!("Screenshot failed: {error}");
+                    return iced::exit();
+                }
+                println!(
+                    "Captured {} ({} × {})",
+                    path.display(),
+                    screenshot.size.width,
+                    screenshot.size.height
+                );
+                state.capture_index += 1;
+                if state.capture_index == Screen::ALL.len() {
+                    return iced::exit();
+                }
+                state.screen = Screen::ALL[state.capture_index];
+                return capture_after(Duration::from_millis(600));
+            }
+        }
     }
     Task::none()
 }
@@ -346,6 +478,26 @@ fn decode_server_hello(bytes: &[u8]) -> Result<protocol::ServerHello, HandshakeE
 
 fn boot() -> (Slouching, Task<Message>) {
     let mut state = Slouching::default();
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|s| s == "--screen")
+        && let Some(name) = args.get(pos + 1)
+        && let Some(screen) = Screen::ALL.into_iter().find(|s| s.slug() == name)
+    {
+        state.screen = screen;
+    }
+    if let Some(pos) = args.iter().position(|s| s == "--capture-dir")
+        && let Some(path) = args.get(pos + 1)
+    {
+        let dir = std::path::PathBuf::from(path);
+        std::fs::create_dir_all(&dir).expect("create screenshot directory");
+        state.capture_dir = Some(dir);
+        state.screen = Screen::ALL[0];
+    }
+    let capture = if state.capture_dir.is_some() {
+        capture_after(Duration::from_secs(6))
+    } else {
+        Task::none()
+    };
     let (transport, handle) = transport_task(state.transport_generation);
     state.transport_handle = Some(handle);
     (
@@ -353,192 +505,49 @@ fn boot() -> (Slouching, Task<Message>) {
         Task::batch([
             Task::perform(fetch_backend_status(), Message::BackendFetched),
             transport,
+            capture,
         ]),
     )
 }
 
 fn view(state: &Slouching) -> Element<'_, Message> {
-    let navigation = row![
-        button("Home").on_press(Message::Navigate(Screen::Home)),
-        button("Familiar").on_press(Message::Navigate(Screen::Familiar)),
-        button("Call preview").on_press(Message::Navigate(Screen::Call)),
-    ]
-    .spacing(12);
+    ui::view(state)
+}
 
-    let page = match state.screen {
-        Screen::Home => home(state),
-        Screen::Familiar => familiar(state),
-        Screen::Call => call(),
-    };
-
-    container(
-        column![
-            navigation,
-            backend_status_view(&state.backend),
-            transport_status_view(&state.transport),
-            page,
-        ]
-        .spacing(20),
+fn capture_after(delay: Duration) -> Task<Message> {
+    Task::perform(
+        async move {
+            tokio::time::sleep(delay).await;
+        },
+        |_| Message::Capture,
     )
-    .padding(24)
-    .width(Fill)
-    .height(Fill)
-    .into()
-}
-
-fn transport_status_view(transport: &TransportState) -> Element<'_, Message> {
-    let label = match transport {
-        TransportState::Connecting(attempt) => {
-            format!("Local WebSocket transport: connecting (attempt {attempt})…")
-        }
-        TransportState::Disconnected {
-            reason,
-            retry_seconds,
-        } => {
-            format!("Local WebSocket transport disconnected: {reason} · retry in {retry_seconds} s")
-        }
-        TransportState::ProtocolError(reason) => format!("WebSocket protocol error: {reason}"),
-        TransportState::Active { hello, heartbeats } => format!(
-            "Local WebSocket transport active · protocol v{} · Pong acknowledgements: {} · identity: {} · messaging: {} · calls: {}",
-            hello.protocol_version,
-            heartbeats,
-            availability_label(hello.identity_available),
-            availability_label(hello.messaging_available),
-            availability_label(hello.calls_available),
-        ),
-    };
-    text(label).color(Color::from_rgb8(180, 140, 255)).into()
-}
-
-fn availability_label(available: bool) -> &'static str {
-    if available {
-        "available"
-    } else {
-        "unavailable"
-    }
-}
-
-fn backend_status_view(backend: &BackendConnection) -> Element<'_, Message> {
-    let status = match backend {
-        BackendConnection::Connecting => "Connecting to local Elixir backend…".to_string(),
-        BackendConnection::Unavailable(reason) => format!("Local backend unavailable: {reason}"),
-        BackendConnection::ContractMismatch(reason) => {
-            format!("Status contract mismatch: {reason}")
-        }
-        BackendConnection::Connected(snapshot) => format!(
-            "Local Elixir backend responding · contract v{} · Identity: {} · Messaging: {} · Calls: {} · Peer connections: {}",
-            snapshot.contract_version,
-            capability_label(snapshot.identity),
-            capability_label(snapshot.messaging),
-            capability_label(snapshot.calls),
-            snapshot.peer_connections
-        ),
-    };
-    column![
-        row![
-            text(status).color(Color::from_rgb8(242, 223, 138)),
-            button("Refresh backend").on_press(Message::RefreshBackend),
-        ]
-        .spacing(12),
-        text("Local diagnostic only · no secure peer connection or chat is active")
-            .size(13)
-            .color(Color::from_rgb8(180, 140, 255)),
-    ]
-    .spacing(5)
-    .into()
-}
-
-fn capability_label(capability: CapabilityStatus) -> &'static str {
-    match capability {
-        CapabilityStatus::NotImplemented => "not implemented",
-    }
-}
-
-fn home(state: &Slouching) -> Element<'_, Message> {
-    let logo = image(image::Handle::from_bytes(
-        include_bytes!("../prototypes/web/brand/05-two-wizards-primary-logo.png").to_vec(),
-    ))
-    .width(Length::Fixed(80.0))
-    .height(Length::Fixed(80.0));
-    let scenery = image(image::Handle::from_bytes(
-        include_bytes!("../prototypes/web/art/bg-home.jpg").to_vec(),
-    ))
-    .width(Length::Fill)
-    .height(Length::Fixed(350.0));
-
-    column![
-        row![
-            logo,
-            text("slouching")
-                .size(68)
-                .color(Color::from_rgb8(242, 223, 138)),
-        ]
-        .spacing(16),
-        text("P2P voice & video for you and your crew")
-            .size(17)
-            .color(Color::from_rgb8(236, 230, 255)),
-        row![button("Join a call"), button("Create a call")].spacing(12),
-        text_input("slouch:// invitation · preview only", &state.invite)
-            .on_input(Message::InviteChanged),
-        text("Call actions are unavailable in this scaffold.")
-            .color(Color::from_rgb8(180, 140, 255)),
-        scenery,
-    ]
-    .spacing(15)
-    .into()
-}
-
-fn familiar(state: &Slouching) -> Element<'_, Message> {
-    column![
-        text("Who sits by the campfire?")
-            .size(38)
-            .color(Color::from_rgb8(242, 223, 138)),
-        text("Choose a preview name and familiar. No cryptographic identity is created."),
-        text_input("Your name", &state.name).on_input(Message::NameChanged),
-        row![
-            button("Wizard").on_press(Message::ChooseFamiliar("Wizard")),
-            button("Frog").on_press(Message::ChooseFamiliar("Frog")),
-            button("Orb").on_press(Message::ChooseFamiliar("Orb")),
-        ]
-        .spacing(12),
-        text(format!("Selected familiar: {}", state.familiar)),
-    ]
-    .spacing(18)
-    .into()
-}
-
-fn call() -> Element<'static, Message> {
-    let art = image(image::Handle::from_bytes(
-        include_bytes!("../prototypes/web/art/scene-orb.jpg").to_vec(),
-    ))
-    .width(Length::Fill)
-    .height(Length::Fixed(390.0));
-
-    column![
-        text("THE MOSSY STUMP · CALL PREVIEW")
-            .size(28)
-            .color(Color::from_rgb8(242, 223, 138)),
-        text("Illustrative art. No participant or video stream is connected.")
-            .color(Color::from_rgb8(180, 140, 255)),
-        art,
-        row![
-            button("Microphone"),
-            button("Camera"),
-            button("Share screen"),
-            button("Leave preview").on_press(Message::Navigate(Screen::Home)),
-        ]
-        .spacing(12),
-        text("Device controls are disabled in this preview.")
-            .color(Color::from_rgb8(180, 140, 255)),
-    ]
-    .spacing(16)
-    .into()
 }
 
 fn main() -> iced::Result {
+    let size = std::env::var("SLOUCHING_WINDOW_SIZE")
+        .ok()
+        .and_then(|s| {
+            s.split_once('x')
+                .and_then(|(w, h)| Some((w.parse::<f32>().ok()?, h.parse::<f32>().ok()?)))
+        })
+        .unwrap_or((1100.0, 720.0));
+    let mut window = iced::window::Settings {
+        size: size.into(),
+        min_size: Some((800.0, 560.0).into()),
+        position: iced::window::Position::Centered,
+        ..Default::default()
+    };
+    #[cfg(target_os = "linux")]
+    {
+        window.platform_specific.application_id = "com.slouching.desktop".into();
+    }
     iced::application(boot, update, view)
+        .title("slouching · native design preview")
         .theme(Theme::Dark)
-        .window_size((1000.0, 800.0))
+        .default_font(ui::MONO)
+        .font(include_bytes!("../assets/fonts/bricolagegrotesque.ttf").as_slice())
+        .font(include_bytes!("../assets/fonts/jetbrainsmono.ttf").as_slice())
+        .window(window)
         .run()
 }
 

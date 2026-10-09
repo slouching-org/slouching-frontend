@@ -1,12 +1,22 @@
 # Current frontend slice
 
-**Status:** native Rust/Iced scaffold; visual and functional work remains.
+**Status:** eleven native Rust/Iced visual-preview screens implemented;
+exact visual parity and product features remain open.
 
-`src/main.rs` opens three navigable views: home, familiar selection,
-and call preview. It uses supplied artwork. Invitation entry is a visual
-preview, while call and device controls are disabled. They do not create a
-cryptographic identity, connect peers, open capture devices, send messages,
-or join calls.
+The frontend's `src/main.rs` owns application state and local transport;
+`src/ui.rs` composes the eleven source-board views with native widgets,
+original scenery, familiar portraits and cutouts, source-derived SVG icons,
+embedded fonts, translucent panels, scanlines, and vignette. The **Telas**
+gallery reaches every view. Home actions open the lobby preview; profile
+and chat fields edit local in-memory values. Familiar selection, settings
+and share-source tabs, and the interface texture toggle work locally.
+
+Every view is labeled as a visual preview. Character scenes and messages
+are examples. Camera/microphone actions explain their unavailable state;
+send, capture, and verification controls cannot perform product operations.
+The app does not generate keys, enumerate devices, send messages, join calls,
+or persist a local identity/history. The settings **Rede & P2P** tab exposes
+real backend diagnostics separately from the illustrative call routes.
 
 The earlier HTML/CSS/JavaScript preview is retained under
 `prototypes/web/` as a **design benchmark**, not the product runtime.
@@ -15,12 +25,12 @@ verified device identity. Its call art is illustrative, never a live
 camera feed.
 
 The [eleven source screens](../../design/screens) define the visual
-target. A future native implementation must compare real Iced captures
-against them and handle small windows, accessibility, permissions, and
-honest connection states.
+target. Native captures were compared at 1280 × 800 and a compact 960 × 640
+window. The first visual pass covers all eleven views; exact parity,
+accessibility, and permissions still need further implementation and review.
 
 The native UI now requests a v1 development status snapshot from the local
-Elixir backend over loopback HTTP using an asynchronous Iced task. It shows
+Elixir backend over loopback HTTP using an asynchronous Iced task in the network settings. It shows
 connecting, unavailable, incompatible-contract, and responding states; the
 user can refresh manually. This only proves local process availability.
 The response currently reports unimplemented identity, messaging, and calls

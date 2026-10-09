@@ -1,0 +1,1631 @@
+//! Native widgets composed from the supplied design board. All call/chat
+//! content is explicitly a visual preview until product capabilities exist.
+use crate::{BackendConnection, Message, Screen, Slouching, TransportState};
+use iced::widget::{
+    self, button, canvas, column, container, image, row, scrollable, space, stack, svg, text,
+    text_input,
+};
+use iced::{
+    Background, Border, Color, ContentFit, Element, Fill, Font, Point, Rectangle, Renderer, Size,
+    Theme, font,
+};
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+pub const MONO: Font = Font {
+    family: font::Family::Name("JetBrains Mono"),
+    ..Font::DEFAULT
+};
+const TITLE: Font = Font {
+    family: font::Family::Name("Bricolage Grotesque"),
+    weight: font::Weight::ExtraBold,
+    ..Font::DEFAULT
+};
+const NIGHT: Color = Color::from_rgb8(13, 10, 28);
+const PANEL: Color = Color::from_rgb8(26, 22, 56);
+const LINE: Color = Color::from_rgb8(47, 40, 88);
+const PAPER: Color = Color::from_rgb8(236, 230, 255);
+const GOLD: Color = Color::from_rgb8(242, 223, 138);
+const VIOLET: Color = Color::from_rgb8(180, 140, 255);
+const MUTED: Color = Color::from_rgb8(143, 135, 189);
+const GREEN: Color = Color::from_rgb8(143, 209, 158);
+const RED: Color = Color::from_rgb8(110, 33, 72);
+
+struct Assets {
+    images: HashMap<&'static str, image::Handle>,
+    icons: HashMap<&'static str, svg::Handle>,
+}
+fn assets() -> &'static Assets {
+    static ASSETS: OnceLock<Assets> = OnceLock::new();
+    ASSETS.get_or_init(|| {
+        macro_rules! raster { ($($name:literal => $path:literal),* $(,)?) => { HashMap::from([$(( $name, image::Handle::from_bytes(include_bytes!($path).as_slice()))),*]) }; }
+        macro_rules! vector { ($($name:literal),* $(,)?) => { HashMap::from([$(( $name, svg::Handle::from_memory(include_bytes!(concat!("../assets/icons/", $name, ".svg")).as_slice()))),*]) }; }
+        Assets {
+            images: raster! {
+                "home" => "../assets/art/bg-home.jpg",
+                "wizards-cutout" => "../assets/art/wizards-cutout.png",
+                "mushroom-cutout" => "../assets/art/mushroom-cutout.png",
+                "mushroom-scene" => "../assets/art/scene-gnome2.jpg", "sky" => "../assets/art/sky.jpg",
+                "reading" => "../assets/art/scene-reading.jpg", "orb" => "../assets/art/scene-orb.jpg",
+                "frog-scene" => "../assets/art/scene-frog1.jpg", "gnome-scene" => "../assets/art/scene-gnome1.jpg",
+                "frog-cutout" => "../assets/art/frog-cutout.png", "gnome-cutout" => "../assets/art/gnome-cutout.png",
+                "logo" => "../assets/brand/05-two-wizards-primary-logo.png",
+                "hat" => "../assets/art/appicon.jpg", "frog" => "../assets/avatars/ava-frog1.jpg",
+                "gnome" => "../assets/avatars/ava-gnome1.jpg", "wizard" => "../assets/avatars/ava-pipe.jpg",
+                "orb-avatar" => "../assets/avatars/ava-orb.jpg", "mushroom" => "../assets/avatars/ava-gnome2.jpg",
+            },
+            icons: vector! { "settings", "chat", "headphones", "users", "mic", "camera", "refresh",
+                "plus", "key", "close", "check", "screen", "phone", "shield", "file", "pause",
+                "play", "attachment", "arrow", "mic-off", "camera-off" },
+        }
+    })
+}
+
+#[derive(Clone, Copy)]
+struct Layout {
+    x: f32,
+    y: f32,
+    scale: f32,
+}
+impl Layout {
+    fn new(size: Size) -> Self {
+        Self {
+            x: size.width / 1280.0,
+            y: size.height / 800.0,
+            scale: (size.width / 1280.0).min(size.height / 800.0),
+        }
+    }
+    fn px(self, n: f32) -> f32 {
+        n * self.scale
+    }
+    fn label<'a>(self, value: impl Into<String>, size: f32, color: Color) -> widget::Text<'a> {
+        text(value.into())
+            .font(MONO)
+            .size(self.px(size).max(10.0))
+            .color(color)
+    }
+    fn title<'a>(self, value: impl Into<String>, size: f32) -> widget::Text<'a> {
+        text(value.into())
+            .font(TITLE)
+            .size(self.px(size))
+            .color(GOLD)
+    }
+    fn place<'a>(
+        self,
+        content: impl Into<Element<'a, Message>>,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    ) -> Element<'a, Message> {
+        container(container(content).width(w * self.x).height(h * self.y))
+            .padding(iced::Padding {
+                top: y * self.y,
+                left: x * self.x,
+                right: 0.0,
+                bottom: 0.0,
+            })
+            .into()
+    }
+    fn icon(self, name: &'static str, color: Color, size: f32) -> Element<'static, Message> {
+        svg(assets().icons[name].clone())
+            .width(self.px(size))
+            .height(self.px(size))
+            .style(move |_, _| svg::Style { color: Some(color) })
+            .into()
+    }
+    fn picture(self, name: &'static str, w: f32, h: f32) -> Element<'static, Message> {
+        image(assets().images[name].clone())
+            .width(self.px(w))
+            .height(self.px(h))
+            .content_fit(ContentFit::Cover)
+            .into()
+    }
+    fn control(
+        self,
+        icon: &'static str,
+        label: &'static str,
+        msg: Option<Message>,
+        primary: bool,
+    ) -> Element<'static, Message> {
+        let c = if primary { NIGHT } else { PAPER };
+        let content = row![self.icon(icon, c, 18.0), self.label(label, 14.0, c)]
+            .spacing(self.px(10.0))
+            .align_y(iced::Center);
+        button(container(content).center_x(Fill))
+            .on_press_maybe(msg)
+            .padding([self.px(14.0), self.px(18.0)])
+            .width(Fill)
+            .style(move |_, status| button_style(status, primary, false))
+            .into()
+    }
+    fn nav(self, label: &'static str, msg: Message, selected: bool) -> Element<'static, Message> {
+        button(self.label(label, 12.0, if selected { GOLD } else { MUTED }))
+            .on_press(msg)
+            .width(Fill)
+            .padding([self.px(12.0), self.px(16.0)])
+            .style(move |_, status| button_style(status, false, selected))
+            .into()
+    }
+    fn icon_button(self, name: &'static str, msg: Message) -> Element<'static, Message> {
+        button(self.icon(name, PAPER, 18.0))
+            .on_press(msg)
+            .padding(self.px(12.0))
+            .style(|_, s| button_style(s, false, false))
+            .into()
+    }
+    fn panel<'a>(self, content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+        container(content)
+            .padding(self.px(22.0))
+            .width(Fill)
+            .height(Fill)
+            .style(panel_style)
+            .clip(true)
+            .into()
+    }
+    fn input<'a>(
+        self,
+        placeholder: &'a str,
+        value: &'a str,
+        on_input: fn(String) -> Message,
+    ) -> Element<'a, Message> {
+        text_input(placeholder, value)
+            .on_input(on_input)
+            .font(MONO)
+            .size(self.px(14.0).max(11.0))
+            .padding(self.px(12.0))
+            .style(input_style)
+            .into()
+    }
+}
+
+fn panel_style(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Color { a: 0.93, ..PANEL }.into()),
+        border: Border {
+            color: LINE,
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        text_color: Some(PAPER),
+        ..Default::default()
+    }
+}
+fn button_style(status: button::Status, primary: bool, selected: bool) -> button::Style {
+    let disabled = status == button::Status::Disabled;
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    let bg = if primary {
+        GOLD
+    } else if selected || hovered {
+        Color::from_rgb8(35, 28, 77)
+    } else {
+        Color { a: 0.87, ..NIGHT }
+    };
+    button::Style {
+        background: Some(Background::Color(Color {
+            a: if disabled { 0.5 } else { bg.a },
+            ..bg
+        })),
+        text_color: if primary {
+            NIGHT
+        } else if disabled {
+            MUTED
+        } else {
+            PAPER
+        },
+        border: Border {
+            color: if selected || hovered { GOLD } else { LINE },
+            width: if primary { 0.0 } else { 1.0 },
+            radius: 0.0.into(),
+        },
+        ..Default::default()
+    }
+}
+fn input_style(_: &Theme, status: text_input::Status) -> text_input::Style {
+    text_input::Style {
+        background: NIGHT.into(),
+        border: Border {
+            color: if matches!(status, text_input::Status::Focused { .. }) {
+                GOLD
+            } else {
+                LINE
+            },
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        icon: MUTED,
+        placeholder: MUTED,
+        value: PAPER,
+        selection: VIOLET,
+    }
+}
+
+pub fn view(state: &Slouching) -> Element<'_, Message> {
+    widget::responsive(move |size| screen(state, Layout::new(size))).into()
+}
+
+fn screen(state: &Slouching, l: Layout) -> Element<'_, Message> {
+    let bg = if state.screen == Screen::Incoming {
+        "frog-scene"
+    } else {
+        "home"
+    };
+    let shade = match state.screen {
+        Screen::Home => 0.15,
+        Screen::Familiar => 0.35,
+        Screen::Lobby => 0.65,
+        Screen::Incoming => 0.80,
+        _ => 0.90,
+    };
+    let mut layers = vec![
+        image(assets().images[bg].clone())
+            .width(Fill)
+            .height(Fill)
+            .content_fit(ContentFit::Cover)
+            .into(),
+        container(space())
+            .width(Fill)
+            .height(Fill)
+            .style(move |_| container::Style {
+                background: Some(
+                    iced::gradient::Linear::new(iced::Radians(std::f32::consts::FRAC_PI_2))
+                        .add_stop(0.0, Color { a: shade, ..NIGHT })
+                        .add_stop(
+                            0.6,
+                            Color {
+                                a: (shade + 0.1).min(0.95),
+                                ..NIGHT
+                            },
+                        )
+                        .add_stop(1.0, Color { a: 0.90, ..NIGHT })
+                        .into(),
+                ),
+                ..Default::default()
+            })
+            .into(),
+    ];
+    let content = match state.screen {
+        Screen::Home => home(state, l),
+        Screen::Familiar => familiar(state, l),
+        Screen::Settings => settings(state, l),
+        Screen::Call => call(state, l),
+        Screen::Components => components(l),
+        Screen::Lobby => lobby(l),
+        Screen::Connecting => connecting(l),
+        Screen::Share => sharing(state, l),
+        Screen::Chat => chat(state, l),
+        Screen::Incoming => incoming(l),
+        Screen::Verify => verification(l),
+    };
+    layers.push(content);
+    layers.push(header(state, l));
+    if state.texture {
+        layers.push(canvas(Fx).width(Fill).height(Fill).into());
+    }
+    if state.show_gallery {
+        layers.push(widget::opaque(gallery(l)));
+    }
+    if let Some(note) = state.note {
+        layers.push(
+            l.place(
+                l.panel(
+                    column![
+                        l.title("Ainda é uma prévia", 25.0),
+                        l.label(note, 13.0, PAPER),
+                        l.control("close", "Entendi", Some(Message::DismissNote), true)
+                    ]
+                    .spacing(l.px(16.0)),
+                ),
+                320.0,
+                280.0,
+                640.0,
+                235.0,
+            ),
+        );
+    }
+    stack(layers).width(Fill).height(Fill).clip(true).into()
+}
+
+fn header(state: &Slouching, l: Layout) -> Element<'_, Message> {
+    let brand = button(
+        row![
+            l.picture("wizards-cutout", 38.0, 38.0),
+            l.title("slouching", 26.0)
+        ]
+        .spacing(l.px(10.0))
+        .align_y(iced::Center),
+    )
+    .padding(0)
+    .on_press(Message::Navigate(Screen::Home))
+    .style(button::text);
+    let page = if matches!(state.screen, Screen::Home | Screen::Components) {
+        String::new()
+    } else {
+        format!("/ {}", state.screen.label())
+    };
+    let left = row![brand, l.label(page, 12.0, MUTED)]
+        .spacing(l.px(18.0))
+        .align_y(iced::Center);
+    let right = row![
+        l.label("PRÉVIA VISUAL", 10.0, GOLD),
+        button(l.label("Telas", 11.0, PAPER))
+            .on_press(Message::ToggleGallery)
+            .padding(l.px(10.0))
+            .style(|_, s| button_style(s, false, false)),
+        l.icon_button("settings", Message::Navigate(Screen::Settings)),
+        l.icon_button("chat", Message::Navigate(Screen::Chat))
+    ]
+    .spacing(l.px(8.0))
+    .align_y(iced::Center);
+    l.place(
+        row![left, space().width(Fill), right].align_y(iced::Center),
+        24.0,
+        10.0,
+        1232.0,
+        46.0,
+    )
+}
+fn gallery(l: Layout) -> Element<'static, Message> {
+    let mut choices = column![
+        row![
+            l.label("DESIGN BOARD", 12.0, GOLD),
+            space().width(Fill),
+            l.icon_button("close", Message::ToggleGallery)
+        ]
+        .align_y(iced::Center)
+    ]
+    .spacing(l.px(7.0));
+    for s in Screen::ALL {
+        choices = choices.push(l.nav(s.label(), Message::Navigate(s), false));
+    }
+    choices = choices.push(l.label(
+        "11 telas · conteúdo ilustrativo\nNenhum chat ou chamada ativo",
+        11.0,
+        MUTED,
+    ));
+    l.place(l.panel(choices), 890.0, 65.0, 366.0, 700.0)
+}
+fn home(state: &Slouching, l: Layout) -> Element<'_, Message> {
+    let title = l.place(
+        container(l.title("slouching", 120.0)).center_x(Fill),
+        270.0,
+        126.0,
+        740.0,
+        128.0,
+    );
+    let subtitle = l.place(
+        container(
+            l.label("P2P voice & video\nfor you and your crew", 20.0, PAPER)
+                .align_x(iced::Center),
+        )
+        .center_x(Fill),
+        330.0,
+        254.0,
+        620.0,
+        74.0,
+    );
+    let actions = column![
+        l.control(
+            "headphones",
+            "Join a Call",
+            Some(Message::Navigate(Screen::Lobby)),
+            true
+        ),
+        l.control(
+            "users",
+            "Create a Call",
+            Some(Message::Navigate(Screen::Lobby)),
+            false
+        ),
+        row![
+            l.label("Have an invite link?", 12.0, PAPER),
+            l.input("slouch://", &state.invite, Message::InviteChanged)
+        ]
+        .spacing(l.px(8.0))
+        .align_y(iced::Center),
+        l.label("Explore a prévia · chamadas indisponíveis", 10.0, MUTED)
+    ]
+    .spacing(l.px(14.0));
+    let frog = l.place(
+        image(assets().images["frog-cutout"].clone())
+            .width(Fill)
+            .height(Fill)
+            .content_fit(ContentFit::Contain),
+        985.0,
+        380.0,
+        230.0,
+        325.0,
+    );
+    let gnome = l.place(
+        image(assets().images["gnome-cutout"].clone())
+            .width(Fill)
+            .height(Fill)
+            .content_fit(ContentFit::Contain),
+        465.0,
+        558.0,
+        83.0,
+        128.0,
+    );
+    let features = row![
+        feature(l, "frog", "P2P", "Rotas diretas · planejado"),
+        feature(l, "orb-avatar", "Private", "MLS · planejado"),
+        feature(l, "wizard", "For your crew", "Voice, video, screen"),
+        feature(l, "gnome", "Just vibes", "Always")
+    ]
+    .spacing(l.px(22.0));
+    stack![
+        title,
+        subtitle,
+        l.place(actions, 490.0, 366.0, 300.0, 225.0),
+        frog,
+        gnome,
+        l.place(l.panel(features), 28.0, 700.0, 1224.0, 78.0)
+    ]
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+fn feature(
+    l: Layout,
+    art: &'static str,
+    title: &'static str,
+    detail: &'static str,
+) -> Element<'static, Message> {
+    row![
+        l.picture(art, 40.0, 40.0),
+        column![l.label(title, 13.0, PAPER), l.label(detail, 10.0, MUTED)].spacing(l.px(5.0))
+    ]
+    .spacing(l.px(14.0))
+    .width(Fill)
+    .align_y(iced::Center)
+    .into()
+}
+fn familiar(state: &Slouching, l: Layout) -> Element<'_, Message> {
+    let mut familiars = row![].spacing(l.px(12.0));
+    for (name, art) in [
+        ("Sapo Mago", "frog"),
+        ("Gnomo", "gnome"),
+        ("Vidente do Orbe", "orb-avatar"),
+    ] {
+        familiars = familiars.push(
+            button(
+                container(
+                    column![l.picture(art, 104.0, 104.0), l.label(name, 12.0, PAPER)]
+                        .spacing(l.px(8.0))
+                        .align_x(iced::Center),
+                )
+                .center_x(Fill),
+            )
+            .on_press(Message::ChooseFamiliar(name))
+            .width(Fill)
+            .padding(l.px(12.0))
+            .style(move |_, s| button_style(s, false, state.familiar == name)),
+        );
+    }
+    familiars = familiars.push(
+        button(
+            container(
+                column![
+                    container(l.icon("plus", MUTED, 34.0))
+                        .width(l.px(104.0))
+                        .height(l.px(104.0))
+                        .center(Fill),
+                    l.label("Sua imagem", 12.0, PAPER)
+                ]
+                .spacing(l.px(8.0))
+                .align_x(iced::Center),
+            )
+            .center_x(Fill),
+        )
+        .width(Fill)
+        .padding(l.px(12.0))
+        .style(|_, s| button_style(s, false, false)),
+    );
+    let progress = row![rule(GOLD, 3.0), rule(GOLD, 3.0), rule(LINE, 3.0)].spacing(l.px(6.0));
+    let key = container(
+        row![
+            l.icon("key", VIOLET, 24.0),
+            column![
+                l.label("Chave de identidade ainda não criada", 13.0, PAPER),
+                l.label(
+                    "Nome e familiar ficam apenas na memória desta prévia",
+                    11.0,
+                    MUTED
+                )
+            ]
+            .spacing(l.px(5.0))
+        ]
+        .spacing(l.px(14.0))
+        .align_y(iced::Center),
+    )
+    .width(Fill)
+    .padding(l.px(16.0))
+    .style(|_| container::Style {
+        background: Some(NIGHT.into()),
+        border: Border {
+            color: LINE,
+            width: 1.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let body = column![
+        progress,
+        l.title("Quem senta na fogueira?", 40.0),
+        l.label(
+            "Sem conta, sem e-mail. Comece escolhendo seu nome e familiar.",
+            13.0,
+            PAPER
+        ),
+        column![
+            l.label("N O M E  N A  R O D A", 10.0, MUTED),
+            l.input("Como podemos te chamar?", &state.name, Message::NameChanged)
+        ]
+        .spacing(l.px(8.0)),
+        column![
+            l.label("E S C O L H A  S E U  F A M I L I A R", 10.0, MUTED),
+            familiars
+        ]
+        .spacing(l.px(10.0)),
+        key,
+        row![
+            l.control(
+                "close",
+                "Voltar",
+                Some(Message::Navigate(Screen::Home)),
+                false
+            ),
+            space().width(Fill),
+            l.control(
+                "arrow",
+                "Continuar na prévia",
+                Some(Message::Navigate(Screen::Home)),
+                true
+            )
+        ]
+        .spacing(l.px(20.0))
+    ]
+    .spacing(l.px(23.0));
+    l.place(l.panel(body), 230.0, 92.0, 820.0, 620.0)
+}
+fn rule(color: Color, height: f32) -> Element<'static, Message> {
+    container(space())
+        .width(Fill)
+        .height(height)
+        .style(move |_| container::Style {
+            background: Some(color.into()),
+            ..Default::default()
+        })
+        .into()
+}
+fn tile(l: Layout, art: &'static str, label: impl Into<String>) -> Element<'static, Message> {
+    let overlay = container(l.label(label, 11.0, PAPER))
+        .padding(l.px(10.0))
+        .style(|_| container::Style {
+            background: Some(Color { a: 0.8, ..NIGHT }.into()),
+            ..Default::default()
+        });
+    stack![
+        image(assets().images[art].clone())
+            .content_fit(ContentFit::Cover)
+            .width(Fill)
+            .height(Fill),
+        container(overlay).align_bottom(Fill)
+    ]
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+fn boxed<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(content)
+        .width(Fill)
+        .height(Fill)
+        .style(panel_style)
+        .clip(true)
+        .into()
+}
+fn settings(state: &Slouching, l: Layout) -> Element<'_, Message> {
+    let mut tabs = column![].spacing(l.px(6.0));
+    for (i, label) in [
+        "Perfil & familiar",
+        "Áudio & vídeo",
+        "Rede & P2P",
+        "Chaves & MLS",
+        "Dispositivos",
+        "Notificações",
+        "Aparência",
+        "Atalhos",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        tabs = tabs.push(l.nav(
+            label,
+            Message::SettingsTab(i as u8),
+            state.settings_tab == i as u8,
+        ));
+    }
+    let body: Element<'_, Message> = match state.settings_tab {
+        1 => {
+            let audio = column![
+                l.label("Á U D I O", 11.0, GOLD),
+                l.label("Microfone", 13.0, PAPER),
+                field(l, "Nenhum dispositivo enumerado"),
+                rule(LINE, l.px(10.0)),
+                l.label("Captura de áudio indisponível", 11.0, MUTED),
+                l.label("Saída", 13.0, PAPER),
+                field(l, "Nenhuma saída enumerada"),
+                option(l, "Supressão de ruído (RNNoise)", false),
+                option(l, "Cancelamento de eco", false),
+                option(l, "Push-to-talk", false)
+            ]
+            .spacing(l.px(16.0));
+            let video = column![
+                l.label("V Í D E O", 11.0, GOLD),
+                container(tile(l, "reading", "ILUSTRAÇÃO · câmera não aberta")).height(l.px(205.0)),
+                l.label("Câmera", 13.0, PAPER),
+                field(l, "Nenhuma câmera enumerada"),
+                option(l, "Filtro VHS na câmera", false)
+            ]
+            .spacing(l.px(16.0));
+            let topology = row![
+                column![l.label("T O P O L O G I A", 11.0, GOLD),
+                    l.label("Rotas diretas quando possíveis; relay ou SFU opcional operado por um membro.", 12.0, PAPER),
+                    l.label("Sem limite de mesh medido", 11.0, MUTED)].spacing(l.px(16.0)).width(Fill),
+                column![l.label("PRIVACIDADE DE IP", 11.0, GOLD), option(l,"Só via relay",false),
+                    l.label("Nenhuma rota configurada.", 11.0, MUTED)].spacing(l.px(16.0)).width(Fill),
+                column![l.label("SERVIÇOS", 11.0, GOLD),l.label("STUN · não configurado",12.0,MUTED),
+                    l.label("TURN · não configurado",12.0,MUTED),l.label("SFU · não configurado",12.0,MUTED)].spacing(l.px(16.0)).width(Fill)
+            ].spacing(l.px(22.0));
+            column![
+                row![l.panel(audio), l.panel(video)]
+                    .spacing(l.px(18.0))
+                    .height(l.px(440.0)),
+                l.panel(topology)
+            ]
+            .spacing(l.px(18.0))
+            .into()
+        }
+        0 => l.panel(
+            column![
+                l.title("Perfil & familiar", 34.0),
+                row![
+                    l.picture("frog", 100.0, 100.0),
+                    column![
+                        l.label(
+                            if state.name.is_empty() {
+                                "Seu nome"
+                            } else {
+                                &state.name
+                            },
+                            18.0,
+                            PAPER
+                        ),
+                        l.label(state.familiar, 13.0, VIOLET)
+                    ]
+                    .spacing(l.px(10.0))
+                ]
+                .spacing(l.px(20.0)),
+                l.label(
+                    "Perfil de prévia · sem identidade criptográfica",
+                    12.0,
+                    MUTED
+                ),
+                l.control(
+                    "users",
+                    "Escolher familiar",
+                    Some(Message::Navigate(Screen::Familiar)),
+                    true
+                )
+            ]
+            .spacing(l.px(24.0)),
+        ),
+        2 => l.panel(
+            column![
+                l.title("Rede & P2P", 34.0),
+                l.label(
+                    "Nenhum peer conectado. O transporte abaixo é um diagnóstico local.",
+                    12.0,
+                    MUTED
+                ),
+                diagnostics(state, l),
+                l.control(
+                    "refresh",
+                    "Atualizar diagnóstico local",
+                    Some(Message::RefreshBackend),
+                    false
+                ),
+                l.label(
+                    "LAN entre peers, sem helper ou Postgres: requisito ainda não implementado.",
+                    12.0,
+                    PAPER
+                )
+            ]
+            .spacing(l.px(24.0)),
+        ),
+        3 => l.panel(
+            column![
+                l.title("Chaves & MLS", 34.0),
+                l.label(
+                    "Nenhuma chave local, grupo MLS ou fingerprint criado.",
+                    13.0,
+                    PAPER
+                ),
+                l.control(
+                    "shield",
+                    "Ver prévia do selo",
+                    Some(Message::Navigate(Screen::Verify)),
+                    false
+                )
+            ]
+            .spacing(l.px(24.0)),
+        ),
+        6 => l.panel(
+            column![
+                l.title("Aparência", 34.0),
+                l.label("Textura VHS na interface", 14.0, PAPER),
+                l.control(
+                    "screen",
+                    if state.texture {
+                        "Desativar scanlines"
+                    } else {
+                        "Ativar scanlines"
+                    },
+                    Some(Message::ToggleTexture),
+                    true
+                ),
+                l.label(
+                    "Este ajuste afeta somente a interface. Nenhuma câmera é capturada.",
+                    12.0,
+                    MUTED
+                )
+            ]
+            .spacing(l.px(24.0)),
+        ),
+        _ => l.panel(
+            column![
+                l.title(Screen::Settings.label(), 34.0),
+                l.label(
+                    "Esta seção ainda não tem integração funcional.",
+                    14.0,
+                    PAPER
+                ),
+                l.label(
+                    "Use as telas de prévia para explorar a direção visual.",
+                    12.0,
+                    MUTED
+                )
+            ]
+            .spacing(l.px(24.0)),
+        ),
+    };
+    stack![
+        l.place(l.panel(tabs), 24.0, 82.0, 220.0, 665.0),
+        l.place(body, 262.0, 82.0, 994.0, 665.0)
+    ]
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+fn field(l: Layout, label: &str) -> Element<'static, Message> {
+    container(l.label(label, 12.0, PAPER))
+        .padding(l.px(12.0))
+        .width(Fill)
+        .style(|_| container::Style {
+            background: Some(NIGHT.into()),
+            border: Border {
+                color: LINE,
+                width: 1.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .into()
+}
+fn option(l: Layout, label: &str, on: bool) -> Element<'static, Message> {
+    row![
+        container(space())
+            .width(l.px(15.0))
+            .height(l.px(15.0))
+            .style(move |_| container::Style {
+                background: Some(if on { GOLD } else { NIGHT }.into()),
+                border: Border {
+                    color: LINE,
+                    width: 1.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        l.label(label, 12.0, MUTED)
+    ]
+    .spacing(l.px(10.0))
+    .align_y(iced::Center)
+    .into()
+}
+fn diagnostics(state: &Slouching, l: Layout) -> Element<'static, Message> {
+    let http = match &state.backend {
+        BackendConnection::Connecting => "Consultando servidor local…".into(),
+        BackendConnection::Unavailable(reason) => format!("Servidor local indisponível: {reason}"),
+        BackendConnection::ContractMismatch(reason) => format!("Contrato incompatível: {reason}"),
+        BackendConnection::Connected(s) => format!(
+            "Elixir local · contrato v{} · {} peers\nIdentidade: {:?} · mensagens: {:?} · chamadas: {:?}",
+            s.contract_version, s.peer_connections, s.identity, s.messaging, s.calls
+        ),
+    };
+    let ws = match &state.transport {
+        TransportState::Connecting(attempt) => format!("WebSocket · tentativa {attempt}"),
+        TransportState::Disconnected {
+            reason,
+            retry_seconds,
+        } => format!("Transporte desconectado · nova tentativa em {retry_seconds}s\n{reason}"),
+        TransportState::ProtocolError(reason) => format!("Erro de protocolo: {reason}"),
+        TransportState::Active { hello, heartbeats } => format!(
+            "Transporte local ativo · v{} · {heartbeats} Pongs\nIdentidade: {} · mensagens: {} · chamadas: {}",
+            hello.protocol_version,
+            hello.identity_available,
+            hello.messaging_available,
+            hello.calls_available
+        ),
+    };
+    column![l.label(http, 12.0, PAPER), l.label(ws, 12.0, VIOLET)]
+        .spacing(l.px(18.0))
+        .into()
+}
+fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
+    let stage = tile(
+        l,
+        "orb",
+        "Bram · cena ilustrativa / nenhuma câmera conectada",
+    );
+    let filmstrip = row![
+        boxed(tile(l, "frog-scene", "Mara · personagem")),
+        boxed(tile(l, "gnome-scene", "Pim · personagem")),
+        boxed(tile(l, "hat", "Você · câmera indisponível"))
+    ]
+    .spacing(l.px(12.0));
+    let controls = row![
+        l.icon_button(
+            "mic-off",
+            Message::PreviewAction("Captura de microfone ainda não implementada.")
+        ),
+        l.icon_button(
+            "camera-off",
+            Message::PreviewAction("Captura de câmera ainda não implementada.")
+        ),
+        l.icon_button("screen", Message::Navigate(Screen::Share)),
+        button(l.label("Leave", 14.0, PAPER))
+            .on_press(Message::Navigate(Screen::Home))
+            .padding([l.px(14.0), l.px(30.0)])
+            .style(|_, _| button::Style {
+                background: Some(RED.into()),
+                text_color: PAPER,
+                ..Default::default()
+            })
+    ]
+    .spacing(l.px(10.0));
+    let roster = column![
+        l.label("I N  T H E  R O O M", 11.0, MUTED),
+        person(l, "orb-avatar", "Bram", "exemplo"),
+        person(l, "frog", "Mara", "exemplo"),
+        person(l, "gnome", "Pim", "exemplo"),
+        person(l, "wizard", "You", "prévia")
+    ]
+    .spacing(l.px(13.0));
+    let samples = column![
+        container(l.picture("mushroom-scene", 145.0, 94.0)).width(Fill),
+        l.label("Pim  21:05", 11.0, VIOLET),
+        l.label("mic is dead, here's the proof", 12.0, PAPER),
+        container(l.picture("frog-scene", 145.0, 94.0)).width(Fill),
+        l.label("You  21:06", 11.0, GOLD),
+        l.label("saving both to the tape", 12.0, PAPER)
+    ]
+    .spacing(l.px(12.0));
+    let camp = column![
+        l.label("C A M P F I R E  C H A T", 11.0, MUTED),
+        l.label("EXEMPLOS · nenhum envio", 10.0, VIOLET),
+        scrollable(samples).height(Fill),
+        l.input("Mensagem · prévia", &state.draft, Message::DraftChanged)
+    ]
+    .spacing(l.px(12.0));
+    stack![
+        l.place(boxed(stage), 22.0, 70.0, 920.0, 426.0),
+        l.place(filmstrip, 22.0, 510.0, 920.0, 164.0),
+        l.place(container(controls).center_x(Fill), 22.0, 690.0, 920.0, 56.0),
+        l.place(l.panel(roster), 962.0, 70.0, 296.0, 204.0),
+        l.place(l.panel(camp), 962.0, 290.0, 296.0, 456.0)
+    ]
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+fn person(l: Layout, art: &'static str, name: &str, status: &str) -> Element<'static, Message> {
+    row![
+        l.picture(art, 28.0, 28.0),
+        l.label(name, 12.0, PAPER),
+        space().width(Fill),
+        l.label(status, 11.0, MUTED)
+    ]
+    .spacing(l.px(12.0))
+    .align_y(iced::Center)
+    .into()
+}
+fn lobby(l: Layout) -> Element<'static, Message> {
+    let stage = tile(l, "reading", "ILUSTRAÇÃO · sem captura local");
+    let details = column![
+        l.label("N O V A  F O G U E I R A", 10.0, MUTED),
+        l.title("the-mossy-stump", 32.0),
+        l.label("CONVITE", 11.0, GOLD),
+        field(l, "Nenhum convite gerado"),
+        l.label(
+            "O grupo e suas chaves ainda não existem. Nenhum participante entrou.",
+            12.0,
+            MUTED
+        ),
+        l.label("PERSONAGENS DA PRÉVIA", 11.0, GOLD),
+        person(l, "frog", "Mara", "ilustração"),
+        person(l, "gnome", "Pim", "ilustração"),
+        option(l, "Entrar mutado", true),
+        l.control(
+            "headphones",
+            "Explorar a tela de conexão",
+            Some(Message::Navigate(Screen::Connecting)),
+            true
+        )
+    ]
+    .spacing(l.px(20.0));
+    let controls = row![
+        l.icon_button(
+            "mic",
+            Message::PreviewAction("Esta imagem é ilustrativa. O microfone não foi aberto.")
+        ),
+        l.icon_button(
+            "camera",
+            Message::PreviewAction("Esta imagem é ilustrativa. A câmera não foi aberta.")
+        ),
+        l.icon_button("settings", Message::Navigate(Screen::Settings))
+    ]
+    .spacing(l.px(10.0));
+    stack![
+        l.place(boxed(stage), 42.0, 116.0, 748.0, 446.0),
+        l.place(container(controls).center_x(Fill), 42.0, 580.0, 748.0, 58.0),
+        l.place(l.panel(details), 814.0, 116.0, 422.0, 544.0)
+    ]
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+fn connecting(l: Layout) -> Element<'static, Message> {
+    let gnome = image(assets().images["gnome-cutout"].clone())
+        .width(Fill)
+        .height(Fill)
+        .content_fit(ContentFit::Contain);
+    let steps = column![l.label("PRÉVIA · nenhuma tentativa P2P ativa",11.0,VIOLET),
+        l.label("[—] convite · nenhum grupo autenticado\n[—] descoberta · não implementada\n[—] ICE / QUIC · não implementado\n[—] MLS · nenhuma Welcome recebida\n[—] relay · nenhum helper autorizado",13.0,PAPER)].spacing(l.px(18.0));
+    let fallback = column![row![l.picture("mushroom",84.0,84.0),column![l.title("Pim cochilou do outro lado do pântano",25.0),
+        l.label("Exemplo de falha de rota. Esta prévia não detecta NAT ou peers.",12.0,PAPER)].spacing(l.px(12.0))].spacing(l.px(16.0)),
+        l.control("refresh","Usar relay TURN · indisponível",None,true),l.control("users","Mover para SFU · indisponível",None,false),
+        l.control("arrow","Voltar ao lobby",Some(Message::Navigate(Screen::Lobby)),false),
+        l.label("O helper só poderá encaminhar dados cifrados. Não recebe as chaves privadas dos membros.",12.0,MUTED)].spacing(l.px(18.0));
+    stack![
+        l.place(gnome, 230.0, 70.0, 220.0, 252.0),
+        l.place(
+            l.title("Acendendo a fogueira…", 36.0),
+            115.0,
+            350.0,
+            490.0,
+            62.0
+        ),
+        l.place(rule(LINE, l.px(5.0)), 160.0, 415.0, 360.0, 5.0),
+        l.place(l.panel(steps), 115.0, 438.0, 490.0, 225.0),
+        l.place(
+            l.label("QUANDO O CAMINHO DIRETO FALHA", 11.0, MUTED),
+            660.0,
+            82.0,
+            555.0,
+            25.0
+        ),
+        l.place(l.panel(fallback), 660.0, 118.0, 555.0, 397.0),
+        l.place(
+            l.panel(l.label("Nenhuma rota configurada · sem conexão", 12.0, VIOLET)),
+            660.0,
+            540.0,
+            555.0,
+            68.0
+        )
+    ]
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+
+fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
+    let tabs = row![
+        l.nav(
+            "Telas · exemplos",
+            Message::ShareTab(0),
+            state.share_tab == 0
+        ),
+        l.nav(
+            "Janelas · exemplos",
+            Message::ShareTab(1),
+            state.share_tab == 1
+        ),
+        l.nav("Câmera extra", Message::ShareTab(2), state.share_tab == 2)
+    ]
+    .spacing(l.px(8.0));
+    let mut sources = row![].spacing(l.px(14.0));
+    let list = if state.share_tab == 0 {
+        [
+            ("home", "Tela 1 · exemplo"),
+            ("reading", "Tela 2 · exemplo"),
+            ("orb", "Somente uma janela…"),
+        ]
+    } else if state.share_tab == 1 {
+        [
+            ("reading", "Grimório · exemplo"),
+            ("frog-scene", "Janela da roda · exemplo"),
+            ("home", "Paisagem · exemplo"),
+        ]
+    } else {
+        [
+            ("frog-scene", "Câmera · ilustração"),
+            ("orb", "Orbe · ilustração"),
+            ("hat", "Sem câmera conectada"),
+        ]
+    };
+    for (i, (art, label)) in list.into_iter().enumerate() {
+        sources = sources.push(
+            button(
+                column![
+                    container(tile(l, art, label)).height(l.px(150.0)),
+                    l.label(
+                        if state.selected_source == i as u8 {
+                            "Selecionado na prévia"
+                        } else {
+                            "Exemplo de fonte"
+                        },
+                        11.0,
+                        MUTED
+                    )
+                ]
+                .spacing(l.px(10.0)),
+            )
+            .width(Fill)
+            .padding(l.px(10.0))
+            .on_press(Message::SelectSource(i as u8))
+            .style(move |_, s| button_style(s, false, state.selected_source == i as u8)),
+        );
+    }
+    let body = column![
+        l.title("O que você quer mostrar à roda?", 36.0),
+        l.label(
+            "PRÉVIA · fontes ilustrativas, nenhuma tela enumerada ou capturada",
+            12.0,
+            MUTED
+        ),
+        tabs,
+        sources,
+        option(l, "Compartilhar áudio do sistema · indisponível", false),
+        row![
+            column![
+                l.label("QUALIDADE", 11.0, GOLD),
+                field(l, "720p30 / 1080p30 / 1080p60")
+            ],
+            column![
+                l.label("OTIMIZAR PARA", 11.0, GOLD),
+                field(l, "Texto nítido / movimento")
+            ]
+        ]
+        .spacing(l.px(24.0)),
+        l.label(
+            "Estimativa de upload indisponível · nenhum peer conectado",
+            11.0,
+            MUTED
+        ),
+        row![
+            l.control(
+                "close",
+                "Cancelar",
+                Some(Message::Navigate(Screen::Call)),
+                false
+            ),
+            space().width(Fill),
+            l.control("screen", "Captura indisponível", None, true)
+        ]
+        .spacing(l.px(20.0))
+    ]
+    .spacing(l.px(20.0));
+    l.place(l.panel(body), 126.0, 94.0, 1028.0, 646.0)
+}
+fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
+    let contacts = column![
+        l.title("Sussurros", 25.0),
+        field(l, "Buscar · prévia"),
+        person(l, "frog", "Mara", "exemplo"),
+        person(l, "gnome", "Pim", "exemplo"),
+        person(l, "orb-avatar", "Velho Bram", "exemplo"),
+        person(l, "wizard", "Odo", "exemplo"),
+        space().height(Fill),
+        l.control(
+            "users",
+            "Meu familiar",
+            Some(Message::Navigate(Screen::Familiar)),
+            false
+        )
+    ]
+    .spacing(l.px(23.0));
+    let chathead = row![
+        l.picture("frog", 38.0, 38.0),
+        column![
+            l.label("Mara", 18.0, PAPER),
+            l.label("Personagem · sem presença real", 10.0, MUTED)
+        ],
+        space().width(Fill),
+        l.icon_button("phone", Message::Navigate(Screen::Incoming)),
+        l.icon_button("camera", Message::Navigate(Screen::Lobby)),
+        l.icon_button("shield", Message::Navigate(Screen::Verify))
+    ]
+    .spacing(l.px(12.0))
+    .align_y(iced::Center);
+    let sample = column![
+        container(l.label(
+            "EXEMPLOS DE MENSAGEM · nenhum envio ou recibo real",
+            10.0,
+            MUTED
+        ))
+        .center_x(Fill),
+        bubble(
+            l,
+            "viu o castelo ontem? as luzes da escada acenderam sozinhas",
+            "21:02 · exemplo",
+            false
+        ),
+        bubble(
+            l,
+            "vi! gravei tudo, te mando a fita",
+            "21:03 · exemplo",
+            true
+        ),
+        container(
+            column![
+                l.picture("mushroom-scene", 240.0, 150.0),
+                l.label("olha quem dormiu no meio do turno", 12.0, PAPER)
+            ]
+            .spacing(l.px(8.0))
+        )
+        .padding(l.px(12.0))
+        .style(panel_style),
+        row![
+            l.icon("file", VIOLET, 28.0),
+            column![
+                l.label("castelo_escada.mov", 12.0, PAPER),
+                l.label(
+                    "Anexo ilustrativo · nenhum arquivo transferido",
+                    10.0,
+                    MUTED
+                )
+            ]
+            .spacing(l.px(8.0))
+        ]
+        .spacing(l.px(15.0)),
+        l.label(
+            "O histórico ficará no SQLite local · ainda não implementado",
+            11.0,
+            MUTED
+        )
+    ]
+    .spacing(l.px(22.0));
+    let messages = scrollable(sample).height(Fill);
+    let composer = row![
+        l.icon_button(
+            "attachment",
+            Message::PreviewAction("Anexos ainda não podem ser enviados.")
+        ),
+        l.input(
+            "Mensagem · envio indisponível",
+            &state.draft,
+            Message::DraftChanged
+        ),
+        button(l.icon("arrow", NIGHT, 20.0))
+            .padding(l.px(14.0))
+            .style(|_, s| button_style(s, true, false))
+    ]
+    .spacing(l.px(10.0));
+    let body = column![chathead, rule(LINE, 1.0), messages, composer].spacing(l.px(18.0));
+    stack![
+        l.place(l.panel(contacts), 24.0, 80.0, 300.0, 676.0),
+        l.place(l.panel(body), 340.0, 80.0, 916.0, 676.0)
+    ]
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+fn bubble(l: Layout, value: &str, time: &str, outgoing: bool) -> Element<'static, Message> {
+    let c = container(
+        column![l.label(value, 13.0, PAPER), l.label(time, 10.0, MUTED)].spacing(l.px(8.0)),
+    )
+    .padding(l.px(16.0))
+    .max_width(l.px(560.0))
+    .style(move |_| container::Style {
+        background: Some(
+            if outgoing {
+                Color::from_rgb8(35, 28, 77)
+            } else {
+                PANEL
+            }
+            .into(),
+        ),
+        border: Border {
+            color: LINE,
+            width: 1.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    if outgoing {
+        container(c).align_right(Fill).into()
+    } else {
+        container(c).align_left(Fill).into()
+    }
+}
+fn incoming(l: Layout) -> Element<'static, Message> {
+    let portrait = container(
+        image(assets().images["frog"].clone())
+            .width(l.px(154.0))
+            .height(l.px(154.0))
+            .content_fit(ContentFit::Cover)
+            .border_radius(l.px(80.0)),
+    )
+    .padding(l.px(3.0))
+    .style(|_| container::Style {
+        border: Border {
+            color: GOLD,
+            width: 2.0,
+            radius: 80.0.into(),
+        },
+        ..Default::default()
+    });
+    let actions = row![
+        l.control(
+            "close",
+            "Recusar",
+            Some(Message::Navigate(Screen::Home)),
+            false
+        ),
+        l.control(
+            "phone",
+            "Prévia de voz",
+            Some(Message::Navigate(Screen::Lobby)),
+            false
+        ),
+        l.control(
+            "camera",
+            "Prévia de vídeo",
+            Some(Message::Navigate(Screen::Lobby)),
+            true
+        )
+    ]
+    .spacing(l.px(16.0));
+    let notification = column![
+        l.label("NOTIFICAÇÃO · EXEMPLO", 10.0, MUTED),
+        row![
+            l.picture("gnome", 42.0, 42.0),
+            column![
+                l.label("Pim chama a roda", 14.0, PAPER),
+                l.label("Nenhuma chamada recebida", 10.0, MUTED)
+            ]
+            .spacing(l.px(6.0))
+        ]
+        .spacing(l.px(12.0)),
+        row![
+            l.control(
+                "close",
+                "Agora não",
+                Some(Message::Navigate(Screen::Home)),
+                false
+            ),
+            l.control(
+                "headphones",
+                "Ver lobby",
+                Some(Message::Navigate(Screen::Lobby)),
+                true
+            )
+        ]
+        .spacing(l.px(8.0))
+    ]
+    .spacing(l.px(14.0));
+    stack![
+        l.place(
+            container(portrait).center_x(Fill),
+            480.0,
+            140.0,
+            320.0,
+            185.0
+        ),
+        l.place(
+            container(l.label("C H A M A D A  D E  V Í D E O", 11.0, MUTED)).center_x(Fill),
+            300.0,
+            367.0,
+            680.0,
+            25.0
+        ),
+        l.place(
+            container(l.title("Mara está batendo", 52.0)).center_x(Fill),
+            210.0,
+            408.0,
+            860.0,
+            80.0
+        ),
+        l.place(
+            container(l.label(
+                "Personagem da prévia · nenhuma chamada recebida",
+                12.0,
+                VIOLET
+            ))
+            .center_x(Fill),
+            240.0,
+            495.0,
+            800.0,
+            40.0
+        ),
+        l.place(actions, 310.0, 558.0, 660.0, 60.0),
+        l.place(
+            container(l.label("já vou, tô esquentando o caldeirão", 12.0, MUTED)).center_x(Fill),
+            260.0,
+            631.0,
+            760.0,
+            30.0
+        ),
+        l.place(l.panel(notification), 890.0, 606.0, 360.0, 182.0)
+    ]
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+
+fn verification(l: Layout) -> Element<'static, Message> {
+    let heading = column![
+        l.title("Selar o pacto com Mara", 40.0),
+        l.label(
+            "PRÉVIA DE SEGURANÇA · nenhuma identidade, palavra ou QR autenticado",
+            12.0,
+            VIOLET
+        )
+    ]
+    .spacing(l.px(12.0));
+    let actions = column![
+        l.control("check", "Verificação indisponível", None, true),
+        l.control(
+            "close",
+            "Voltar à conversa",
+            Some(Message::Navigate(Screen::Chat)),
+            false
+        ),
+        l.label("QR não disponível", 12.0, MUTED)
+    ]
+    .spacing(l.px(12.0));
+    let mls = column![
+        l.label("G R U P O  M L S", 11.0, GOLD),
+        l.label("epoch · nenhum grupo criado", 12.0, MUTED),
+        l.label("suíte · ainda não selecionada", 12.0, MUTED),
+        l.label("mídia · SFrame não implementado", 12.0, MUTED)
+    ]
+    .spacing(l.px(12.0));
+    let devices = column![
+        l.label("DISPOSITIVOS DA MARA", 11.0, GOLD),
+        l.label("Nenhum dispositivo autenticado ou verificado", 12.0, MUTED),
+        l.label(
+            "A comparação exige chaves reais e um canal independente.",
+            12.0,
+            PAPER
+        )
+    ]
+    .spacing(l.px(14.0));
+    stack![
+        l.place(heading, 48.0, 90.0, 1150.0, 92.0),
+        l.place(
+            seal_card(l, "wizard", "Você · Odo"),
+            48.0,
+            228.0,
+            438.0,
+            280.0
+        ),
+        l.place(
+            image(assets().images["wizards-cutout"].clone())
+                .width(Fill)
+                .height(Fill)
+                .content_fit(ContentFit::Contain),
+            536.0,
+            172.0,
+            208.0,
+            214.0
+        ),
+        l.place(actions, 510.0, 408.0, 260.0, 153.0),
+        l.place(seal_card(l, "frog", "Mara"), 794.0, 228.0, 438.0, 280.0),
+        l.place(l.panel(mls), 48.0, 590.0, 580.0, 151.0),
+        l.place(l.panel(devices), 652.0, 590.0, 580.0, 151.0)
+    ]
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+
+fn seal_card(l: Layout, art: &'static str, name: &str) -> Element<'static, Message> {
+    let mut words = column![].spacing(l.px(8.0));
+    for group in [["sapo", "lua", "musgo"], ["cajado", "vela", "runa"]] {
+        words = words.push(
+            row![field(l, group[0]), field(l, group[1]), field(l, group[2])].spacing(l.px(8.0)),
+        );
+    }
+    l.panel(
+        column![
+            row![l.picture(art, 36.0, 36.0), l.label(name, 14.0, PAPER)]
+                .spacing(l.px(14.0))
+                .align_y(iced::Center),
+            l.label("PALAVRAS ILUSTRATIVAS", 10.0, VIOLET),
+            words,
+            l.label("Fingerprint não disponível · sem chave", 10.0, MUTED)
+        ]
+        .spacing(l.px(14.0)),
+    )
+}
+
+fn components(l: Layout) -> Element<'static, Message> {
+    let mut colors = column![].spacing(l.px(16.0));
+    let tokens = [
+        ("Noite", NIGHT),
+        ("Painel", PANEL),
+        ("Linha", LINE),
+        ("Pergaminho", PAPER),
+        ("Lanterna", GOLD),
+        ("Feitiço", VIOLET),
+        ("Musgo", GREEN),
+        ("Amanita", RED),
+    ];
+    for group in tokens.chunks(4) {
+        let mut strip = row![].spacing(l.px(10.0));
+        for &(name, color) in group {
+            strip = strip.push(
+                column![
+                    container(space())
+                        .width(Fill)
+                        .height(l.px(54.0))
+                        .style(move |_| container::Style {
+                            background: Some(color.into()),
+                            border: Border {
+                                color: LINE,
+                                width: 1.0,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }),
+                    l.label(name, 12.0, PAPER)
+                ]
+                .spacing(l.px(8.0))
+                .width(Fill),
+            );
+        }
+        colors = colors.push(strip);
+    }
+    let left=column![l.title("slouching",62.0),l.label("P2P voice & video for you and your crew",13.0,PAPER),l.label("C O R E S",11.0,MUTED),colors,l.label("T I P O G R A F I A",11.0,MUTED),rule(LINE,1.0),
+        row![l.title("Aa",34.0),l.label("Bricolage Grotesque 800 — logo e títulos",11.0,PAPER)].spacing(l.px(16.0)).align_y(iced::Center),rule(LINE,1.0),
+        row![l.label("Aa",30.0,PAPER),l.label("JetBrains Mono 400 / 500 / 700",11.0,PAPER)].spacing(l.px(16.0)).align_y(iced::Center),l.label("T E X T U R A",11.0,MUTED),
+        l.label("Scanlines, vinheta e painéis translúcidos. Bordas de 1 px e cantos retos preservam o clima da fita VHS.",12.0,MUTED)].spacing(l.px(19.0));
+    let mut cast = row![].spacing(l.px(12.0));
+    for (art, name) in [
+        ("wizards-cutout", "Os Magos"),
+        ("frog-cutout", "Sapo Mago"),
+        ("gnome-cutout", "Gnomo"),
+        ("mushroom-cutout", "O Cogumelo"),
+    ] {
+        cast = cast.push(
+            l.panel(
+                column![
+                    image(assets().images[art].clone())
+                        .width(Fill)
+                        .height(l.px(126.0))
+                        .content_fit(ContentFit::Contain),
+                    l.label(name, 11.0, PAPER)
+                ]
+                .spacing(l.px(14.0))
+                .align_x(iced::Center),
+            ),
+        );
+    }
+    let right = column![
+        l.label("E L E N C O  ·  F A M I L I A R E S", 11.0, MUTED),
+        container(cast).height(l.px(194.0)),
+        l.label("C O M P O N E N T E S", 11.0, MUTED),
+        row![
+            l.control(
+                "headphones",
+                "Join a Call",
+                Some(Message::Navigate(Screen::Lobby)),
+                true
+            ),
+            l.control(
+                "users",
+                "Create a Call",
+                Some(Message::Navigate(Screen::Lobby)),
+                false
+            )
+        ]
+        .spacing(l.px(12.0)),
+        row![
+            l.icon_button(
+                "mic",
+                Message::PreviewAction("Microfone indisponível nesta prévia.")
+            ),
+            l.icon_button("screen", Message::Navigate(Screen::Share)),
+            l.icon_button("shield", Message::Navigate(Screen::Verify))
+        ]
+        .spacing(l.px(12.0)),
+        l.panel(
+            column![
+                l.label("CONVITE", 11.0, MUTED),
+                field(l, "Nenhum convite gerado"),
+                l.label(
+                    "Os indicadores de rota, MLS e entrega só serão exibidos com evidência real.",
+                    11.0,
+                    VIOLET
+                )
+            ]
+            .spacing(l.px(16.0))
+        ),
+        l.control(
+            "screen",
+            "Alternar textura VHS",
+            Some(Message::ToggleTexture),
+            false
+        )
+    ]
+    .spacing(l.px(23.0));
+    stack![
+        l.place(left, 48.0, 82.0, 520.0, 660.0),
+        l.place(right, 608.0, 90.0, 624.0, 640.0)
+    ]
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+
+struct Fx;
+impl canvas::Program<Message> for Fx {
+    type State = ();
+    fn draw(
+        &self,
+        _: &(),
+        renderer: &Renderer,
+        _: &Theme,
+        bounds: Rectangle,
+        _: iced::mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut f = canvas::Frame::new(renderer, bounds.size());
+        for y in (0..bounds.height as usize).step_by(3) {
+            f.fill_rectangle(
+                Point::new(0.0, y as f32),
+                Size::new(bounds.width, 1.0),
+                Color::from_rgba(0.0, 0.0, 0.0, 0.14),
+            );
+        }
+        for (start, end) in [
+            (Point::ORIGIN, Point::new(bounds.width * 0.15, 0.0)),
+            (
+                Point::new(bounds.width, 0.0),
+                Point::new(bounds.width * 0.85, 0.0),
+            ),
+        ] {
+            let g = canvas::gradient::Linear::new(start, end)
+                .add_stop(0.0, Color::from_rgba(0.0, 0.0, 0.0, 0.46))
+                .add_stop(1.0, Color::TRANSPARENT);
+            f.fill(
+                &canvas::Path::rectangle(Point::ORIGIN, bounds.size()),
+                canvas::Fill {
+                    style: canvas::Style::Gradient(g.into()),
+                    ..Default::default()
+                },
+            );
+        }
+        vec![f.into_geometry()]
+    }
+}

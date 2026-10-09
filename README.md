@@ -9,7 +9,7 @@ backend interface.
 The first HTML/CSS/JavaScript screens were a rushed **visual prototype**.
 They now live in [`prototypes/web/`](prototypes/web/) and are not the
 product frontend. The Rust app in [`src/main.rs`](src/main.rs) is the
-new starting point.
+application entry point; [src/ui.rs](src/ui.rs) owns the native design components and screens.
 
 ## Run the native scaffold
 
@@ -39,13 +39,42 @@ not establish a peer session. The UI shows connection and protocol errors
 separately. **Refresh backend** repeats both
 the HTTP diagnostic and WebSocket handshake.
 
-It opens home, familiar, and call-preview views using the supplied art.
-Call and device controls are disabled. Invitation entry is a visual preview;
-it does not connect peers, create keys, capture media, or send messages.
-This is a native UI scaffold; visual parity with the eleven reference
-screens and functional integration with the backend remain open work.
+The native app now recreates all eleven design-board views with real Iced
+widgets, original characters and scenery, extracted outline SVG icons,
+Bricolage Grotesque and JetBrains Mono, translucent panels, scanlines, and
+vignette. The top-right **Telas** button opens the screen gallery.
 
-![Actual Rust/Iced home with Elixir HTTP status and active WebSocket heartbeat; visual parity is pending](docs/design/runtime/elixir-persistent-transport.png)
+Familiar selection, profile/invitation/draft fields, screen navigation,
+settings tabs, illustrative share-source selection, and interface texture
+work locally. Profiles and drafts remain in memory. Every view is labeled
+as a visual preview: character images, messages, and comparison words are
+illustrative. No identity is generated, no message is sent, and no camera,
+microphone, or screen is captured. **Rede & P2P** in Settings retains the
+real Elixir HTTP/WebSocket diagnostics and manual refresh.
+
+![Actual native Iced home using the supplied scenery and characters](docs/design/runtime/native-vhs/09-home.png)
+
+![Actual native Iced group-call preview; all media and chat content is illustrative](docs/design/runtime/native-vhs/10-call.png)
+
+The eleven runtime captures are in [native-vhs](docs/design/runtime/native-vhs/).
+These are a first implementation of the visual direction, with comparison
+at 1280 × 800 and a compact 960 × 640 window. Exact visual parity,
+accessibility, and live media integration remain to be completed.
+
+## Reproduce native captures
+
+```sh
+cargo run -- --screen 09-home
+SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures
+```
+
+The capture command renders all eleven screens, saves screenshots through
+Iced's window screenshot API, and exits. A tiling compositor may override
+the requested window size; float/resize that window before the initial
+six-second capture delay. `SLOUCHING_WINDOW_SIZE` only requests an initial
+size. The normal default is a compact 1100 × 720 window.
+
+Assets and font license/provenance notes are in [assets/README.md](assets/README.md).
 
 ## Architecture
 
