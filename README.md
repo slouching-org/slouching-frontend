@@ -119,6 +119,23 @@ current epoch and quarantine state. **Abrir** restores a group's ID, bounded
 transcript, pending Commits, and security alert, so reopening the app does not
 depend on remembering the group ID.
 
+A member can create a signed MLS self-update proposal and share its public bytes
+with the designated committer through a separately trusted channel. The
+committer authenticates the member's device-bound MLS credential, stores the
+proposal in the encrypted OpenMLS state, and deduplicates exact redelivery.
+Only the designated committer can turn accepted proposals into a Commit. That
+operation saves the new epoch, Commit outbox, and predecessor-member recipient
+ledger atomically; the existing direct-session Commit delivery flow distributes
+it. This first proposal path accepts self-updates only. It does not yet provide
+network proposal delivery or approval controls for other proposal types.
+
+For this flow, the member opens the group and clicks **Criar proposta para
+atualizar minha chave**, then shares **Copiar proposta para o committer** over
+the trusted channel. The committer opens the same group, pastes the bytes in
+**Proposta de update recebida do membro**, and clicks **Autenticar e guardar
+proposta** followed by **Criar Commit das propostas pendentes**. It then uses
+**Enviar Commits pendentes** over the active pinned peer session.
+
 Before applying a Commit, each device saves the prior OpenMLS epoch state in
 its encrypted profile database. If it later receives a different, valid Commit
 from the designated committer for an already accepted predecessor epoch, it
@@ -153,7 +170,7 @@ be installed and available in the user session.
 
 ![Actual native Iced group-call preview; media and sample messages are illustrative](docs/design/runtime/native-vhs/10-call.png)
 
-![Actual native Iced MLS group screen, captured from the running app without a selected group](docs/design/runtime/native-vhs/11-mls.png)
+![Actual native Iced MLS group screen showing saved groups and the self-update proposal action, captured from the running app without a selected group](docs/design/runtime/native-vhs/11-mls.png)
 
 The MLS screen now detects authenticated committer equivocation. It verifies a
 conflicting historical Commit against a saved OpenMLS epoch snapshot, stores

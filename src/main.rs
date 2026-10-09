@@ -194,6 +194,8 @@ struct Slouching {
     mls_invite_key_package: String,
     mls_commit: String,
     mls_received_commit: String,
+    mls_update_proposal: String,
+    mls_received_update_proposal: String,
     mls_welcome: String,
     mls_ratchet_tree: String,
     mls_status: String,
@@ -323,6 +325,8 @@ impl Default for Slouching {
             mls_invite_key_package: String::new(),
             mls_commit: String::new(),
             mls_received_commit: String::new(),
+            mls_update_proposal: String::new(),
+            mls_received_update_proposal: String::new(),
             mls_welcome: String::new(),
             mls_ratchet_tree: String::new(),
             mls_status: "Crie uma identidade do dispositivo para começar.".to_owned(),
@@ -396,6 +400,14 @@ enum Message {
     MlsInviteKeyPackageChanged(String),
     MlsCommitChanged(String),
     MlsReceivedCommitChanged(String),
+    MlsUpdateProposalChanged(String),
+    MlsReceivedUpdateProposalChanged(String),
+    CreateMlsUpdateProposal,
+    MlsUpdateProposalCreated(Result<storage::PreparedMlsUpdateProposal, String>),
+    ApplyMlsUpdateProposal,
+    MlsUpdateProposalProcessed(Result<storage::ProcessedMlsProposal, String>),
+    CommitMlsProposals,
+    MlsProposalCommitCreated(Result<storage::StoredMlsCommit, String>),
     ApplyMlsCommit,
     MlsCommitProcessed(Result<storage::ProcessedMlsCommit, String>),
     DistributeMlsCommit,
@@ -1238,6 +1250,114 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         Message::MlsMessageDraftChanged(value) => state.mls_message_draft = value,
         Message::MlsCommitChanged(value) => state.mls_commit = value,
         Message::MlsReceivedCommitChanged(value) => state.mls_received_commit = value,
+        Message::MlsUpdateProposalChanged(value) => state.mls_update_proposal = value,
+        Message::MlsReceivedUpdateProposalChanged(value) => {
+            state.mls_received_update_proposal = value
+        }
+        Message::CreateMlsUpdateProposal => {
+            if state.mls_quarantine_reason.is_some() {
+                state.mls_status = "Grupo em quarentena; atualização de membro bloqueada.".into();
+                return Task::none();
+            }
+            let group_id = match hex_decode_bytes(&state.mls_group_id) {
+                Ok(group_id) if group_id.len() == 16 => group_id,
+                _ => {
+                    state.mls_status =
+                        "Informe o ID do grupo MLS ingressado neste dispositivo.".into();
+                    return Task::none();
+                }
+            };
+            state.mls_status =
+                "Criando proposta assinada para atualizar a chave deste membro…".into();
+            return Task::perform(
+                create_mls_update_proposal_task(group_id),
+                Message::MlsUpdateProposalCreated,
+            );
+        }
+        Message::MlsUpdateProposalCreated(result) => match result {
+            Ok(proposal) => {
+                state.mls_update_proposal = hex_encode_bytes(&proposal.proposal);
+                state.mls_status = format!(
+                    "Proposta de atualização pronta para o committer designado (epoch {}). Compartilhe pelo canal confiável.",
+                    proposal.epoch
+                );
+            }
+            Err(error) => state.mls_status = format!("Falha ao criar proposta MLS: {error}"),
+        },
+        Message::ApplyMlsUpdateProposal => {
+            if state.mls_quarantine_reason.is_some() {
+                state.mls_status = "Grupo em quarentena; propostas MLS bloqueadas.".into();
+                return Task::none();
+            }
+            let group_id = match hex_decode_bytes(&state.mls_group_id) {
+                Ok(group_id) if group_id.len() == 16 => group_id,
+                _ => {
+                    state.mls_status =
+                        "Informe o ID do grupo MLS ingressado neste dispositivo.".into();
+                    return Task::none();
+                }
+            };
+            let proposal = match hex_decode_bytes(&state.mls_received_update_proposal) {
+                Ok(proposal) => proposal,
+                Err(error) => {
+                    state.mls_status = format!("Proposta MLS inválida: {error}");
+                    return Task::none();
+                }
+            };
+            state.mls_status = "Autenticando a proposta do membro e guardando-a no grupo…".into();
+            return Task::perform(
+                process_mls_update_proposal_task(group_id, proposal),
+                Message::MlsUpdateProposalProcessed,
+            );
+        }
+        Message::MlsUpdateProposalProcessed(result) => match result {
+            Ok(storage::ProcessedMlsProposal::Accepted { epoch }) => {
+                state.mls_received_update_proposal.clear();
+                state.mls_status = format!(
+                    "Atualização autenticada e salva como proposta pendente no epoch {epoch}. O committer pode gerar o Commit."
+                );
+            }
+            Ok(storage::ProcessedMlsProposal::Duplicate { epoch }) => {
+                state.mls_received_update_proposal.clear();
+                state.mls_status = format!(
+                    "Proposta já está salva no grupo no epoch {epoch}; redelivery não duplicou a operação."
+                );
+            }
+            Err(error) => state.mls_status = format!("Proposta MLS rejeitada: {error}"),
+        },
+        Message::CommitMlsProposals => {
+            if state.mls_quarantine_reason.is_some() {
+                state.mls_status = "Grupo em quarentena; geração de Commit bloqueada.".into();
+                return Task::none();
+            }
+            let group_id = match hex_decode_bytes(&state.mls_group_id) {
+                Ok(group_id) if group_id.len() == 16 => group_id,
+                _ => {
+                    state.mls_status =
+                        "Informe o ID do grupo MLS ingressado neste dispositivo.".into();
+                    return Task::none();
+                }
+            };
+            state.mls_status = "Commitando propostas MLS autenticadas…".into();
+            return Task::perform(
+                commit_mls_proposals_task(group_id),
+                Message::MlsProposalCommitCreated,
+            );
+        }
+        Message::MlsProposalCommitCreated(result) => match result {
+            Ok(commit) => {
+                state.mls_commit = hex_encode_bytes(&commit.commit);
+                state.mls_status = format!(
+                    "Commit MLS do epoch {} salvo no outbox para os membros anteriores. Distribua pela sessão direta.",
+                    commit.epoch
+                );
+                let history = load_mls_history(state, commit.group_id);
+                return Task::batch([history, load_mls_groups()]);
+            }
+            Err(error) => {
+                state.mls_status = format!("Falha ao criar Commit das propostas: {error}")
+            }
+        },
         Message::DistributeMlsCommit => {
             if state.mls_quarantine_reason.is_some() {
                 state.mls_status =
@@ -2107,6 +2227,31 @@ async fn admit_mls_member_task(
     tokio::task::spawn_blocking(move || storage::add_mls_group_member(&group_id, &package))
         .await
         .map_err(|error| format!("MLS member admission task failed: {error}"))?
+}
+
+async fn create_mls_update_proposal_task(
+    group_id: Vec<u8>,
+) -> Result<storage::PreparedMlsUpdateProposal, String> {
+    tokio::task::spawn_blocking(move || storage::create_mls_self_update_proposal(&group_id))
+        .await
+        .map_err(|error| format!("MLS update proposal task failed: {error}"))?
+}
+
+async fn process_mls_update_proposal_task(
+    group_id: Vec<u8>,
+    proposal: Vec<u8>,
+) -> Result<storage::ProcessedMlsProposal, String> {
+    tokio::task::spawn_blocking(move || {
+        storage::process_mls_self_update_proposal(&group_id, &proposal)
+    })
+    .await
+    .map_err(|error| format!("MLS proposal processing task failed: {error}"))?
+}
+
+async fn commit_mls_proposals_task(group_id: Vec<u8>) -> Result<storage::StoredMlsCommit, String> {
+    tokio::task::spawn_blocking(move || storage::commit_pending_mls_proposals(&group_id))
+        .await
+        .map_err(|error| format!("MLS proposal Commit task failed: {error}"))?
 }
 
 async fn join_mls_group_task(

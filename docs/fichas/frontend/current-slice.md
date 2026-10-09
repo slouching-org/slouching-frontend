@@ -33,6 +33,10 @@ require a separately trusted channel. Both devices must have joined the same
 group, select its ID, and establish a direct LAN session to exchange messages.
 Groups saved on this device appear with their current epoch and quarantine
 status; selecting one reloads its local transcript and security state.
+Members can exchange signed self-update proposals through a separately
+trusted channel. The designated committer authenticates and stores a proposal,
+then creates an atomic, retryable Commit for the existing member-delivery flow.
+Other proposal types and network proposal delivery are not implemented.
 
 The direct-LAN text screen manually pins the peer's Ed25519 device key. One
 side listens and shares its announced LAN address; the other connects to that

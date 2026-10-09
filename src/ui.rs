@@ -1309,6 +1309,25 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
         .align_y(iced::Center),
         column(local_groups).spacing(l.px(4.0)),
         rule(LINE, 1.0),
+        l.label("PROPOSTA DE UPDATE RECEBIDA DO MEMBRO", 10.0, GOLD),
+        l.input(
+            "Cole a proposta hexadecimal",
+            &state.mls_received_update_proposal,
+            Message::MlsReceivedUpdateProposalChanged
+        ),
+        l.control(
+            "check",
+            "Autenticar e guardar proposta",
+            Some(Message::ApplyMlsUpdateProposal),
+            state.mls_quarantine_reason.is_none()
+        ),
+        l.control(
+            "users",
+            "Criar Commit das propostas pendentes",
+            Some(Message::CommitMlsProposals),
+            state.mls_quarantine_reason.is_none()
+        ),
+        rule(LINE, 1.0),
         l.label("KEYPACKAGE RECEBIDO DO CONVIDADO", 10.0, GOLD),
         l.input(
             "Cole o KeyPackage público",
@@ -1403,6 +1422,25 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             "Copiar KeyPackage para convidar",
             (!state.mls_key_package.is_empty())
                 .then(|| Message::CopyMlsValue(state.mls_key_package.clone())),
+            false
+        ),
+        l.label("ATUALIZAÇÃO DA MINHA CHAVE MLS", 10.0, GOLD),
+        l.control(
+            "key",
+            "Criar proposta para atualizar minha chave",
+            Some(Message::CreateMlsUpdateProposal),
+            state.mls_quarantine_reason.is_none()
+        ),
+        l.input(
+            "Proposta assinada hexadecimal",
+            &state.mls_update_proposal,
+            Message::MlsUpdateProposalChanged
+        ),
+        l.control(
+            "key",
+            "Copiar proposta para o committer",
+            (!state.mls_update_proposal.is_empty())
+                .then(|| Message::CopyMlsValue(state.mls_update_proposal.clone())),
             false
         ),
         rule(LINE, 1.0),

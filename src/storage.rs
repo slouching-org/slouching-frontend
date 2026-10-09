@@ -3,9 +3,10 @@ use directories::ProjectDirs;
 use ed25519_dalek::SigningKey;
 use keyring::{Entry, Error as KeyringError};
 use openmls::prelude::{
-    BasicCredential, Ciphersuite, CredentialWithKey, GroupId, KeyPackage, KeyPackageIn, MlsGroup,
-    MlsGroupCreateConfig, MlsGroupJoinConfig, MlsMessageBodyIn, MlsMessageIn, OpenMlsProvider,
-    ProtocolVersion, RatchetTreeIn, StagedWelcome, tls_codec::Serialize as TlsCodecSerialize,
+    BasicCredential, Ciphersuite, CredentialWithKey, GroupId, KeyPackage, KeyPackageIn,
+    LeafNodeParameters, MlsGroup, MlsGroupCreateConfig, MlsGroupJoinConfig, MlsMessageBodyIn,
+    MlsMessageIn, OpenMlsProvider, ProcessedMessageContent, Proposal, ProtocolVersion,
+    RatchetTreeIn, StagedWelcome, tls_codec::Serialize as TlsCodecSerialize,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
@@ -24,7 +25,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 11;
+const PROFILE_SCHEMA_VERSION: u32 = 12;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 type StoredEventEnvelope = (
@@ -442,6 +443,19 @@ pub struct StoredMlsCommit {
     pub author_device: [u8; 32],
     pub commit_hash: [u8; 32],
     pub commit: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedMlsUpdateProposal {
+    pub group_id: Vec<u8>,
+    pub epoch: u64,
+    pub proposal: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessedMlsProposal {
+    Accepted { epoch: u64 },
+    Duplicate { epoch: u64 },
 }
 
 type StoredMlsCommitRow = (Vec<u8>, Vec<u8>, i64, i64, Vec<u8>, Vec<u8>, Vec<u8>);
@@ -1054,6 +1068,237 @@ fn create_mls_application_event_in(
         })
     })();
     finish_sql_transaction(connection, result, "MLS application outbox")
+}
+
+/// Creates a signed self-update proposal for the selected MLS group. The
+/// returned public message can be transferred to the designated committer.
+pub fn create_mls_self_update_proposal(
+    group_id: &[u8],
+) -> Result<PreparedMlsUpdateProposal, String> {
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let device_identity = signing_key_from_secret(secret)?;
+    let mut connection = open_local_database()?;
+    create_mls_self_update_proposal_in(&mut connection, group_id, &device_identity)
+}
+
+fn create_mls_self_update_proposal_in(
+    connection: &mut Connection,
+    group_id: &[u8],
+    device_identity: &SigningKey,
+) -> Result<PreparedMlsUpdateProposal, String> {
+    use openmls::prelude::tls_codec::Serialize as TlsCodecSerialize;
+
+    if group_id.len() != 16 {
+        return Err("MLS group ID must be 16 bytes".to_owned());
+    }
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| format!("could not begin MLS update proposal transaction: {error}"))?;
+    let result = (|| {
+        ensure_mls_group_not_quarantined(connection, group_id)?;
+        let proposal = {
+            let provider = LocalOpenMlsProvider::new(connection);
+            let group_identifier = GroupId::from_slice(group_id);
+            let mut group = MlsGroup::load(provider.storage(), &group_identifier)
+                .map_err(|error| format!("could not load MLS group: {error}"))?
+                .ok_or_else(|| "MLS group state is missing".to_owned())?;
+            if !group.is_active() {
+                return Err("MLS group is inactive on this device".to_owned());
+            }
+            let ciphersuite = group.ciphersuite();
+            let own_leaf = group
+                .own_leaf()
+                .ok_or_else(|| "local MLS member leaf is missing".to_owned())?;
+            let binding =
+                MlsSigningKeyBinding::from_bytes(own_leaf.credential().serialized_content())
+                    .ok_or_else(|| {
+                        "local MLS credential has no device identity binding".to_owned()
+                    })?;
+            if binding.device_public_key != device_identity.verifying_key().to_bytes()
+                || !binding.verifies_mls_credential(
+                    &binding.device_public_key,
+                    ciphersuite.signature_algorithm() as u16,
+                    own_leaf.signature_key().as_slice(),
+                )
+            {
+                return Err("MLS group is not bound to this device identity".to_owned());
+            }
+            let signer = SignatureKeyPair::read(
+                provider.storage(),
+                &binding.mls_signing_public_key,
+                ciphersuite.signature_algorithm(),
+            )
+            .ok_or_else(|| "MLS signing key material is missing".to_owned())?;
+            let (proposal, _) = group
+                .propose_self_update(&provider, &signer, LeafNodeParameters::default())
+                .map_err(|error| format!("could not create MLS update proposal: {error:?}"))?;
+            proposal
+                .tls_serialize_detached()
+                .map_err(|error| format!("could not serialize MLS update proposal: {error}"))?
+        };
+        let epoch = connection
+            .query_row(
+                "SELECT epoch FROM local_mls_groups WHERE group_id = ?1",
+                [group_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("could not load MLS update proposal epoch: {error}"))?;
+        Ok(PreparedMlsUpdateProposal {
+            group_id: group_id.to_vec(),
+            epoch: u64::try_from(epoch).map_err(|_| "invalid MLS epoch".to_owned())?,
+            proposal,
+        })
+    })();
+    finish_sql_transaction(connection, result, "MLS update proposal")
+}
+
+/// Authenticates a member's self-update proposal and stores it in OpenMLS's
+/// pending proposal queue before returning. Exact delivery is deduplicated.
+pub fn process_mls_self_update_proposal(
+    group_id: &[u8],
+    proposal_bytes: &[u8],
+) -> Result<ProcessedMlsProposal, String> {
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let device_identity = signing_key_from_secret(secret)?;
+    let mut connection = open_local_database()?;
+    process_mls_self_update_proposal_in(&mut connection, group_id, proposal_bytes, &device_identity)
+}
+
+fn process_mls_self_update_proposal_in(
+    connection: &mut Connection,
+    group_id: &[u8],
+    proposal_bytes: &[u8],
+    device_identity: &SigningKey,
+) -> Result<ProcessedMlsProposal, String> {
+    use openmls::prelude::tls_codec::Deserialize as TlsCodecDeserialize;
+
+    if group_id.len() != 16 || proposal_bytes.is_empty() || proposal_bytes.len() > 64 * 1024 {
+        return Err("MLS update proposal has an invalid group ID or size".to_owned());
+    }
+    let message = MlsMessageIn::tls_deserialize_exact(proposal_bytes)
+        .map_err(|error| format!("invalid serialized MLS proposal: {error}"))?
+        .try_into_protocol_message()
+        .map_err(|error| format!("MLS update is not a protocol message: {error}"))?;
+    if message.group_id().as_slice() != group_id {
+        return Err("MLS proposal belongs to another group".to_owned());
+    }
+    let epoch = message.epoch().as_u64();
+    let digest = *blake3::hash(proposal_bytes).as_bytes();
+    let mut proposal_id = [0; 16];
+    proposal_id.copy_from_slice(&digest[..16]);
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| format!("could not begin inbound MLS proposal transaction: {error}"))?;
+    let result = (|| {
+        ensure_mls_group_not_quarantined(connection, group_id)?;
+        let (indexed_epoch, designated_committer): (i64, Vec<u8>) = connection
+            .query_row(
+                "SELECT epoch, designated_committer_device FROM local_mls_groups WHERE group_id = ?1",
+                [group_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| format!("could not load MLS proposal policy: {error}"))?;
+        if designated_committer.as_slice() != device_identity.verifying_key().as_bytes() {
+            return Err("only the designated committer can accept an MLS proposal".to_owned());
+        }
+        let duplicate: Option<(Vec<u8>, Vec<u8>)> = connection
+            .query_row(
+                "SELECT proposal_hash, proposal_bytes FROM local_mls_proposals WHERE proposal_id = ?1",
+                [proposal_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("could not check MLS proposal redelivery: {error}"))?;
+        if let Some((saved_hash, saved_bytes)) = duplicate {
+            if saved_hash.as_slice() == digest && saved_bytes == proposal_bytes {
+                return Ok(ProcessedMlsProposal::Duplicate { epoch });
+            }
+            return Err("MLS proposal ID collision".to_owned());
+        }
+        if epoch != indexed_epoch as u64 {
+            return Err("MLS proposal is not for the current group epoch".to_owned());
+        }
+        let (accepted_epoch, author_device) = {
+            let provider = LocalOpenMlsProvider::new(connection);
+            let group_identifier = GroupId::from_slice(group_id);
+            let mut group = MlsGroup::load(provider.storage(), &group_identifier)
+                .map_err(|error| format!("could not load MLS group for proposal: {error}"))?
+                .ok_or_else(|| "MLS group state is missing".to_owned())?;
+            if group.epoch().as_u64() != epoch {
+                return Err("MLS group epoch disagrees with its local index".to_owned());
+            }
+            let own_leaf = group
+                .own_leaf()
+                .ok_or_else(|| "local MLS member leaf is missing".to_owned())?;
+            let own_binding =
+                MlsSigningKeyBinding::from_bytes(own_leaf.credential().serialized_content())
+                    .ok_or_else(|| {
+                        "local MLS credential has no device identity binding".to_owned()
+                    })?;
+            if own_binding.device_public_key != device_identity.verifying_key().to_bytes()
+                || !own_binding.verifies_mls_credential(
+                    &own_binding.device_public_key,
+                    group.ciphersuite().signature_algorithm() as u16,
+                    own_leaf.signature_key().as_slice(),
+                )
+            {
+                return Err("MLS group is not bound to this device identity".to_owned());
+            }
+            let processed = group
+                .process_message(&provider, message)
+                .map_err(|error| format!("could not authenticate MLS proposal: {error:?}"))?;
+            let sender_credential = processed.credential().serialized_content().to_vec();
+            let sender_member = group
+                .members()
+                .find(|member| member.credential.serialized_content() == sender_credential)
+                .ok_or_else(|| "MLS proposal author is not a current group member".to_owned())?;
+            let sender_binding = MlsSigningKeyBinding::from_bytes(&sender_credential)
+                .ok_or_else(|| "MLS proposal author has no device identity binding".to_owned())?;
+            if !sender_binding.verifies_mls_credential(
+                &sender_binding.device_public_key,
+                group.ciphersuite().signature_algorithm() as u16,
+                sender_member.signature_key.as_slice(),
+            ) {
+                return Err("MLS proposal author has an invalid device binding".to_owned());
+            }
+            let queued = match processed.into_content() {
+                ProcessedMessageContent::ProposalMessage(proposal) => proposal,
+                _ => return Err("MLS message is not a standalone proposal".to_owned()),
+            };
+            if !matches!(queued.proposal(), Proposal::Update(_)) {
+                return Err("only a member self-update proposal is accepted here".to_owned());
+            }
+            group
+                .store_pending_proposal(provider.storage(), *queued)
+                .map_err(|error| format!("could not persist MLS pending proposal: {error}"))?;
+            (group.epoch().as_u64(), sender_binding.device_public_key)
+        };
+        connection
+            .execute(
+                "INSERT INTO local_mls_proposals
+                    (proposal_id, group_id, epoch, author_device, proposal_hash, proposal_bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    proposal_id.as_slice(),
+                    group_id,
+                    epoch as i64,
+                    author_device.as_slice(),
+                    digest.as_slice(),
+                    proposal_bytes
+                ],
+            )
+            .map_err(|error| format!("could not journal accepted MLS proposal: {error}"))?;
+        Ok(ProcessedMlsProposal::Accepted {
+            epoch: accepted_epoch,
+        })
+    })();
+    finish_sql_transaction(connection, result, "inbound MLS proposal")
 }
 
 /// Authenticates and decrypts a queued MLS event, saving its ciphertext before
@@ -2213,6 +2458,170 @@ fn add_mls_group_member_in(
     finish_sql_transaction(connection, result, "MLS member-add")
 }
 
+/// Commits the authenticated proposal queue on the designated committer and
+/// atomically records the new OpenMLS epoch and per-member delivery ledger.
+pub fn commit_pending_mls_proposals(group_id: &[u8]) -> Result<StoredMlsCommit, String> {
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let device_identity = signing_key_from_secret(secret)?;
+    let mut connection = open_local_database()?;
+    commit_pending_mls_proposals_in(&mut connection, group_id, &device_identity)
+}
+
+fn commit_pending_mls_proposals_in(
+    connection: &mut Connection,
+    group_id: &[u8],
+    device_identity: &SigningKey,
+) -> Result<StoredMlsCommit, String> {
+    use openmls::prelude::tls_codec::Serialize as TlsCodecSerialize;
+
+    if group_id.len() != 16 {
+        return Err("MLS group ID must be 16 bytes".to_owned());
+    }
+    let device_public_key = device_identity.verifying_key().to_bytes();
+    let (indexed_epoch, designated_committer): (i64, Vec<u8>) = connection
+        .query_row(
+            "SELECT epoch, designated_committer_device FROM local_mls_groups WHERE group_id = ?1",
+            [group_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| format!("could not load MLS group policy: {error}"))?;
+    if designated_committer.as_slice() != device_public_key {
+        return Err("this device is not the designated MLS committer".to_owned());
+    }
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| format!("could not begin MLS proposal Commit transaction: {error}"))?;
+    let result = (|| {
+        ensure_mls_group_not_quarantined(connection, group_id)?;
+        let predecessor_epoch = u64::try_from(indexed_epoch)
+            .map_err(|_| "MLS group has an invalid indexed epoch".to_owned())?;
+        capture_mls_epoch_snapshot_in(connection, group_id, predecessor_epoch)?;
+        let (stored, recipients) = {
+            let provider = LocalOpenMlsProvider::new(connection);
+            let group_identifier = GroupId::from_slice(group_id);
+            let mut group = MlsGroup::load(provider.storage(), &group_identifier)
+                .map_err(|error| format!("could not load MLS group for Commit: {error}"))?
+                .ok_or_else(|| "MLS group state is missing".to_owned())?;
+            if group.epoch().as_u64() != predecessor_epoch {
+                return Err("MLS group epoch disagrees with its local index".to_owned());
+            }
+            if !group.has_pending_proposals() {
+                return Err("there are no authenticated MLS proposals to commit".to_owned());
+            }
+            let ciphersuite = group.ciphersuite();
+            let own_leaf = group
+                .own_leaf()
+                .ok_or_else(|| "local MLS member leaf is missing".to_owned())?;
+            let binding =
+                MlsSigningKeyBinding::from_bytes(own_leaf.credential().serialized_content())
+                    .ok_or_else(|| "MLS committer credential has no device binding".to_owned())?;
+            if binding.device_public_key != device_public_key
+                || !binding.verifies_mls_credential(
+                    &device_public_key,
+                    ciphersuite.signature_algorithm() as u16,
+                    own_leaf.signature_key().as_slice(),
+                )
+            {
+                return Err(
+                    "MLS group is not bound to the designated committer identity".to_owned(),
+                );
+            }
+            let signer = SignatureKeyPair::read(
+                provider.storage(),
+                &binding.mls_signing_public_key,
+                ciphersuite.signature_algorithm(),
+            )
+            .ok_or_else(|| "MLS committer signing key material is missing".to_owned())?;
+            let mut recipients = Vec::new();
+            for member in group.members() {
+                let binding =
+                    MlsSigningKeyBinding::from_bytes(member.credential.serialized_content())
+                        .ok_or_else(|| "MLS member has no device identity binding".to_owned())?;
+                if !binding.verifies_mls_credential(
+                    &binding.device_public_key,
+                    ciphersuite.signature_algorithm() as u16,
+                    member.signature_key.as_slice(),
+                ) {
+                    return Err("MLS member has an invalid device binding".to_owned());
+                }
+                if binding.device_public_key != device_public_key
+                    && !recipients.contains(&binding.device_public_key)
+                {
+                    recipients.push(binding.device_public_key);
+                }
+            }
+            let (commit, _, _) = group
+                .commit_to_pending_proposals(&provider, &signer)
+                .map_err(|error| format!("could not create proposal Commit: {error:?}"))?;
+            let commit_bytes = commit
+                .tls_serialize_detached()
+                .map_err(|error| format!("could not serialize proposal Commit: {error}"))?;
+            group
+                .merge_pending_commit(&provider)
+                .map_err(|error| format!("could not persist proposal Commit: {error:?}"))?;
+            let commit_hash = *blake3::hash(&commit_bytes).as_bytes();
+            let mut event_id = [0; 16];
+            event_id.copy_from_slice(&commit_hash[..16]);
+            (
+                StoredMlsCommit {
+                    event_id,
+                    group_id: group_id.to_vec(),
+                    predecessor_epoch,
+                    epoch: group.epoch().as_u64(),
+                    author_device: device_public_key,
+                    commit_hash,
+                    commit: commit_bytes,
+                },
+                recipients,
+            )
+        };
+        if stored.epoch != predecessor_epoch.saturating_add(1) {
+            return Err("proposal Commit did not advance exactly one epoch".to_owned());
+        }
+        connection
+            .execute(
+                "INSERT INTO local_mls_commits
+                    (event_id, group_id, predecessor_epoch, epoch, author_device,
+                     commit_hash, commit_bytes, delivery_state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued')",
+                params![
+                    stored.event_id.as_slice(),
+                    stored.group_id,
+                    stored.predecessor_epoch as i64,
+                    stored.epoch as i64,
+                    stored.author_device.as_slice(),
+                    stored.commit_hash.as_slice(),
+                    stored.commit
+                ],
+            )
+            .map_err(|error| format!("could not persist proposal Commit outbox: {error}"))?;
+        for recipient in recipients {
+            connection
+                .execute(
+                    "INSERT INTO local_mls_commit_recipients
+                        (commit_event_id, device_public_key, delivery_state)
+                     VALUES (?1, ?2, 'queued')",
+                    params![stored.event_id.as_slice(), recipient.as_slice()],
+                )
+                .map_err(|error| format!("could not persist proposal Commit recipient: {error}"))?;
+        }
+        let updated = connection
+            .execute(
+                "UPDATE local_mls_groups SET epoch = ?1 WHERE group_id = ?2 AND epoch = ?3",
+                params![stored.epoch as i64, group_id, predecessor_epoch as i64],
+            )
+            .map_err(|error| format!("could not update MLS proposal Commit epoch: {error}"))?;
+        if updated != 1 {
+            return Err("MLS group epoch changed while committing proposals".to_owned());
+        }
+        Ok(stored)
+    })();
+    finish_sql_transaction(connection, result, "MLS proposal Commit")
+}
+
 /// Process an MLS Welcome for a locally stored KeyPackage and persist the
 /// admitted group in this device's encrypted database.
 pub fn join_mls_group_from_welcome(
@@ -3088,6 +3497,23 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
                 format!("could not create MLS epoch snapshots and quarantine ledger: {error}")
             })?;
     }
+    if version < 12 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE local_mls_proposals (
+                     proposal_id BLOB PRIMARY KEY NOT NULL CHECK (length(proposal_id) = 16),
+                     group_id BLOB NOT NULL CHECK (length(group_id) = 16),
+                     epoch INTEGER NOT NULL CHECK (epoch >= 0),
+                     author_device BLOB NOT NULL CHECK (length(author_device) = 32),
+                     proposal_hash BLOB NOT NULL CHECK (length(proposal_hash) = 32),
+                     proposal_bytes BLOB NOT NULL CHECK (length(proposal_bytes) > 0)
+                 );
+                 CREATE INDEX local_mls_proposals_by_group
+                     ON local_mls_proposals (group_id, epoch);
+                 PRAGMA user_version = 12;",
+            )
+            .map_err(|error| format!("could not create encrypted MLS proposal journal: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -3551,6 +3977,147 @@ mod tests {
 
         drop(connection);
         fs::remove_dir_all(directory).expect("temporary database files should be removed");
+    }
+
+    #[test]
+    fn designated_committer_persists_and_deduplicates_member_self_update_proposals() {
+        use openmls::prelude::{Ciphersuite, GroupId, MlsGroup};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-mls-update-proposal-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary database directory should be created");
+        let creator_identity = SigningKey::from_bytes(&[0x4a; 32]);
+        let member_identity = SigningKey::from_bytes(&[0x4b; 32]);
+        let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+        let mut creator = open_database(&directory.join("creator.sqlite3"), &[0x4c; 32])
+            .expect("committer database should initialize");
+        let group = create_mls_group_in(&mut creator, ciphersuite, &creator_identity)
+            .expect("designated committer should create the group");
+        let mut member = open_database(&directory.join("member.sqlite3"), &[0x4d; 32])
+            .expect("member database should initialize");
+        let package = create_mls_key_package_in(&mut member, ciphersuite, &member_identity)
+            .expect("member should prepare a bound KeyPackage");
+        let admission = add_mls_group_member_in(
+            &mut creator,
+            &group.group_id,
+            &package.public_bytes,
+            &creator_identity,
+        )
+        .expect("committer should admit the member");
+        join_mls_group_from_welcome_in(
+            &mut member,
+            &admission.welcome,
+            &admission.ratchet_tree,
+            &member_identity,
+        )
+        .expect("member should join with its Welcome");
+
+        let proposal =
+            create_mls_self_update_proposal_in(&mut member, &group.group_id, &member_identity)
+                .expect("member should create a self-update proposal");
+        assert_eq!(proposal.epoch, 1);
+        assert_eq!(
+            process_mls_self_update_proposal_in(
+                &mut creator,
+                &group.group_id,
+                &proposal.proposal,
+                &creator_identity,
+            )
+            .expect("designated committer should accept the signed update proposal"),
+            ProcessedMlsProposal::Accepted { epoch: 1 }
+        );
+        assert_eq!(
+            process_mls_self_update_proposal_in(
+                &mut creator,
+                &group.group_id,
+                &proposal.proposal,
+                &creator_identity,
+            )
+            .expect("exact proposal redelivery should be acknowledged idempotently"),
+            ProcessedMlsProposal::Duplicate { epoch: 1 }
+        );
+        assert!(
+            process_mls_self_update_proposal_in(
+                &mut member,
+                &group.group_id,
+                &proposal.proposal,
+                &member_identity,
+            )
+            .is_err()
+        );
+        let journal_rows: i64 = creator
+            .query_row(
+                "SELECT COUNT(*) FROM local_mls_proposals WHERE group_id = ?1",
+                [&group.group_id],
+                |row| row.get(0),
+            )
+            .expect("proposal journal should be queryable");
+        assert_eq!(journal_rows, 1);
+        creator
+            .execute_batch(
+                "CREATE TRIGGER force_proposal_commit_outbox_failure
+                 BEFORE INSERT ON local_mls_commits
+                 BEGIN SELECT RAISE(ABORT, 'simulated proposal outbox failure'); END;",
+            )
+            .expect("test should install a proposal Commit outbox failure");
+        assert!(
+            commit_pending_mls_proposals_in(&mut creator, &group.group_id, &creator_identity,)
+                .is_err()
+        );
+        {
+            let provider = LocalOpenMlsProvider::new(&mut creator);
+            let loaded = MlsGroup::load(provider.storage(), &GroupId::from_slice(&group.group_id))
+                .expect("proposal transaction rollback should leave group loadable")
+                .expect("proposal transaction rollback should retain group state");
+            assert_eq!(loaded.epoch().as_u64(), 1);
+            assert!(loaded.has_pending_proposals());
+        }
+        creator
+            .execute_batch("DROP TRIGGER force_proposal_commit_outbox_failure;")
+            .expect("test should remove its proposal Commit failure trigger");
+        let commit =
+            commit_pending_mls_proposals_in(&mut creator, &group.group_id, &creator_identity)
+                .expect("designated committer should atomically commit accepted proposals");
+        assert_eq!(commit.predecessor_epoch, 1);
+        assert_eq!(commit.epoch, 2);
+        assert!(!commit.commit.is_empty());
+        assert_eq!(
+            process_mls_self_update_proposal_in(
+                &mut creator,
+                &group.group_id,
+                &proposal.proposal,
+                &creator_identity,
+            )
+            .expect("redelivery after the group advanced should still be acknowledged"),
+            ProcessedMlsProposal::Duplicate { epoch: 1 }
+        );
+        assert_eq!(
+            process_inbound_mls_commit_in(
+                &mut member,
+                &group.group_id,
+                &commit.commit,
+                &member_identity,
+            )
+            .expect("member should authenticate and apply the proposal Commit"),
+            ProcessedMlsCommit::Applied { epoch: 2 }
+        );
+        {
+            let provider = LocalOpenMlsProvider::new(&mut creator);
+            let loaded = MlsGroup::load(provider.storage(), &GroupId::from_slice(&group.group_id))
+                .expect("committer group should reload")
+                .expect("committer group should persist");
+            assert!(!loaded.has_pending_proposals());
+            assert_eq!(loaded.epoch().as_u64(), 2);
+        }
+        drop(member);
+        drop(creator);
+        fs::remove_dir_all(directory).expect("temporary proposal databases should be removed");
     }
 
     #[test]

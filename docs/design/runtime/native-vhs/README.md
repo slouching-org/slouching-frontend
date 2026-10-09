@@ -28,6 +28,12 @@ banner when authenticated committer
 equivocation has quarantined a group; MLS sends, retries, and Commit delivery
 are disabled for that group.
 
+The screen also supports signed member self-update proposals exchanged through
+a separately trusted channel. The designated committer authenticates and stores
+the proposal, then creates a Commit for the existing per-member delivery flow.
+This path currently handles self-updates only; it does not send proposals over
+the peer session.
+
 Opening the encrypted database composes OpenMLS RustCrypto with its versioned
 SQLite storage schema through the same SQLCipher connection. The Rust core
 persists MLS signing keys and groups, creates device-bound KeyPackages, admits
@@ -36,8 +42,9 @@ with the journal. The group setup flow is now exposed as an additional native
 screen; the original eleven design-board views remain available.
 
 Storage tests use temporary SQLCipher databases to check OpenMLS migrations,
-device-bound group admission, encrypted messaging, ordered Commit recovery, and
-authenticated conflicting Commits. The equivocation test confirms that the
+device-bound group admission, encrypted messaging, signed self-update proposal
+authentication and deduplication, transactional proposal Commits, ordered
+Commit recovery, and authenticated conflicting Commits. The equivocation test confirms that the
 valid conflicting Commit is verified against a saved historical epoch, evidence
 and quarantine persist, the accepted epoch is unchanged, and outbound MLS
 messages are blocked. It also races an exact redelivery against that conflict
