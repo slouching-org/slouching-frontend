@@ -39,41 +39,38 @@ not establish a peer session. The UI shows connection and protocol errors
 separately. **Refresh backend** repeats both
 the HTTP diagnostic and WebSocket handshake.
 
-## Direct LAN text transport experiment
+## Direct LAN messages
 
-The client includes a one-message Iroh/QUIC path for testing two devices on
-the same LAN. Create an Ed25519 identity on each device from the Familiar
-screen, then exchange the 64-character public-key hex values out of band.
-Start the receiver on device A, pinning device B's public key:
+The **chat** button in the Iced app opens a one-shot direct-text screen. This
+path sends real text over Iroh/QUIC between devices on a reachable LAN; it is
+separate from the Elixir diagnostics and has no hosted service in the data
+path.
 
-```sh
-PEER_KEY='REPLACE_WITH_DEVICE_B_64_CHAR_PUBLIC_KEY_HEX'
-cargo run -- --lan-listen 45873 --expect-peer "$PEER_KEY"
-```
+1. Start the app on both devices. Create a device identity if needed, open the
+   chat screen, and use **Copiar minha chave pública** to exchange the two 64-character
+   Ed25519 public keys out of band. On Linux, the system Secret Service must
+   be available to create or load this identity.
+2. On both devices, paste the other device's public key into **Chave pública do
+   peer · pin manual**. This manually pins the peer for both sending and receiving.
+3. On the receiving device, choose a UDP port (for example `45873`) and click
+   **Aguardar uma mensagem**. Share one of the displayed LAN endpoint addresses
+   and the port with the sender. Wildcard addresses such as `0.0.0.0` cannot be
+   shared; if no LAN address is announced, check the device's network
+   interfaces.
+4. On the sending device, enter the receiver's LAN address and port, type a
+   message, and click **Enviar**. The screen shows a sent message only after the
+   receiver confirms it; received text appears on the listener device after
+   the same pinned identity check.
 
-On device B, use A's LAN IPv4 address and public key:
-
-```sh
-PEER_KEY='REPLACE_WITH_DEVICE_A_64_CHAR_PUBLIC_KEY_HEX'
-cargo run -- --lan-send 192.168.1.20:45873 --expect-peer "$PEER_KEY" --text 'hello from the crew'
-```
-
-The listener accepts only the pinned Iroh EndpointId, and the sender dials the
-expected ID directly. The Iroh endpoint key is derived from the device's
-existing Ed25519 identity; QUIC TLS encrypts and authenticates the connection.
-The stream carries one versioned UTF-8 frame (up to 16 KiB), an acknowledgement,
-and explicit receipt frames so both processes know the exchange completed. No
-relay, address lookup, Elixir route, or database service is used. Find the
-receiver's LAN IP with `ip -4 addr` and allow UDP on the chosen port in the
-local firewall.
-
-This is a direct pairwise transport check, not MLS messaging or verified
-contact pairing. The user must manually pin the other device key on both ends.
-There is no MLS group, message history, retry/offline delivery, relay fallback,
-NAT traversal, or chat UI integration. The chat screen remains an illustrative
-preview. The automated `cargo test --test peer_process` launches two separate
-OS processes, checks a text exchange and acknowledgement, and confirms that a
-listener rejects an unpinned device.
+The listener accepts one message, then stops; click **Aguardar uma mensagem**
+again to receive another. The transcript contains only real messages from the
+current app session and disappears when the app closes. This is pairwise QUIC
+channel encryption and pinned device identity, not MLS messaging, contact
+verification, or a durable chat. There is no address discovery, relay,
+cross-NAT support, retry/offline delivery, or media. Allow the chosen UDP port
+through each device's local firewall. The automated
+`cargo test --test peer_process` launches two separate OS processes, checks a
+text exchange, and confirms that a listener rejects an unpinned device.
 
 The native app now recreates all eleven design-board views with real Iced
 widgets, original characters and scenery, extracted outline SVG icons,
@@ -91,12 +88,11 @@ fingerprint format, contact pairing, or MLS state is implemented. The core can
 sign a versioned binding from that durable device key to an MLS signing
 public key, including its signature-scheme code, without returning the private
 seed. This primitive is not connected to an MLS credential, key package, peer
-credential, KeyPackage, or trusted contact roster; the direct-LAN CLI pins
-device public keys separately. The local profile remains separate from that key.
-Every view is labeled as a visual
-preview: character images, messages, and comparison words are illustrative.
-The chat UI does not send messages; the separate direct-LAN CLI above sends one
-real pairwise text frame. No camera, microphone, or screen is captured. **Rede &
+credential, KeyPackage, or trusted contact roster; the direct-LAN screen
+manually pins device public keys separately. The local profile remains
+separate from that key. Character scenes, call views, and design-board examples
+remain visual previews. The dedicated chat screen shows only real direct-LAN
+messages for its current session. No camera, microphone, or screen is captured. **Rede &
 P2P** in Settings retains the real Elixir HTTP/WebSocket diagnostics and
 manual refresh. On Linux, this uses Secret Service, so a desktop password
 vault must be installed and available in the user session.
@@ -107,8 +103,8 @@ deduplicates identical event IDs and rejects reuse with different ciphertext
 or envelope metadata. Outbound rows have local queued/held/received/expired/
 failed states and bounded cursor-paginated reads; the inbox can also be read
 in bounded pages. No transport or authenticated receipt feeds those states
-yet. MLS, inbox/outbox UI, delivery, and transport are not connected to these
-primitives; this does not enable chat.
+yet. The direct-LAN session transcript is separate and is not persisted to this
+journal; MLS and durable inbox/outbox UI remain unimplemented.
 
 Opening the same SQLCipher database now composes OpenMLS RustCrypto with the
 SQLite storage provider and initializes its versioned schema. This is only a
@@ -126,9 +122,11 @@ the app does not yet create MLS credentials, KeyPackages, or groups.
 
 ![Actual refreshed 1280 × 800 native Iced familiar screen from this transport milestone; Secret Service is unavailable in this capture](docs/design/runtime/native-vhs/01-familiar.png)
 
+![Actual Iced direct-LAN messaging UI; this capture has Secret Service unavailable, so send and listen are disabled](docs/design/runtime/native-vhs/06-chat.png)
+
 ![Actual native Iced home with open scenery and icon-based feature strip, without the frog mage or gnome cutouts](docs/design/runtime/native-vhs/09-home.png)
 
-![Actual native Iced group-call preview; all media and chat content is illustrative](docs/design/runtime/native-vhs/10-call.png)
+![Actual native Iced group-call preview; media and sample messages are illustrative](docs/design/runtime/native-vhs/10-call.png)
 
 The eleven runtime captures are in [native-vhs](docs/design/runtime/native-vhs/).
 These are a first implementation of the visual direction, with comparison
@@ -159,9 +157,9 @@ Assets and font license/provenance notes are in [assets/README.md](assets/README
 - **Local client core:** Rust owns local identity, cryptography, encrypted
   storage, peer transport, and media. The encrypted display profile and
   explicit Ed25519 key storage plus initial opaque encrypted-event storage
-  are implemented. A pinned-device Iroh/QUIC LAN text exchange is available as
-  a one-shot CLI experiment; MLS messaging, integrated inbox/history, and media
-  remain unbuilt.
+  are implemented. A pinned-device Iroh/QUIC LAN text exchange is available
+  from the Iced UI with a one-shot listener and session-only transcript; MLS
+  messaging, integrated inbox/history, and media remain unbuilt.
 - **Server/backend:** Elixir in
   [`slouching-org/slouching-backend`](https://github.com/slouching-org/slouching-backend).
 - **Current boundary:** loopback HTTP status and binary protobuf WebSocket

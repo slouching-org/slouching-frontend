@@ -1,8 +1,9 @@
 # Direct LAN text transport v1
 
-This is a bounded client-only experiment for exchanging one text frame between
-two manually paired Rust clients on a reachable LAN. The Elixir HTTP/WebSocket
-diagnostics and their protobuf handshake are not involved.
+This is a bounded client-only flow for exchanging one text frame between two
+Rust clients on a reachable LAN. The Iced chat screen exposes pin, listen, send,
+and session transcript controls. The Elixir HTTP/WebSocket diagnostics and
+their protobuf handshake are not involved.
 
 ## Identity and channel
 
@@ -67,6 +68,7 @@ the listener pins another device key.
 
 This does not create an MLS credential, KeyPackage, or group. It does not use
 the MLS binding primitive, create a durable peer roster, persist the delivered
-text, update the illustrative chat UI, retry delivery, work for offline peers,
-discover addresses, traverse NAT, or fall back to a relay. It must not be
-described as cross-NAT ready or as product MLS messaging.
+text, retry delivery, work for offline peers, discover addresses, traverse NAT,
+or fall back to a relay. The transcript is held in application memory and is
+cleared when the app closes. It must not be described as cross-NAT ready,
+trusted contact pairing, or product MLS messaging.

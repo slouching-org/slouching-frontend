@@ -169,8 +169,16 @@ impl Layout {
         value: &'a str,
         on_input: fn(String) -> Message,
     ) -> Element<'a, Message> {
+        self.input_maybe(placeholder, value, Some(on_input))
+    }
+    fn input_maybe<'a>(
+        self,
+        placeholder: &'a str,
+        value: &'a str,
+        on_input: Option<fn(String) -> Message>,
+    ) -> Element<'a, Message> {
         text_input(placeholder, value)
-            .on_input(on_input)
+            .on_input_maybe(on_input)
             .font(MONO)
             .size(self.px(14.0).max(11.0))
             .padding(self.px(12.0))
@@ -346,8 +354,13 @@ fn header(state: &Slouching, l: Layout) -> Element<'_, Message> {
     let left = row![brand, l.label(page, 12.0, MUTED)]
         .spacing(l.px(18.0))
         .align_y(iced::Center);
+    let mode = if state.screen == Screen::Chat {
+        "P2P · LAN"
+    } else {
+        "PRÉVIA VISUAL"
+    };
     let right = row![
-        l.label("PRÉVIA VISUAL", 10.0, GOLD),
+        l.label(mode, 10.0, GOLD),
         button(l.label("Telas", 11.0, PAPER))
             .on_press(Message::ToggleGallery)
             .padding(l.px(10.0))
@@ -379,7 +392,7 @@ fn gallery(l: Layout) -> Element<'static, Message> {
         choices = choices.push(l.nav(s.label(), Message::Navigate(s), false));
     }
     choices = choices.push(l.label(
-        "11 telas · conteúdo ilustrativo\nNenhum chat ou chamada ativo",
+        "11 telas · chamadas indisponíveis\nChat texto · LAN manual",
         11.0,
         MUTED,
     ));
@@ -427,7 +440,7 @@ fn home(state: &Slouching, l: Layout) -> Element<'_, Message> {
     ]
     .spacing(l.px(14.0));
     let features = row![
-        feature(l, "arrow", "P2P", "Rotas diretas · planejado"),
+        feature(l, "arrow", "P2P", "Texto LAN · experimental"),
         feature(l, "shield", "Private", "MLS · planejado"),
         feature(l, "users", "For your crew", "Voice, video, screen"),
         feature(l, "headphones", "Just vibes", "Always")
@@ -762,7 +775,7 @@ fn settings(state: &Slouching, l: Layout) -> Element<'_, Message> {
             column![
                 l.title("Rede & P2P", 34.0),
                 l.label(
-                    "Nenhum peer conectado. O transporte abaixo é um diagnóstico local.",
+                    "O diagnóstico HTTP/WebSocket abaixo verifica apenas o backend local.",
                     12.0,
                     MUTED
                 ),
@@ -774,9 +787,15 @@ fn settings(state: &Slouching, l: Layout) -> Element<'_, Message> {
                     false
                 ),
                 l.label(
-                    "LAN entre peers, sem helper ou Postgres: requisito ainda não implementado.",
+                    "Mensagens de texto entre peers na mesma LAN usam o transporte Rust/Iroh, sem backend.",
                     12.0,
                     PAPER
+                ),
+                l.control(
+                    "chat",
+                    "Abrir mensagens diretas LAN",
+                    Some(Message::Navigate(Screen::Chat)),
+                    true
                 )
             ]
             .spacing(l.px(24.0)),
@@ -1176,103 +1195,258 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
     l.place(l.panel(body), 126.0, 94.0, 1028.0, 646.0)
 }
 fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
-    let contacts = column![
-        l.title("Sussurros", 25.0),
-        field(l, "Buscar · prévia"),
-        person(l, "frog", "Mara", "exemplo"),
-        person(l, "gnome", "Pim", "exemplo"),
-        person(l, "orb-avatar", "Velho Bram", "exemplo"),
-        person(l, "wizard", "Odo", "exemplo"),
-        space().height(Fill),
-        l.control(
-            "users",
-            "Meu familiar",
-            Some(Message::Navigate(Screen::Familiar)),
-            false
-        )
-    ]
-    .spacing(l.px(23.0));
-    let chathead = row![
-        l.picture("frog", 38.0, 38.0),
-        column![
-            l.label("Mara", 18.0, PAPER),
-            l.label("Personagem · sem presença real", 10.0, MUTED)
-        ],
-        space().width(Fill),
-        l.icon_button("phone", Message::Navigate(Screen::Incoming)),
-        l.icon_button("camera", Message::Navigate(Screen::Lobby)),
-        l.icon_button("shield", Message::Navigate(Screen::Verify))
-    ]
-    .spacing(l.px(12.0))
-    .align_y(iced::Center);
-    let sample = column![
-        container(l.label(
-            "EXEMPLOS DE MENSAGEM · nenhum envio ou recibo real",
+    let identity_ready = matches!(state.identity_status, crate::IdentityStatus::Ready(_));
+    let listener_active = matches!(
+        state.peer_listen_status,
+        crate::PeerListenStatus::Starting { .. } | crate::PeerListenStatus::Listening { .. }
+    );
+    let (identity_detail, copy_message, copy_label) = match &state.identity_status {
+        crate::IdentityStatus::Ready(public_key) => (
+            public_key
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            Some(Message::CopyDeviceKey),
+            if state.identity_key_copied {
+                "Chave copiada"
+            } else {
+                "Copiar minha chave pública"
+            },
+        ),
+        crate::IdentityStatus::Missing => (
+            "Crie uma identidade para usar o transporte direto.".to_owned(),
+            Some(Message::CreateIdentity),
+            "Criar identidade do dispositivo",
+        ),
+        crate::IdentityStatus::Loading => (
+            "Carregando chave do cofre do sistema…".to_owned(),
+            None,
+            "Identidade carregando",
+        ),
+        crate::IdentityStatus::Creating => (
+            "Criando chave no cofre do sistema…".to_owned(),
+            None,
+            "Criando identidade",
+        ),
+        crate::IdentityStatus::Failed => (
+            "Cofre do sistema indisponível. Confira o Secret Service.".to_owned(),
+            Some(Message::CreateIdentity),
+            "Tentar carregar identidade",
+        ),
+    };
+    let identity = column![
+        l.label("SUA IDENTIDADE DO DISPOSITIVO", 10.0, GOLD),
+        l.label(identity_detail, 10.0, PAPER),
+        l.control("key", copy_label, copy_message, !identity_ready),
+        rule(LINE, 1.0),
+        l.label("CHAVE PÚBLICA DO PEER · PIN MANUAL", 10.0, GOLD),
+        l.input_maybe(
+            "64 caracteres hexadecimais",
+            &state.peer_public_key,
+            (!listener_active).then_some(Message::PeerPublicKeyChanged as fn(String) -> Message)
+        ),
+        l.label(
+            "A mesma chave esperada é usada ao enviar e ao receber.",
             10.0,
             MUTED
-        ))
-        .center_x(Fill),
-        bubble(
-            l,
-            "viu o castelo ontem? as luzes da escada acenderam sozinhas",
-            "21:02 · exemplo",
-            false
         ),
-        bubble(
-            l,
-            "vi! gravei tudo, te mando a fita",
-            "21:03 · exemplo",
-            true
-        ),
-        container(
-            column![
-                l.picture("mushroom-scene", 240.0, 150.0),
-                l.label("olha quem dormiu no meio do turno", 12.0, PAPER)
-            ]
-            .spacing(l.px(8.0))
+        l.label("PORTA UDP PARA RECEBER", 10.0, GOLD),
+        l.input_maybe(
+            "45873",
+            &state.peer_listen_port,
+            (!listener_active).then_some(Message::PeerListenPortChanged as fn(String) -> Message)
         )
-        .padding(l.px(12.0))
-        .style(panel_style),
-        row![
-            l.icon("file", VIOLET, 28.0),
-            column![
-                l.label("castelo_escada.mov", 12.0, PAPER),
-                l.label(
-                    "Anexo ilustrativo · nenhum arquivo transferido",
-                    10.0,
-                    MUTED
+    ]
+    .spacing(l.px(10.0));
+    let listener_status: Element<'_, Message> = match &state.peer_listen_status {
+        crate::PeerListenStatus::Idle => l
+            .label(
+                "Listener parado. Ao iniciar, este app aceita uma mensagem do peer pinado.",
+                11.0,
+                MUTED,
+            )
+            .into(),
+        crate::PeerListenStatus::Starting { port } => l
+            .label(format!("Abrindo listener UDP na porta {port}…"), 11.0, GOLD)
+            .into(),
+        crate::PeerListenStatus::Listening { port, addresses } => {
+            let direct = addresses
+                .iter()
+                .filter(|address| !address.ip().is_unspecified() && !address.ip().is_loopback())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let detail = if direct.is_empty() {
+                format!(
+                    "Aguardando uma mensagem · UDP {port}. Nenhum IP LAN foi anunciado; consulte as interfaces de rede. Não compartilhe 0.0.0.0: é um endereço curinga."
                 )
-            ]
-            .spacing(l.px(8.0))
-        ]
-        .spacing(l.px(15.0)),
+            } else {
+                format!(
+                    "Aguardando uma mensagem · compartilhe: {}",
+                    direct.join("  ou  ")
+                )
+            };
+            l.label(detail, 11.0, GREEN).into()
+        }
+        crate::PeerListenStatus::Received => l
+            .label(
+                "Mensagem recebida e confirmada. O listener de uma mensagem foi encerrado.",
+                11.0,
+                GREEN,
+            )
+            .into(),
+        crate::PeerListenStatus::Failed(error) => l
+            .label(
+                format!("Listener: {error}"),
+                11.0,
+                Color::from_rgb8(255, 145, 159),
+            )
+            .into(),
+    };
+    let listen_button = match state.peer_listen_status {
+        crate::PeerListenStatus::Starting { .. } | crate::PeerListenStatus::Listening { .. } => l
+            .control(
+                "close",
+                "Parar de aguardar",
+                Some(Message::StopPeerListener),
+                false,
+            ),
+        _ => l.control(
+            "headphones",
+            if identity_ready {
+                "Aguardar uma mensagem"
+            } else {
+                "Identidade necessária para escutar"
+            },
+            identity_ready.then_some(Message::StartPeerListener),
+            true,
+        ),
+    };
+    let listening = column![
+        listen_button,
+        listener_status,
         l.label(
-            "O histórico ficará no SQLite local · ainda não implementado",
-            11.0,
+            "A porta precisa estar liberada no firewall da rede local.",
+            10.0,
             MUTED
         )
     ]
-    .spacing(l.px(22.0));
-    let messages = scrollable(sample).height(Fill);
-    let composer = row![
-        l.icon_button(
-            "attachment",
-            Message::PreviewAction("Anexos ainda não podem ser enviados.")
-        ),
-        l.input(
-            "Mensagem · envio indisponível",
-            &state.draft,
-            Message::DraftChanged
-        ),
-        button(l.icon("arrow", NIGHT, 20.0))
-            .padding(l.px(14.0))
-            .style(|_, s| button_style(s, true, false))
+    .spacing(l.px(9.0));
+    let local = l.panel(column![identity, rule(LINE, 1.0), listening].spacing(l.px(13.0)));
+
+    let send_action =
+        if identity_ready && !matches!(state.peer_send_status, crate::PeerSendStatus::Sending) {
+            Some(Message::SendPeerText)
+        } else {
+            None
+        };
+    let send_address = row![
+        column![
+            l.label("ENDEREÇO LAN DO PEER", 10.0, GOLD),
+            l.input(
+                "192.168.1.20:45873",
+                &state.peer_address,
+                Message::PeerAddressChanged
+            )
+        ]
+        .spacing(l.px(6.0))
+        .width(Fill),
+        column![
+            l.label("MENSAGEM", 10.0, GOLD),
+            l.input(
+                "Texto simples · até 16 KiB",
+                &state.peer_draft,
+                Message::PeerDraftChanged
+            )
+        ]
+        .spacing(l.px(6.0))
+        .width(Fill),
+        l.control("arrow", "Enviar", send_action, true)
     ]
-    .spacing(l.px(10.0));
-    let body = column![chathead, rule(LINE, 1.0), messages, composer].spacing(l.px(18.0));
+    .spacing(l.px(10.0))
+    .align_y(iced::Bottom);
+    let send_status: Element<'_, Message> = match &state.peer_send_status {
+        crate::PeerSendStatus::Idle => l
+            .label(
+                "Envio direto · o peer precisa estar aguardando na mesma LAN.",
+                11.0,
+                MUTED,
+            )
+            .into(),
+        crate::PeerSendStatus::Sending => l
+            .label(
+                "Conectando ao peer pinado e aguardando confirmação…",
+                11.0,
+                GOLD,
+            )
+            .into(),
+        crate::PeerSendStatus::Sent => l
+            .label(
+                "Mensagem entregue; o peer confirmou o recebimento.",
+                11.0,
+                GREEN,
+            )
+            .into(),
+        crate::PeerSendStatus::Failed(error) => l
+            .label(
+                format!("Envio falhou: {error}"),
+                11.0,
+                Color::from_rgb8(255, 145, 159),
+            )
+            .into(),
+    };
+    let transcript: Element<'_, Message> = if state.peer_transcript.is_empty() {
+        container(
+            l.label(
+                "Nenhuma mensagem entregue nesta sessão. As mensagens aparecerão aqui somente após o transporte confirmar o envio ou o recebimento.",
+                12.0,
+                MUTED,
+            )
+            .align_x(iced::Alignment::Center),
+        )
+        .width(Fill)
+        .height(Fill)
+        .center(Fill)
+        .into()
+    } else {
+        let entries =
+            state
+                .peer_transcript
+                .iter()
+                .fold(column![].spacing(l.px(12.0)), |entries, entry| {
+                    let (label, outgoing) = match entry.direction {
+                        crate::PeerMessageDirection::Sent => ("Enviada · sessão atual", true),
+                        crate::PeerMessageDirection::Received => ("Recebida · sessão atual", false),
+                    };
+                    entries.push(bubble(l, &entry.text, label, outgoing))
+                });
+        scrollable(entries).height(Fill).into()
+    };
+    let body = column![
+        row![
+            column![
+                l.title("Texto direto", 28.0),
+                l.label("Iroh/QUIC · mesma LAN · sem MLS", 11.0, MUTED)
+            ]
+            .spacing(l.px(5.0)),
+            space().width(Fill),
+            l.label("SEM HISTÓRICO · SÓ ESTA SESSÃO", 10.0, GOLD)
+        ]
+        .align_y(iced::Center),
+        rule(LINE, 1.0),
+        send_address,
+        send_status,
+        rule(LINE, 1.0),
+        transcript,
+        l.label(
+            "Canal QUIC cifrado com chave do dispositivo pinada. Sem descoberta, relay, NAT traversal ou armazenamento.",
+            10.0,
+            MUTED
+        )
+    ]
+    .spacing(l.px(14.0));
     stack![
-        l.place(l.panel(contacts), 24.0, 80.0, 300.0, 676.0),
-        l.place(l.panel(body), 340.0, 80.0, 916.0, 676.0)
+        l.place(local, 24.0, 80.0, 370.0, 676.0),
+        l.place(l.panel(body), 408.0, 80.0, 848.0, 676.0)
     ]
     .width(Fill)
     .height(Fill)

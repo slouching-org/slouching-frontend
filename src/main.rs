@@ -138,7 +138,7 @@ impl Screen {
             Self::Lobby => "Lobby",
             Self::Connecting => "Conectando & fallback",
             Self::Share => "Escolher tela",
-            Self::Chat => "Conversa pessoal",
+            Self::Chat => "Texto direto · LAN",
             Self::Incoming => "Chamada recebida",
             Self::Verify => "Verificar selo",
             Self::Home => "Início",
@@ -168,6 +168,16 @@ struct Slouching {
     capture_once: bool,
     profile_status: ProfileStatus,
     identity_status: IdentityStatus,
+    peer_public_key: String,
+    peer_listen_port: String,
+    peer_address: String,
+    peer_draft: String,
+    peer_listen_status: PeerListenStatus,
+    peer_send_status: PeerSendStatus,
+    peer_transcript: Vec<PeerTranscriptEntry>,
+    peer_listener_handle: Option<Handle>,
+    peer_listener_generation: u64,
+    identity_key_copied: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +196,49 @@ enum IdentityStatus {
     Creating,
     Ready([u8; 32]),
     Failed,
+}
+
+#[derive(Debug, Clone)]
+enum PeerListenStatus {
+    Idle,
+    Starting {
+        port: u16,
+    },
+    Listening {
+        port: u16,
+        addresses: Vec<std::net::SocketAddr>,
+    },
+    Received,
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+enum PeerSendStatus {
+    Idle,
+    Sending,
+    Sent,
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+struct PeerTranscriptEntry {
+    direction: PeerMessageDirection,
+    text: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PeerMessageDirection {
+    Sent,
+    Received,
+}
+
+#[derive(Debug, Clone)]
+enum PeerListenEvent {
+    Bound {
+        addresses: Vec<std::net::SocketAddr>,
+    },
+    Received(String),
+    Failed(String),
 }
 
 impl Default for Slouching {
@@ -211,6 +264,16 @@ impl Default for Slouching {
             capture_once: false,
             profile_status: ProfileStatus::Loading,
             identity_status: IdentityStatus::Loading,
+            peer_public_key: String::new(),
+            peer_listen_port: "45873".to_owned(),
+            peer_address: String::new(),
+            peer_draft: String::new(),
+            peer_listen_status: PeerListenStatus::Idle,
+            peer_send_status: PeerSendStatus::Idle,
+            peer_transcript: Vec::new(),
+            peer_listener_handle: None,
+            peer_listener_generation: 0,
+            identity_key_copied: false,
         }
     }
 }
@@ -240,6 +303,16 @@ enum Message {
     IdentityLoaded(Result<Option<[u8; 32]>, String>),
     CreateIdentity,
     IdentityCreated(Result<[u8; 32], String>),
+    CopyDeviceKey,
+    PeerPublicKeyChanged(String),
+    PeerListenPortChanged(String),
+    PeerAddressChanged(String),
+    PeerDraftChanged(String),
+    StartPeerListener,
+    StopPeerListener,
+    PeerListenEvent(u64, PeerListenEvent),
+    SendPeerText,
+    PeerSendCompleted(String, Result<String, String>),
 }
 
 fn update(state: &mut Slouching, message: Message) -> Task<Message> {
@@ -398,11 +471,140 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             return Task::perform(create_identity_task(), Message::IdentityCreated);
         }
         Message::IdentityCreated(result) => match result {
-            Ok(public_key) => state.identity_status = IdentityStatus::Ready(public_key),
+            Ok(public_key) => {
+                state.identity_status = IdentityStatus::Ready(public_key);
+                state.identity_key_copied = false;
+            }
             Err(_) => {
                 state.identity_status = IdentityStatus::Failed;
-                state.note = Some("Não foi possível criar a chave no cofre do sistema.");
             }
+        },
+        Message::CopyDeviceKey => {
+            if let IdentityStatus::Ready(public_key) = state.identity_status {
+                state.identity_key_copied = true;
+                return iced::clipboard::write(hex_encode_key(&public_key));
+            }
+        }
+        Message::PeerPublicKeyChanged(value) => state.peer_public_key = value,
+        Message::PeerListenPortChanged(value) => state.peer_listen_port = value,
+        Message::PeerAddressChanged(value) => state.peer_address = value,
+        Message::PeerDraftChanged(value) => state.peer_draft = value,
+        Message::StartPeerListener => {
+            if state.peer_listener_handle.is_some() {
+                return Task::none();
+            }
+            if !matches!(state.identity_status, IdentityStatus::Ready(_)) {
+                state.peer_listen_status = PeerListenStatus::Failed(
+                    "Crie ou carregue a identidade do dispositivo antes de escutar.".to_owned(),
+                );
+                return Task::none();
+            }
+            let port = match state.peer_listen_port.parse::<u16>() {
+                Ok(port) if port != 0 => port,
+                _ => {
+                    state.peer_listen_status = PeerListenStatus::Failed(
+                        "Informe uma porta UDP entre 1 e 65535.".to_owned(),
+                    );
+                    return Task::none();
+                }
+            };
+            let expected_peer = match parse_peer_id(&state.peer_public_key) {
+                Ok(peer) => peer,
+                Err(error) => {
+                    state.peer_listen_status = PeerListenStatus::Failed(error);
+                    return Task::none();
+                }
+            };
+            state.peer_listener_generation = state.peer_listener_generation.saturating_add(1);
+            let generation = state.peer_listener_generation;
+            state.peer_listen_status = PeerListenStatus::Starting { port };
+            let (task, handle) = peer_listener_task(generation, port, expected_peer);
+            state.peer_listener_handle = Some(handle);
+            return task;
+        }
+        Message::StopPeerListener => {
+            if let Some(handle) = state.peer_listener_handle.take() {
+                handle.abort();
+            }
+            state.peer_listener_generation = state.peer_listener_generation.saturating_add(1);
+            state.peer_listen_status = PeerListenStatus::Idle;
+        }
+        Message::PeerListenEvent(generation, event)
+            if generation == state.peer_listener_generation =>
+        {
+            match event {
+                PeerListenEvent::Bound { addresses } => {
+                    let port = match state.peer_listen_status {
+                        PeerListenStatus::Starting { port } => port,
+                        PeerListenStatus::Listening { port, .. } => port,
+                        _ => 0,
+                    };
+                    state.peer_listen_status = PeerListenStatus::Listening { port, addresses };
+                }
+                PeerListenEvent::Received(text) => {
+                    state.peer_transcript.push(PeerTranscriptEntry {
+                        direction: PeerMessageDirection::Received,
+                        text,
+                    });
+                    state.peer_listen_status = PeerListenStatus::Received;
+                    state.peer_listener_handle = None;
+                }
+                PeerListenEvent::Failed(error) => {
+                    state.peer_listen_status = PeerListenStatus::Failed(error);
+                    state.peer_listener_handle = None;
+                }
+            }
+        }
+        Message::PeerListenEvent(_, _) => {}
+        Message::SendPeerText => {
+            if !matches!(state.identity_status, IdentityStatus::Ready(_)) {
+                state.peer_send_status = PeerSendStatus::Failed(
+                    "Crie ou carregue a identidade do dispositivo antes de enviar.".to_owned(),
+                );
+                return Task::none();
+            }
+            let expected_peer = match parse_peer_id(&state.peer_public_key) {
+                Ok(peer) => peer,
+                Err(error) => {
+                    state.peer_send_status = PeerSendStatus::Failed(error);
+                    return Task::none();
+                }
+            };
+            let address = match state.peer_address.parse::<std::net::SocketAddr>() {
+                Ok(address) if !address.ip().is_unspecified() && address.port() != 0 => address,
+                _ => {
+                    state.peer_send_status = PeerSendStatus::Failed(
+                        "Informe o IP LAN e a porta UDP do outro dispositivo, por exemplo 192.168.1.20:45873.".to_owned(),
+                    );
+                    return Task::none();
+                }
+            };
+            let text = state.peer_draft.trim().to_owned();
+            if text.is_empty() || text.len() > 16 * 1024 {
+                state.peer_send_status = PeerSendStatus::Failed(
+                    "A mensagem precisa ter entre 1 e 16 KiB em UTF-8.".to_owned(),
+                );
+                return Task::none();
+            }
+            state.peer_send_status = PeerSendStatus::Sending;
+            return Task::perform(
+                send_peer_text_task(expected_peer, address, text.clone()),
+                move |result| Message::PeerSendCompleted(text, result),
+            );
+        }
+        Message::PeerSendCompleted(text, result) => match result {
+            Ok(_) => {
+                let draft_matches_sent_text = state.peer_draft.trim() == text;
+                state.peer_transcript.push(PeerTranscriptEntry {
+                    direction: PeerMessageDirection::Sent,
+                    text,
+                });
+                state.peer_send_status = PeerSendStatus::Sent;
+                if draft_matches_sent_text {
+                    state.peer_draft.clear();
+                }
+            }
+            Err(error) => state.peer_send_status = PeerSendStatus::Failed(error),
         },
     }
     Task::none()
@@ -644,6 +846,58 @@ async fn create_identity_task() -> Result<[u8; 32], String> {
         .map_err(|error| format!("device identity task failed: {error}"))?
 }
 
+fn peer_listener_task(
+    generation: u64,
+    port: u16,
+    expected_peer: iroh::EndpointId,
+) -> (Task<Message>, Handle) {
+    let events = async_stream::stream! {
+        let local_identity = match load_peer_secret_key_task().await {
+            Ok(identity) => identity,
+            Err(error) => {
+                yield PeerListenEvent::Failed(error);
+                return;
+            }
+        };
+        let listener = match peer::bind_listener(
+            local_identity,
+            std::net::SocketAddr::from(([0, 0, 0, 0], port)),
+            expected_peer,
+        ).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                yield PeerListenEvent::Failed(error);
+                return;
+            }
+        };
+        let addresses = listener.direct_addresses();
+        yield PeerListenEvent::Bound { addresses };
+        match listener.receive_once().await {
+            Ok(text) => yield PeerListenEvent::Received(text),
+            Err(error) => yield PeerListenEvent::Failed(error),
+        }
+    };
+    Task::run(events, move |event| {
+        Message::PeerListenEvent(generation, event)
+    })
+    .abortable()
+}
+
+async fn send_peer_text_task(
+    expected_peer: iroh::EndpointId,
+    address: std::net::SocketAddr,
+    text: String,
+) -> Result<String, String> {
+    let local_identity = load_peer_secret_key_task().await?;
+    peer::send_once(local_identity, expected_peer, address, &text).await
+}
+
+async fn load_peer_secret_key_task() -> Result<iroh::SecretKey, String> {
+    tokio::task::spawn_blocking(storage::load_device_peer_secret_key)
+        .await
+        .map_err(|error| format!("device identity task failed: {error}"))?
+}
+
 fn view(state: &Slouching) -> Element<'_, Message> {
     ui::view(state)
 }
@@ -687,7 +941,7 @@ fn main() -> iced::Result {
         window.platform_specific.application_id = "com.slouching.desktop".into();
     }
     iced::application(boot, update, view)
-        .title("slouching · native design preview")
+        .title("slouching · native client")
         .theme(Theme::Dark)
         .default_font(ui::MONO)
         .font(include_bytes!("../assets/fonts/bricolagegrotesque.ttf").as_slice())
@@ -827,5 +1081,73 @@ mod tests {
             decode_server_hello(b"not protobuf"),
             Err(HandshakeError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn peer_transcript_only_records_confirmed_sends_and_current_listener_receives() {
+        let mut state = Slouching::default();
+        let _ = update(
+            &mut state,
+            Message::PeerSendCompleted(
+                "not delivered".to_owned(),
+                Err("peer unavailable".to_owned()),
+            ),
+        );
+        assert!(state.peer_transcript.is_empty());
+        assert!(matches!(state.peer_send_status, PeerSendStatus::Failed(_)));
+
+        let _ = update(
+            &mut state,
+            Message::PeerSendCompleted(
+                "delivered text".to_owned(),
+                Ok("received 14 bytes".to_owned()),
+            ),
+        );
+        assert!(matches!(state.peer_send_status, PeerSendStatus::Sent));
+        assert!(matches!(
+            state.peer_transcript.as_slice(),
+            [PeerTranscriptEntry {
+                direction: PeerMessageDirection::Sent,
+                text
+            }] if text == "delivered text"
+        ));
+
+        state.peer_listener_generation = 2;
+        let _ = update(
+            &mut state,
+            Message::PeerListenEvent(1, PeerListenEvent::Received("stale".to_owned())),
+        );
+        assert_eq!(state.peer_transcript.len(), 1);
+        let _ = update(
+            &mut state,
+            Message::PeerListenEvent(2, PeerListenEvent::Received("incoming".to_owned())),
+        );
+        assert!(matches!(
+            state.peer_transcript.as_slice(),
+            [
+                PeerTranscriptEntry {
+                    direction: PeerMessageDirection::Sent,
+                    text: sent
+                },
+                PeerTranscriptEntry {
+                    direction: PeerMessageDirection::Received,
+                    text: received
+                }
+            ] if sent == "delivered text" && received == "incoming"
+        ));
+    }
+
+    #[test]
+    fn peer_send_and_listen_require_a_local_device_identity() {
+        let mut state = Slouching::default();
+        let _ = update(&mut state, Message::StartPeerListener);
+        let _ = update(&mut state, Message::SendPeerText);
+        assert!(matches!(
+            state.peer_listen_status,
+            PeerListenStatus::Failed(_)
+        ));
+        assert!(matches!(state.peer_send_status, PeerSendStatus::Failed(_)));
+        assert!(state.peer_listener_handle.is_none());
+        assert!(state.peer_transcript.is_empty());
     }
 }
