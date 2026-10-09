@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package slouching.v1;
+
+// A development-only transport handshake. This does not authenticate devices.
+message ClientHello {
+  uint32 protocol_version = 1;
+}
+
+message ServerHello {
+  uint32 protocol_version = 1;
+  string server_role = 2;
+  bool identity_available = 3;
+  bool messaging_available = 4;
+  bool calls_available = 5;
+}
+
+message VersionError {
+  uint32 supported_version = 1;
+}
+
+message ClientFrame {
+  oneof payload {
+    ClientHello hello = 1;
+  }
+}
+
+message ServerFrame {
+  oneof payload {
+    ServerHello hello = 1;
+    VersionError version_error = 2;
+  }
+}

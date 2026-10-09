@@ -5,8 +5,8 @@ document and current correction.
 
 ## Context
 
-The complete architecture PDF specifies Rust/Iced for the client and
-Rust/Tokio for its core. The first frontend repository instead placed
+The complete architecture PDF specifies Rust/Iced for the client,
+Rust for its local core, and Elixir for the server/backend. The first frontend repository instead placed
 a JavaScript visual preview at the root without saying it was a
 temporary prototype.
 
@@ -14,9 +14,9 @@ temporary prototype.
 
 Build the product desktop frontend in Rust/Iced. Keep the JavaScript
 screens only under `prototypes/web/` as visual reference. The native
-UI reads real identity, membership, delivery, network, and media state
-from the peer core through a reviewed Rust API. The core remains
-peer-owned on each computer.
+UI must read real identity, membership, delivery, network, and media state
+from their implementing components through reviewed contracts. Its present
+Elixir loopback HTTP status call is only a development diagnostic.
 
 ## Consequences
 
