@@ -1196,6 +1196,42 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
     l.place(l.panel(body), 126.0, 94.0, 1028.0, 646.0)
 }
 fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
+    let recipient_rows = state
+        .mls_commit_recipients
+        .iter()
+        .take(3)
+        .map(|recipient| -> Element<'_, Message> {
+            let device = crate::hex_encode_bytes(&recipient.device_public_key);
+            l.label(
+                format!(
+                    "epoch {} · {}… · {}",
+                    recipient.epoch,
+                    &device[..12],
+                    if recipient.delivered {
+                        "ACK persistido"
+                    } else {
+                        "aguardando ACK"
+                    }
+                ),
+                10.0,
+                if recipient.delivered { GREEN } else { MUTED },
+            )
+            .into()
+        })
+        .collect::<Vec<_>>();
+    let recipient_rows = if recipient_rows.is_empty() {
+        vec![
+            l.label("Nenhum Commit distribuído neste grupo ainda.", 10.0, MUTED)
+                .into(),
+        ]
+    } else {
+        recipient_rows
+    };
+    let recipient_status = column![
+        l.label("ENTREGA DE COMMITS · POR DISPOSITIVO", 10.0, GOLD),
+        column(recipient_rows).spacing(l.px(3.0))
+    ]
+    .spacing(l.px(4.0));
     let inviter = column![
         l.title("1 · Criar e convidar", 21.0),
         l.label("O criador do grupo é o committer designado.", 11.0, MUTED),
@@ -1415,6 +1451,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             scrollable(invitee).height(l.px(275.0)).width(Fill)
         ].spacing(l.px(18.0)),
         l.label(state.mls_status.clone(), 11.0, GREEN),
+        recipient_status,
         l.label("TRANSCRIÇÃO MLS · ARMAZENADA LOCALMENTE", 10.0, GOLD),
         container(history).height(l.px(78.0)).width(Fill),
         row![

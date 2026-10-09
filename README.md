@@ -100,8 +100,9 @@ member recorded at the Commit's predecessor epoch; a newly invited device is
 not sent that older Commit. The recipient validates it and persists the new
 epoch before ACK, and the sender stores that ACK per recipient. Exact redelivery
 is harmless. This sends to one connected member at a time; automatic
-multi-member fan-out and offline delivery are still in progress.
-New members join with the matching Welcome and ratchet tree. The transcript reloads locally, and **Reenviar pendentes**
+multi-member fan-out and offline delivery are still in progress. The MLS screen
+shows each eligible device's persisted adoption ACK. New members join with the
+matching Welcome and ratchet tree. The transcript reloads locally, and **Reenviar pendentes**
 sends queued events for the selected group after reconnecting.
 
 Familiar selection, invitation/draft fields, screen navigation, settings

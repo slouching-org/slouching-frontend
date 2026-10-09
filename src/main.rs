@@ -201,6 +201,7 @@ struct Slouching {
     mls_history: Vec<storage::StoredMlsMessage>,
     mls_history_group: Option<Vec<u8>>,
     mls_pending_commits: Vec<storage::StoredMlsCommit>,
+    mls_commit_recipients: Vec<storage::MlsCommitRecipientStatus>,
     mls_pending_events: std::collections::HashMap<u64, [u8; 16]>,
     mls_sending_commits: std::collections::HashMap<u64, [u8; 16]>,
     mls_next_request_id: u64,
@@ -326,6 +327,7 @@ impl Default for Slouching {
             mls_history: Vec::new(),
             mls_history_group: None,
             mls_pending_commits: Vec::new(),
+            mls_commit_recipients: Vec::new(),
             mls_pending_events: std::collections::HashMap::new(),
             mls_sending_commits: std::collections::HashMap::new(),
             mls_next_request_id: 1,
@@ -410,6 +412,10 @@ enum Message {
     MlsMessageDraftChanged(String),
     MlsHistoryLoaded(Vec<u8>, Result<Vec<storage::StoredMlsMessage>, String>),
     MlsCommitsLoaded(Vec<u8>, Result<Vec<storage::StoredMlsCommit>, String>),
+    MlsCommitRecipientsLoaded(
+        Vec<u8>,
+        Result<Vec<storage::MlsCommitRecipientStatus>, String>,
+    ),
     RetryQueuedMlsEvents,
     MlsOutboxLoaded(Vec<u8>, Result<Vec<storage::StoredOutboundEvent>, String>),
     SendMlsApplication,
@@ -1359,6 +1365,17 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 }
             }
         }
+        Message::MlsCommitRecipientsLoaded(group_id, result) => {
+            if state.mls_history_group.as_deref() == Some(group_id.as_slice()) {
+                match result {
+                    Ok(recipients) => state.mls_commit_recipients = recipients,
+                    Err(error) => {
+                        state.mls_status =
+                            format!("Não foi possível carregar confirmações de Commit: {error}");
+                    }
+                }
+            }
+        }
         Message::RetryQueuedMlsEvents => {
             if !matches!(state.peer_listen_status, PeerListenStatus::Connected) {
                 state.mls_status =
@@ -1879,13 +1896,20 @@ fn hex_encode_bytes(bytes: &[u8]) -> String {
 fn load_mls_history(state: &mut Slouching, group_id: Vec<u8>) -> Task<Message> {
     state.mls_history_group = Some(group_id.clone());
     let history_group_id = group_id.clone();
+    let commits_group_id = group_id.clone();
+    let recipients_group_id = group_id.clone();
+    let recipients_message_group_id = recipients_group_id.clone();
     Task::batch([
         Task::perform(load_mls_history_task(group_id.clone()), move |result| {
             Message::MlsHistoryLoaded(history_group_id, result)
         }),
-        Task::perform(load_mls_commits_task(group_id.clone()), move |result| {
+        Task::perform(load_mls_commits_task(commits_group_id), move |result| {
             Message::MlsCommitsLoaded(group_id, result)
         }),
+        Task::perform(
+            load_mls_commit_recipient_status_task(recipients_group_id),
+            move |result| Message::MlsCommitRecipientsLoaded(recipients_message_group_id, result),
+        ),
     ])
 }
 
@@ -1901,6 +1925,14 @@ async fn load_mls_commits_task(group_id: Vec<u8>) -> Result<Vec<storage::StoredM
     tokio::task::spawn_blocking(move || storage::list_queued_mls_commits(&group_id, 100))
         .await
         .map_err(|error| format!("MLS Commit outbox task failed: {error}"))?
+}
+
+async fn load_mls_commit_recipient_status_task(
+    group_id: Vec<u8>,
+) -> Result<Vec<storage::MlsCommitRecipientStatus>, String> {
+    tokio::task::spawn_blocking(move || storage::list_mls_commit_recipient_status(&group_id, 200))
+        .await
+        .map_err(|error| format!("MLS Commit recipient status task failed: {error}"))?
 }
 
 async fn load_mls_commits_for_peer_task(

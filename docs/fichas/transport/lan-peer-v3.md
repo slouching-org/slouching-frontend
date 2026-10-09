@@ -66,8 +66,9 @@ active pinned session to one device in the predecessor-epoch member snapshot.
 The sender also checks that the pinned peer remains a device-bound MLS member,
 so a newly invited member never receives the older Commit. The receiver
 validates the Commit signature, designated committer, group and next epoch,
-persists the state, then ACKs. The sender persists that ACK per recipient;
-redelivery is idempotent. The new member joins with the matching Welcome and
+persists the state, then ACKs. The sender persists that ACK per recipient and
+the MLS screen shows which devices have adopted the Commit; redelivery is
+idempotent. The new member joins with the matching Welcome and
 ratchet tree. Automatic multi-member fan-out and helper delivery are not
 implemented.
 

@@ -390,6 +390,65 @@ pub struct StoredMlsCommit {
     pub commit: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlsCommitRecipientStatus {
+    pub event_id: [u8; 16],
+    pub epoch: u64,
+    pub device_public_key: [u8; 32],
+    pub delivered: bool,
+}
+
+pub fn list_mls_commit_recipient_status(
+    group_id: &[u8],
+    limit: usize,
+) -> Result<Vec<MlsCommitRecipientStatus>, String> {
+    let connection = open_local_database()?;
+    list_mls_commit_recipient_status_in(&connection, group_id, limit)
+}
+
+fn list_mls_commit_recipient_status_in(
+    connection: &Connection,
+    group_id: &[u8],
+    limit: usize,
+) -> Result<Vec<MlsCommitRecipientStatus>, String> {
+    if group_id.len() != 16 || !(1..=500).contains(&limit) {
+        return Err(
+            "MLS recipient status query requires a 16-byte group ID and limit 1..500".to_owned(),
+        );
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT c.event_id, c.epoch, r.device_public_key, r.delivery_state
+             FROM local_mls_commits c
+             JOIN local_mls_commit_recipients r ON r.commit_event_id = c.event_id
+             WHERE c.group_id = ?1
+             ORDER BY c.epoch DESC, r.device_public_key LIMIT ?2",
+        )
+        .map_err(|error| format!("could not prepare MLS recipient status query: {error}"))?;
+    let rows = statement
+        .query_map(params![group_id, limit as i64], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| format!("could not query MLS recipient status: {error}"))?;
+    rows.map(|row| {
+        let (event_id, epoch, device_public_key, delivery_state) =
+            row.map_err(|error| format!("could not read MLS recipient status: {error}"))?;
+        Ok(MlsCommitRecipientStatus {
+            event_id: fixed_bytes(event_id, "MLS recipient Commit ID")?,
+            epoch: u64::try_from(epoch)
+                .map_err(|_| "MLS recipient status has an invalid epoch".to_owned())?,
+            device_public_key: fixed_bytes(device_public_key, "MLS recipient device key")?,
+            delivered: delivery_state == "delivered",
+        })
+    })
+    .collect()
+}
+
 pub fn list_queued_mls_commits(
     group_id: &[u8],
     limit: usize,
@@ -3199,6 +3258,16 @@ mod tests {
         drop(creator);
         let mut creator = open_database(&creator_path, &creator_key)
             .expect("recipient ACK ledger should survive an encrypted database reopen");
+        let recipient_status = list_mls_commit_recipient_status_in(&creator, &group.group_id, 20)
+            .expect("per-device Commit delivery state should reload");
+        assert_eq!(recipient_status.len(), 1);
+        assert_eq!(
+            recipient_status[0].event_id,
+            second_admission.commit_event_id
+        );
+        assert_eq!(recipient_status[0].epoch, 2);
+        assert_eq!(recipient_status[0].device_public_key, invitee_device);
+        assert!(recipient_status[0].delivered);
         assert!(list_queued_mls_commits_for_peer_in(
             &mut creator,
             &group.group_id,
