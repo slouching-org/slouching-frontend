@@ -1196,6 +1196,51 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
     l.place(l.panel(body), 126.0, 94.0, 1028.0, 646.0)
 }
 fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
+    let local_group_rows = state
+        .mls_groups
+        .iter()
+        .map(|group| -> Element<'_, Message> {
+            let group_id = crate::hex_encode_bytes(&group.group_id);
+            row![
+                column![
+                    l.label(
+                        format!("{}… · epoch {}", &group_id[..16], group.epoch),
+                        10.0,
+                        PAPER
+                    ),
+                    if group.quarantined {
+                        l.label("EM QUARENTENA", 9.0, GOLD)
+                    } else {
+                        l.label("local", 9.0, MUTED)
+                    }
+                ]
+                .spacing(l.px(2.0)),
+                space().width(Fill),
+                button(l.label("Abrir", 10.0, PAPER))
+                    .on_press(Message::SelectMlsGroup(group.group_id.to_vec()))
+                    .padding([l.px(5.0), l.px(9.0)])
+                    .style(|_, status| button_style(status, false, false))
+            ]
+            .align_y(iced::Center)
+            .spacing(l.px(6.0))
+            .into()
+        })
+        .collect::<Vec<_>>();
+    let local_groups = if let Some(error) = state.mls_groups_error.as_deref() {
+        let message = if error.contains("credential store") || error.contains("Secret Service") {
+            "Secret Service indisponível; verifique o cofre e atualize."
+        } else {
+            "Não foi possível carregar os grupos locais."
+        };
+        vec![l.label(message, 10.0, RED).into()]
+    } else if local_group_rows.is_empty() {
+        vec![
+            l.label("Nenhum grupo salvo neste dispositivo.", 10.0, MUTED)
+                .into(),
+        ]
+    } else {
+        local_group_rows
+    };
     let recipient_rows = state
         .mls_commit_recipients
         .iter()
@@ -1254,6 +1299,15 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 .then(|| Message::CopyMlsValue(state.mls_group_id.clone())),
             false
         ),
+        row![
+            l.label("GRUPOS LOCAIS", 9.0, GOLD),
+            button(l.label("↻", 11.0, PAPER))
+                .on_press(Message::RefreshMlsGroups)
+                .padding([l.px(4.0), l.px(7.0)])
+                .style(|_, status| button_style(status, false, false))
+        ]
+        .align_y(iced::Center),
+        column(local_groups).spacing(l.px(4.0)),
         rule(LINE, 1.0),
         l.label("KEYPACKAGE RECEBIDO DO CONVIDADO", 10.0, GOLD),
         l.input(

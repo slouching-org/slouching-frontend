@@ -114,6 +114,11 @@ remains queued after the first recipient ACK and a database reopen. New members 
 matching Welcome and ratchet tree. The transcript reloads locally, and **Reenviar pendentes**
 sends queued events for the selected group after reconnecting.
 
+The MLS screen lists groups saved in the local SQLCipher database with their
+current epoch and quarantine state. **Abrir** restores a group's ID, bounded
+transcript, pending Commits, and security alert, so reopening the app does not
+depend on remembering the group ID.
+
 Before applying a Commit, each device saves the prior OpenMLS epoch state in
 its encrypted profile database. If it later receives a different, valid Commit
 from the designated committer for an already accepted predecessor epoch, it

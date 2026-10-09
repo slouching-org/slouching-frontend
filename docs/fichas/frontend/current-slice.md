@@ -31,6 +31,8 @@ tree data, loads a bounded local transcript, sends application messages, and
 retries queued outbox events for the selected group unless it is quarantined. Group invitations still
 require a separately trusted channel. Both devices must have joined the same
 group, select its ID, and establish a direct LAN session to exchange messages.
+Groups saved on this device appear with their current epoch and quarantine
+status; selecting one reloads its local transcript and security state.
 
 The direct-LAN text screen manually pins the peer's Ed25519 device key. One
 side listens and shares its announced LAN address; the other connects to that

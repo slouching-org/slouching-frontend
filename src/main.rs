@@ -198,6 +198,8 @@ struct Slouching {
     mls_ratchet_tree: String,
     mls_status: String,
     mls_quarantine_reason: Option<String>,
+    mls_groups: Vec<storage::StoredMlsGroup>,
+    mls_groups_error: Option<String>,
     mls_message_draft: String,
     mls_history: Vec<storage::StoredMlsMessage>,
     mls_history_group: Option<Vec<u8>>,
@@ -325,6 +327,8 @@ impl Default for Slouching {
             mls_ratchet_tree: String::new(),
             mls_status: "Crie uma identidade do dispositivo para começar.".to_owned(),
             mls_quarantine_reason: None,
+            mls_groups: Vec::new(),
+            mls_groups_error: None,
             mls_message_draft: String::new(),
             mls_history: Vec::new(),
             mls_history_group: None,
@@ -385,6 +389,9 @@ enum Message {
     SendPeerText,
     PeerCommandSent(Result<(), String>),
     MlsGroupIdChanged(String),
+    SelectMlsGroup(Vec<u8>),
+    RefreshMlsGroups,
+    MlsGroupsLoaded(Result<Vec<storage::StoredMlsGroup>, String>),
     MlsKeyPackageChanged(String),
     MlsInviteKeyPackageChanged(String),
     MlsCommitChanged(String),
@@ -1095,6 +1102,25 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 return load_mls_history(state, group_id);
             }
         }
+        Message::SelectMlsGroup(group_id) => {
+            if group_id.len() != 16 {
+                state.mls_status = "ID de grupo local inválido.".to_owned();
+                return Task::none();
+            }
+            state.mls_group_id = hex_encode_bytes(&group_id);
+            state.mls_history.clear();
+            state.mls_commit.clear();
+            state.mls_pending_commits.clear();
+            return load_mls_history(state, group_id);
+        }
+        Message::RefreshMlsGroups => return load_mls_groups(),
+        Message::MlsGroupsLoaded(result) => match result {
+            Ok(groups) => {
+                state.mls_groups = groups;
+                state.mls_groups_error = None;
+            }
+            Err(error) => state.mls_groups_error = Some(error),
+        },
         Message::MlsKeyPackageChanged(value) => state.mls_key_package = value,
         Message::MlsInviteKeyPackageChanged(value) => state.mls_invite_key_package = value,
         Message::MlsWelcomeChanged(value) => state.mls_welcome = value,
@@ -1114,7 +1140,8 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     "Grupo criado no epoch {}. Este dispositivo é o committer designado.",
                     group.epoch
                 );
-                return load_mls_history(state, group.group_id);
+                let history = load_mls_history(state, group.group_id);
+                return Task::batch([history, load_mls_groups()]);
             }
             Err(error) => state.mls_status = format!("Falha ao criar grupo: {error}"),
         },
@@ -1172,7 +1199,8 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     hex_encode_bytes(&admission.commit_event_id[..4]),
                     admission.epoch
                 );
-                return load_mls_history(state, admission.group_id);
+                let history = load_mls_history(state, admission.group_id);
+                return Task::batch([history, load_mls_groups()]);
             }
             Err(error) => state.mls_status = format!("Falha ao admitir membro: {error}"),
         },
@@ -1201,7 +1229,8 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     "Grupo ingressado no epoch {}. O grupo e as chaves estão no SQLCipher local.",
                     group.epoch
                 );
-                return load_mls_history(state, group.group_id);
+                let history = load_mls_history(state, group.group_id);
+                return Task::batch([history, load_mls_groups()]);
             }
             Err(error) => state.mls_status = format!("Falha ao ingressar no grupo: {error}"),
         },
@@ -1415,7 +1444,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     state.mls_status = format!(
                         "ALERTA DE SEGURANÇA: Commits assinados diferentes no predecessor epoch {predecessor_epoch}. Grupo em quarentena; envio MLS pausado."
                     );
-                    return Task::none();
+                    return load_mls_groups();
                 }
                 if let Some(commands) = state.peer_session_commands.as_ref() {
                     let _ = commands.try_send(peer::PeerCommand::AcceptInbound { sequence });
@@ -1429,7 +1458,8 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     }
                     storage::ProcessedMlsCommit::EquivocationDetected { .. } => unreachable!(),
                 };
-                return load_mls_history(state, envelope.group_id);
+                let history = load_mls_history(state, envelope.group_id);
+                return Task::batch([history, load_mls_groups()]);
             }
             Err(error) => {
                 if let Some(commands) = state.peer_session_commands.as_ref() {
@@ -1515,6 +1545,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     )
                 }
             };
+            return load_mls_groups();
         }
         Message::MlsCommitProcessed(Err(error)) => {
             state.mls_status = format!("Commit MLS rejeitado sem avançar o grupo: {error}");
@@ -1982,6 +2013,7 @@ fn boot() -> (Slouching, Task<Message>) {
             Task::perform(fetch_backend_status(), Message::BackendFetched),
             Task::perform(load_profile_task(), Message::ProfileLoaded),
             Task::perform(load_identity_task(), Message::IdentityLoaded),
+            load_mls_groups(),
             transport,
             capture,
         ]),
@@ -1992,6 +2024,16 @@ async fn load_profile_task() -> Result<Option<storage::LocalProfile>, String> {
     tokio::task::spawn_blocking(storage::load_profile)
         .await
         .map_err(|error| format!("local profile task failed: {error}"))?
+}
+
+fn load_mls_groups() -> Task<Message> {
+    Task::perform(load_mls_groups_task(), Message::MlsGroupsLoaded)
+}
+
+async fn load_mls_groups_task() -> Result<Vec<storage::StoredMlsGroup>, String> {
+    tokio::task::spawn_blocking(storage::list_mls_groups)
+        .await
+        .map_err(|error| format!("MLS group list task failed: {error}"))?
 }
 
 async fn load_direct_history_task(

@@ -22,7 +22,9 @@ The MLS screen lets two devices manually exchange a public KeyPackage,
 Welcome, and ratchet tree through a separately trusted channel. Joined devices
 send encrypted MLS messages over their active pinned Iroh/QUIC session. The
 receiver persists the ratchet update and transcript before ACK. The group view
-also displays a persistent security banner when authenticated committer
+lists locally saved group IDs, epochs, and quarantine state so a group and its
+transcript can be reopened from SQLCipher. It displays a persistent security
+banner when authenticated committer
 equivocation has quarantined a group; MLS sends, retries, and Commit delivery
 are disabled for that group.
 

@@ -160,6 +160,13 @@ pub struct StoredMlsMessage {
     pub text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredMlsGroup {
+    pub group_id: [u8; 16],
+    pub epoch: u64,
+    pub quarantined: bool,
+}
+
 /// Saves a delivered direct-LAN message in the per-device SQLCipher database.
 pub fn store_direct_message(
     peer_device: [u8; 32],
@@ -194,6 +201,36 @@ pub fn list_mls_messages(group_id: &[u8], limit: usize) -> Result<Vec<StoredMlsM
     }
     let connection = open_local_database()?;
     list_mls_messages_in(&connection, group_id, limit)
+}
+
+pub fn list_mls_groups() -> Result<Vec<StoredMlsGroup>, String> {
+    let connection = open_local_database()?;
+    list_mls_groups_in(&connection)
+}
+
+fn list_mls_groups_in(connection: &Connection) -> Result<Vec<StoredMlsGroup>, String> {
+    let mut statement = connection
+        .prepare("SELECT group_id, epoch, quarantined FROM local_mls_groups ORDER BY rowid DESC")
+        .map_err(|error| format!("could not prepare local MLS group list: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|error| format!("could not query local MLS groups: {error}"))?;
+    rows.map(|row| {
+        let (group_id, epoch, quarantined) =
+            row.map_err(|error| format!("could not read local MLS group: {error}"))?;
+        Ok(StoredMlsGroup {
+            group_id: fixed_bytes(group_id, "MLS group ID")?,
+            epoch: u64::try_from(epoch).map_err(|_| "MLS group has invalid epoch".to_owned())?,
+            quarantined: quarantined != 0,
+        })
+    })
+    .collect()
 }
 
 pub fn load_mls_group_quarantine(group_id: &[u8]) -> Result<Option<String>, String> {
@@ -3467,6 +3504,20 @@ mod tests {
         assert_eq!(created.epoch, 0);
         assert_eq!(created.designated_committer_device, device_public_key);
         assert_eq!(created.group_id.len(), 16);
+        let listed = list_mls_groups_in(&connection)
+            .expect("local group picker should list persisted groups");
+        assert_eq!(
+            listed,
+            vec![StoredMlsGroup {
+                group_id: created
+                    .group_id
+                    .as_slice()
+                    .try_into()
+                    .expect("created group ID should be 16 bytes"),
+                epoch: 0,
+                quarantined: false,
+            }]
+        );
 
         let (indexed_ciphersuite, indexed_committer, indexed_epoch): (i64, Vec<u8>, i64) =
             connection
@@ -4094,6 +4145,18 @@ mod tests {
             .expect("quarantine should survive database reopen");
         assert!(persisted_reason.is_some());
         assert_eq!(persisted_epoch, 2);
+        assert_eq!(
+            list_mls_groups_in(&invitee).expect("local group picker should reload quarantine"),
+            vec![StoredMlsGroup {
+                group_id: group
+                    .group_id
+                    .as_slice()
+                    .try_into()
+                    .expect("group ID should be 16 bytes"),
+                epoch: 2,
+                quarantined: true,
+            }]
+        );
 
         drop(another_device);
         drop(fourth_device);
