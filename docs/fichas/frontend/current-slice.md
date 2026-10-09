@@ -10,12 +10,23 @@ ratchet, stores ciphertext and the local transcript in SQLCipher, then ACKs.
 The sender marks the outbox event held by the peer after receiving that ACK.
 Queued application events can be retried from the MLS screen after reconnecting. Membership Commit bytes and the predecessor-epoch member roster are saved atomically with the merged group state. The MLS screen drains pending Commits in epoch order over the active pinned QUIC session, sending only to devices in each Commit's predecessor-epoch recipient snapshot. It waits for each durable ACK before advancing. If a device receives a later Commit before its expected predecessor, it requests that epoch over the pinned session; the committer can return an already-ACKed Commit only to a device in its original recipient snapshot. Newly invited members are excluded; a removed device can receive the Commit that removes it. The receiver validates envelope metadata, MLS signature, group, predecessor epoch, designated committer, and device-bound credentials before atomically persisting the Commit and journal record; transport ACK follows persistence and is durably recorded per recipient on the sender. The UI shows each eligible device's saved adoption ACK. Exact redelivery is idempotent. Repeat after connecting to each other member; multi-peer fan-out, offline delivery, and concurrent proposal handling remain open.
 
+Before applying a next-epoch Commit, the client stores the prior OpenMLS group
+state in the encrypted profile database. If a different Commit later arrives
+for an already accepted predecessor epoch, the client restores that snapshot
+inside a rolled-back verification transaction and checks the MLS signature,
+group, epoch, designated committer, and device binding. A second valid Commit
+from the same committer is recorded as equivocation and permanently quarantines
+that group on this device. The accepted epoch stays intact; MLS sends, retries,
+and Commit distribution are blocked, and the security alert returns when the
+group is reopened. Invalid or differently authored conflicts do not trigger
+quarantine. Recovery or rekey after quarantine is not implemented.
+
 `src/main.rs` owns application and transport state; `src/ui.rs` composes the
 native Iced views, original art, icons, embedded fonts, and texture effects.
 The **Telas** gallery reaches each screen. The MLS view creates groups,
 prepares and admits device-bound KeyPackages, processes Welcome and ratchet
 tree data, loads a bounded local transcript, sends application messages, and
-retries queued outbox events for the selected group. Group invitations still
+retries queued outbox events for the selected group unless it is quarantined. Group invitations still
 require a separately trusted channel. Both devices must have joined the same
 group, select its ID, and establish a direct LAN session to exchange messages.
 
@@ -37,7 +48,7 @@ available in the user session. The settings **Rede & P2P** screen separately
 shows local Elixir HTTP/WebSocket diagnostics; it does not carry chat traffic.
 
 Character scenes and call views remain visual previews. Camera, microphone,
-screen capture, contact discovery, verified pairing, group event distribution,
+screen capture, contact discovery, verified pairing, multi-peer group fan-out,
 relay, and offline delivery are not implemented. The older web UI under
 `prototypes/web/` is a design benchmark, not the product runtime.
 

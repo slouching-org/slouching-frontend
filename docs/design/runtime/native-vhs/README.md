@@ -1,6 +1,6 @@
 # Actual Iced runtime captures
 
-Captured from the native Rust/Iced window at 1280 × 800 pixels with its
+Captured from the native Rust/Iced window with its
 window screenshot API. Every numbered image corresponds to the supplied
 design-board view. These are rendered widgets and source assets, not screen
 PNGs pasted into an app. `compact/` keeps representative 960 × 640 captures.
@@ -19,9 +19,12 @@ media capture, messaging, or call is established by these images.
 Exact parity and accessibility remain open.
 
 The MLS screen lets two devices manually exchange a public KeyPackage,
-Welcome, and ratchet tree through a separately trusted channel. It is a local
-MLS group setup flow; MLS application messages still have no network path or
-chat UI.
+Welcome, and ratchet tree through a separately trusted channel. Joined devices
+send encrypted MLS messages over their active pinned Iroh/QUIC session. The
+receiver persists the ratchet update and transcript before ACK. The group view
+also displays a persistent security banner when authenticated committer
+equivocation has quarantined a group; MLS sends, retries, and Commit delivery
+are disabled for that group.
 
 Opening the encrypted database composes OpenMLS RustCrypto with its versioned
 SQLite storage schema through the same SQLCipher connection. The Rust core
@@ -30,10 +33,12 @@ members, processes Welcome messages, and encrypts/decrypts events transactionall
 with the journal. The group setup flow is now exposed as an additional native
 screen; the original eleven design-board views remain available.
 
-The storage test uses a temporary SQLCipher database, confirms that opening it
-twice preserves the OpenMLS schema, and composes the RustCrypto and SQL
-providers to save and reload an MLS signature key. It creates no product MLS
-credential or group.
+Storage tests use temporary SQLCipher databases to check OpenMLS migrations,
+device-bound group admission, encrypted messaging, ordered Commit recovery, and
+authenticated conflicting Commits. The equivocation test confirms that the
+valid conflicting Commit is verified against a saved historical epoch, evidence
+and quarantine persist, the accepted epoch is unchanged, and outbound MLS
+messages are blocked.
 
 The familiar-screen capture was refreshed after adding the core's signed
 device-to-MLS key binding primitive. The chat capture now shows the per-peer

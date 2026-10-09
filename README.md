@@ -113,6 +113,16 @@ remains queued after the first recipient ACK and a database reopen. New members 
 matching Welcome and ratchet tree. The transcript reloads locally, and **Reenviar pendentes**
 sends queued events for the selected group after reconnecting.
 
+Before applying a Commit, each device saves the prior OpenMLS epoch state in
+its encrypted profile database. If it later receives a different, valid Commit
+from the designated committer for an already accepted predecessor epoch, it
+verifies that Commit against the saved state, records both signed Commit values,
+and quarantines the group locally. The accepted epoch remains unchanged, and
+the UI shows a persistent security alert while blocking MLS sends, retries,
+and further Commit distribution for that group. Invalid Commit bytes do not
+quarantine the group. This client currently has no automated recovery or rekey
+flow for a quarantined group.
+
 Familiar selection, invitation/draft fields, screen navigation, settings
 tabs, illustrative share-source selection, and interface texture work locally.
 The familiar screen saves the display name and familiar as a local profile in
@@ -137,7 +147,14 @@ be installed and available in the user session.
 
 ![Actual native Iced group-call preview; media and sample messages are illustrative](docs/design/runtime/native-vhs/10-call.png)
 
-![Actual native Iced MLS group and chat screen; idle capture without a created group](docs/design/runtime/native-vhs/11-mls.png)
+![Actual native Iced MLS group screen, captured from the running app without a selected group](docs/design/runtime/native-vhs/11-mls.png)
+
+The MLS screen now detects authenticated committer equivocation. It verifies a
+conflicting historical Commit against a saved OpenMLS epoch snapshot, stores
+both Commit values in the encrypted database, and quarantines that group on
+the device. Its accepted epoch remains intact, and reopening the group restores
+the visible security alert. MLS message creation, event retries, and Commit
+delivery are blocked until a recovery or rekey flow is implemented.
 
 The eleven design-board views and additional MLS screen are captured in [native-vhs](docs/design/runtime/native-vhs/).
 These are a first implementation of the visual direction, with comparison

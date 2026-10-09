@@ -197,6 +197,7 @@ struct Slouching {
     mls_welcome: String,
     mls_ratchet_tree: String,
     mls_status: String,
+    mls_quarantine_reason: Option<String>,
     mls_message_draft: String,
     mls_history: Vec<storage::StoredMlsMessage>,
     mls_history_group: Option<Vec<u8>>,
@@ -323,6 +324,7 @@ impl Default for Slouching {
             mls_welcome: String::new(),
             mls_ratchet_tree: String::new(),
             mls_status: "Crie uma identidade do dispositivo para começar.".to_owned(),
+            mls_quarantine_reason: None,
             mls_message_draft: String::new(),
             mls_history: Vec::new(),
             mls_history_group: None,
@@ -416,6 +418,7 @@ enum Message {
     CopyMlsValue(String),
     MlsMessageDraftChanged(String),
     MlsHistoryLoaded(Vec<u8>, Result<Vec<storage::StoredMlsMessage>, String>),
+    MlsQuarantineLoaded(Vec<u8>, Result<Option<String>, String>),
     MlsCommitsLoaded(Vec<u8>, Result<Vec<storage::StoredMlsCommit>, String>),
     MlsCommitRecipientsLoaded(
         Vec<u8>,
@@ -1369,6 +1372,24 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         }
         Message::MlsCommitInboundProcessed(sequence, envelope, result) => match result {
             Ok(processed) => {
+                if let storage::ProcessedMlsCommit::EquivocationDetected { predecessor_epoch } =
+                    &processed
+                {
+                    state.mls_quarantine_reason = Some(format!(
+                        "Commits assinados diferentes para o predecessor epoch {predecessor_epoch}."
+                    ));
+                    if let Some(commands) = state.peer_session_commands.as_ref() {
+                        let _ = commands.try_send(peer::PeerCommand::RejectInbound {
+                            sequence,
+                            reason: "authenticated committer equivocation; group quarantined"
+                                .to_owned(),
+                        });
+                    }
+                    state.mls_status = format!(
+                        "ALERTA DE SEGURANÇA: Commits assinados diferentes no predecessor epoch {predecessor_epoch}. Grupo em quarentena; envio MLS pausado."
+                    );
+                    return Task::none();
+                }
                 if let Some(commands) = state.peer_session_commands.as_ref() {
                     let _ = commands.try_send(peer::PeerCommand::AcceptInbound { sequence });
                 }
@@ -1379,6 +1400,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     storage::ProcessedMlsCommit::Duplicate { epoch } => {
                         format!("Commit já aplicado; epoch {epoch}. ACK de redelivery enviado.")
                     }
+                    storage::ProcessedMlsCommit::EquivocationDetected { .. } => unreachable!(),
                 };
                 return load_mls_history(state, envelope.group_id);
             }
@@ -1452,6 +1474,14 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 storage::ProcessedMlsCommit::Duplicate { epoch } => {
                     format!("Commit já aplicado anteriormente; grupo permanece no epoch {epoch}.")
                 }
+                storage::ProcessedMlsCommit::EquivocationDetected { predecessor_epoch } => {
+                    state.mls_quarantine_reason = Some(format!(
+                        "Commits assinados diferentes para o predecessor epoch {predecessor_epoch}."
+                    ));
+                    format!(
+                        "ALERTA DE SEGURANÇA: Commits conflitantes autenticados no epoch {predecessor_epoch}; grupo em quarentena."
+                    )
+                }
             };
         }
         Message::MlsCommitProcessed(Err(error)) => {
@@ -1464,6 +1494,17 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     Err(error) => {
                         state.mls_status =
                             format!("Não foi possível carregar histórico MLS: {error}");
+                    }
+                }
+            }
+        }
+        Message::MlsQuarantineLoaded(group_id, result) => {
+            if state.mls_history_group.as_deref() == Some(group_id.as_slice()) {
+                match result {
+                    Ok(reason) => state.mls_quarantine_reason = reason,
+                    Err(error) => {
+                        state.mls_status =
+                            format!("Não foi possível verificar a quarentena MLS: {error}");
                     }
                 }
             }
@@ -2015,7 +2056,9 @@ fn hex_encode_bytes(bytes: &[u8]) -> String {
 
 fn load_mls_history(state: &mut Slouching, group_id: Vec<u8>) -> Task<Message> {
     state.mls_history_group = Some(group_id.clone());
+    state.mls_quarantine_reason = None;
     let history_group_id = group_id.clone();
+    let quarantine_group_id = group_id.clone();
     let commits_group_id = group_id.clone();
     let recipients_group_id = group_id.clone();
     let recipients_message_group_id = recipients_group_id.clone();
@@ -2023,6 +2066,10 @@ fn load_mls_history(state: &mut Slouching, group_id: Vec<u8>) -> Task<Message> {
         Task::perform(load_mls_history_task(group_id.clone()), move |result| {
             Message::MlsHistoryLoaded(history_group_id, result)
         }),
+        Task::perform(
+            load_mls_quarantine_task(quarantine_group_id.clone()),
+            move |result| Message::MlsQuarantineLoaded(quarantine_group_id, result),
+        ),
         Task::perform(load_mls_commits_task(commits_group_id), move |result| {
             Message::MlsCommitsLoaded(group_id, result)
         }),
@@ -2031,6 +2078,12 @@ fn load_mls_history(state: &mut Slouching, group_id: Vec<u8>) -> Task<Message> {
             move |result| Message::MlsCommitRecipientsLoaded(recipients_message_group_id, result),
         ),
     ])
+}
+
+async fn load_mls_quarantine_task(group_id: Vec<u8>) -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(move || storage::load_mls_group_quarantine(&group_id))
+        .await
+        .map_err(|error| format!("MLS quarantine query task failed: {error}"))?
 }
 
 async fn load_mls_history_task(

@@ -1425,7 +1425,8 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
     );
     let can_send = matches!(state.peer_listen_status, crate::PeerListenStatus::Connected)
         && !state.mls_message_draft.trim().is_empty()
-        && state.mls_history_group.is_some();
+        && state.mls_history_group.is_some()
+        && state.mls_quarantine_reason.is_none();
     let send = button(l.label("Enviar MLS", 14.0, NIGHT))
         .on_press_maybe(can_send.then_some(Message::SendMlsApplication))
         .padding([l.px(13.0), l.px(20.0)])
@@ -1433,11 +1434,41 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
     let retry = button(l.label("Reenviar pendentes", 12.0, PAPER))
         .on_press_maybe(
             (matches!(state.peer_listen_status, crate::PeerListenStatus::Connected)
-                && state.mls_history_group.is_some())
+                && state.mls_history_group.is_some()
+                && state.mls_quarantine_reason.is_none())
             .then_some(Message::RetryQueuedMlsEvents),
         )
         .padding([l.px(12.0), l.px(16.0)])
         .style(|_, status| button_style(status, false, false));
+    let quarantine_banner: Element<'_, Message> =
+        if let Some(reason) = state.mls_quarantine_reason.as_ref() {
+            container(
+                column![
+                    l.label("ALERTA DE SEGURANÇA · GRUPO EM QUARENTENA", 11.0, GOLD),
+                    l.label(reason.clone(), 11.0, PAPER),
+                    l.label(
+                        "Envio, retry e novos Commits estão bloqueados neste dispositivo.",
+                        10.0,
+                        PAPER
+                    ),
+                ]
+                .spacing(l.px(4.0)),
+            )
+            .padding(l.px(10.0))
+            .width(Fill)
+            .style(|_| container::Style {
+                background: Some(RED.into()),
+                border: Border {
+                    color: GOLD,
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+        } else {
+            space().height(l.px(0.0)).into()
+        };
     let body = column![
         row![
             column![l.title("Grupo MLS", 28.0), l.label("OpenMLS · SQLCipher · Iroh/QUIC direto", 11.0, MUTED)].spacing(l.px(5.0)),
@@ -1445,6 +1476,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             l.label("INVITE MANUAL · CHAVES NÃO SAEM DO DISPOSITIVO", 10.0, GOLD)
         ].align_y(iced::Center),
         rule(LINE, 1.0),
+        quarantine_banner,
         row![
             scrollable(inviter).height(l.px(275.0)).width(Fill),
             rule(LINE, 1.0),

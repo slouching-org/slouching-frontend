@@ -24,7 +24,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 10;
+const PROFILE_SCHEMA_VERSION: u32 = 11;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 type StoredEventEnvelope = (
@@ -45,6 +45,7 @@ type StoredInboundEnvelope = (
     i64,
     Vec<u8>,
 );
+type StoredPriorMlsCommit = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
 #[derive(Default)]
 struct OpenMlsJsonCodec;
@@ -193,6 +194,22 @@ pub fn list_mls_messages(group_id: &[u8], limit: usize) -> Result<Vec<StoredMlsM
     }
     let connection = open_local_database()?;
     list_mls_messages_in(&connection, group_id, limit)
+}
+
+pub fn load_mls_group_quarantine(group_id: &[u8]) -> Result<Option<String>, String> {
+    if group_id.len() != 16 {
+        return Err("MLS group ID must be 16 bytes".to_owned());
+    }
+    let connection = open_local_database()?;
+    connection
+        .query_row(
+            "SELECT quarantine_reason FROM local_mls_groups
+             WHERE group_id = ?1 AND quarantined = 1",
+            [group_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("could not load MLS quarantine state: {error}"))
 }
 
 fn list_mls_messages_in(
@@ -392,6 +409,22 @@ pub struct StoredMlsCommit {
 
 type StoredMlsCommitRow = (Vec<u8>, Vec<u8>, i64, i64, Vec<u8>, Vec<u8>, Vec<u8>);
 
+#[derive(Serialize, serde::Deserialize)]
+struct MlsEpochSnapshot {
+    group_data: Vec<(i64, String, Vec<u8>)>,
+    epoch_key_pairs: Vec<(i64, Vec<u8>, i64, Vec<u8>)>,
+    own_leaf_nodes: Vec<(i64, Vec<u8>)>,
+    proposals: Vec<(i64, Vec<u8>, Vec<u8>)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlsCommitQuarantine {
+    pub predecessor_epoch: u64,
+    pub accepted_event_id: [u8; 16],
+    pub conflicting_event_id: [u8; 16],
+    pub author_device: [u8; 32],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MlsCommitRecipientStatus {
     pub event_id: [u8; 16],
@@ -504,6 +537,7 @@ fn load_authorized_mls_commit_for_peer_in(
              JOIN local_mls_groups g ON g.group_id = c.group_id
              WHERE c.group_id = ?1 AND c.predecessor_epoch = ?2
                AND r.device_public_key = ?3
+               AND g.quarantined = 0
                AND c.author_device = g.designated_committer_device",
             params![group_id, predecessor_epoch as i64, peer_device.as_slice()],
             |row| {
@@ -678,6 +712,7 @@ fn list_queued_mls_commits_in(
     group_id: &[u8],
     limit: usize,
 ) -> Result<Vec<StoredMlsCommit>, String> {
+    ensure_mls_group_not_quarantined(connection, group_id)?;
     let mut statement = connection
         .prepare(
             "SELECT event_id, group_id, predecessor_epoch, epoch, author_device,
@@ -751,6 +786,7 @@ pub enum ProcessedMlsApplicationEvent {
 pub enum ProcessedMlsCommit {
     Applied { epoch: u64 },
     Duplicate { epoch: u64 },
+    EquivocationDetected { predecessor_epoch: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -889,6 +925,7 @@ fn create_mls_application_event_in(
         .execute_batch("BEGIN IMMEDIATE")
         .map_err(|error| format!("could not begin MLS outbox transaction: {error}"))?;
     let result = (|| {
+        ensure_mls_group_not_quarantined(connection, group_id.as_slice())?;
         let (event, wire_message) = {
             let provider = LocalOpenMlsProvider::new(connection);
             let mut group = MlsGroup::load(provider.storage(), &group_id)
@@ -1021,6 +1058,7 @@ fn process_inbound_mls_application_event_in(
         .execute_batch("BEGIN IMMEDIATE")
         .map_err(|error| format!("could not begin inbound MLS transaction: {error}"))?;
     let result = (|| {
+        ensure_mls_group_not_quarantined(connection, &event.group_id)?;
         let existing: Option<StoredInboundEnvelope> = connection
             .query_row(
                 "SELECT author_device, group_id, ciphertext_digest, epoch, checkpoint,
@@ -1206,32 +1244,99 @@ fn process_inbound_mls_commit_in(
         .execute_batch("BEGIN IMMEDIATE")
         .map_err(|error| format!("could not begin inbound MLS Commit transaction: {error}"))?;
     let result = (|| {
-        let policy: (Vec<u8>, i64) = connection
+        let policy: (Vec<u8>, i64, bool) = connection
             .query_row(
-                "SELECT designated_committer_device, epoch
+                "SELECT designated_committer_device, epoch, quarantined
                  FROM local_mls_groups WHERE group_id = ?1",
                 [group_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0)),
             )
             .map_err(|error| format!("could not load MLS group policy: {error}"))?;
+        if policy.2 {
+            return Err(
+                "MLS group is quarantined after authenticated committer equivocation".to_owned(),
+            );
+        }
         if predecessor_epoch < policy.1 as u64 {
-            let existing: Option<(Vec<u8>, Vec<u8>)> = connection
+            let existing: Option<StoredPriorMlsCommit> = connection
                 .query_row(
-                    "SELECT commit_hash, commit_bytes
+                    "SELECT event_id, commit_hash, commit_bytes, author_device
                      FROM local_mls_inbound_commits
                      WHERE group_id = ?1 AND predecessor_epoch = ?2",
                     params![group_id, predecessor_epoch as i64],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()
                 .map_err(|error| format!("could not check MLS Commit redelivery: {error}"))?;
-            if let Some((digest, bytes)) = existing {
+            if let Some((accepted_event_id, digest, bytes, accepted_author)) = existing {
                 if digest.as_slice() == commit_hash && bytes == commit_bytes {
                     return Ok(ProcessedMlsCommit::Duplicate {
                         epoch: predecessor_epoch.saturating_add(1),
                     });
                 }
-                return Err("conflicting Commit bytes target an already-applied predecessor; authenticated committer evidence is required before quarantine".to_owned());
+                let author_device = authenticate_mls_commit_from_epoch_snapshot(
+                    connection,
+                    group_id,
+                    predecessor_epoch,
+                    commit_bytes,
+                    device_identity,
+                    &policy.0,
+                )?;
+                if accepted_author.as_slice() != author_device {
+                    return Err(
+                        "conflicting Commit author differs from the accepted historical author"
+                            .to_owned(),
+                    );
+                }
+                let accepted_event_id: [u8; 16] =
+                    fixed_bytes(accepted_event_id, "accepted MLS Commit event ID")?;
+                let accepted_hash: [u8; 32] = fixed_bytes(digest, "accepted MLS Commit digest")?;
+                let mut accepted_author_id = [0; 16];
+                accepted_author_id.copy_from_slice(&accepted_hash[..16]);
+                if accepted_author_id != accepted_event_id {
+                    return Err(
+                        "accepted MLS Commit journal has an invalid event digest".to_owned()
+                    );
+                }
+                connection
+                    .execute(
+                        "INSERT INTO local_mls_equivocations
+                            (group_id, predecessor_epoch, accepted_event_id, accepted_hash,
+                             accepted_bytes, conflicting_event_id, conflicting_hash,
+                             conflicting_bytes, author_device)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![
+                            group_id,
+                            predecessor_epoch as i64,
+                            accepted_event_id.as_slice(),
+                            accepted_hash.as_slice(),
+                            bytes,
+                            event_id.as_slice(),
+                            commit_hash.as_slice(),
+                            commit_bytes,
+                            author_device.as_slice(),
+                        ],
+                    )
+                    .map_err(|error| {
+                        format!("could not preserve MLS equivocation evidence: {error}")
+                    })?;
+                let updated = connection
+                    .execute(
+                        "UPDATE local_mls_groups
+                         SET quarantined = 1,
+                             quarantine_reason = 'authenticated designated committer equivocation'
+                         WHERE group_id = ?1 AND quarantined = 0",
+                        [group_id],
+                    )
+                    .map_err(|error| {
+                        format!("could not quarantine equivocated MLS group: {error}")
+                    })?;
+                if updated != 1 {
+                    return Err(
+                        "MLS group quarantine state changed during evidence storage".to_owned()
+                    );
+                }
+                return Ok(ProcessedMlsCommit::EquivocationDetected { predecessor_epoch });
             }
             return Err("MLS Commit predecessor is older than local state but has no matching journal entry".to_owned());
         }
@@ -1252,6 +1357,8 @@ fn process_inbound_mls_commit_in(
         if collision.is_some() {
             return Err("MLS Commit event ID collision".to_owned());
         }
+
+        capture_mls_epoch_snapshot_in(connection, group_id, predecessor_epoch)?;
 
         let (epoch, author_device) = {
             let provider = LocalOpenMlsProvider::new(connection);
@@ -1435,10 +1542,13 @@ pub fn list_outbound_events(
     let connection = open_local_database()?;
     let mut statement = connection
         .prepare(
-            "SELECT rowid, event_id, author_device, group_id, epoch, checkpoint,
-                    expires_at_unix, ciphertext, delivery_state
-             FROM local_events WHERE direction = 'outbound' AND rowid > ?1
-             ORDER BY rowid LIMIT ?2",
+            "SELECT e.rowid, e.event_id, e.author_device, e.group_id, e.epoch, e.checkpoint,
+                    e.expires_at_unix, e.ciphertext, e.delivery_state
+             FROM local_events e
+             LEFT JOIN local_mls_groups g ON g.group_id = e.group_id
+             WHERE e.direction = 'outbound' AND e.rowid > ?1
+               AND (g.group_id IS NULL OR g.quarantined = 0)
+             ORDER BY e.rowid LIMIT ?2",
         )
         .map_err(|error| format!("could not prepare local outbox query: {error}"))?;
     let rows = statement
@@ -1943,6 +2053,15 @@ fn add_mls_group_member_in(
         .execute_batch("BEGIN IMMEDIATE")
         .map_err(|error| format!("could not begin MLS member-add transaction: {error}"))?;
     let result = (|| {
+        ensure_mls_group_not_quarantined(connection, group_id.as_slice())?;
+        let predecessor_epoch: i64 = connection
+            .query_row(
+                "SELECT epoch FROM local_mls_groups WHERE group_id = ?1",
+                [group_id.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("could not load MLS snapshot epoch: {error}"))?;
+        capture_mls_epoch_snapshot_in(connection, group_id.as_slice(), predecessor_epoch as u64)?;
         let (added, epoch) = {
             let provider = LocalOpenMlsProvider::new(connection);
             let mut group = MlsGroup::load(provider.storage(), &group_id)
@@ -2157,6 +2276,7 @@ fn join_mls_group_from_welcome_in(
                 ],
             )
             .map_err(|error| format!("could not index joined MLS group: {error}"))?;
+        capture_mls_epoch_snapshot_in(connection, &joined.group_id, joined.epoch)?;
         Ok(joined)
     })();
     finish_sql_transaction(connection, result, "MLS Welcome")
@@ -2178,6 +2298,321 @@ fn finish_sql_transaction<T>(
             let _ = connection.execute_batch("ROLLBACK");
             Err(error)
         }
+    }
+}
+
+fn capture_mls_epoch_snapshot_in(
+    connection: &Connection,
+    group_id: &[u8],
+    epoch: u64,
+) -> Result<(), String> {
+    if group_id.len() != 16 || epoch > i64::MAX as u64 {
+        return Err("MLS epoch snapshot has an invalid group or epoch".to_owned());
+    }
+    // openmls_sqlite_storage encodes storage keys through its configured Codec.
+    // GroupId is serialized as a JSON object, unlike the raw ID used by our index.
+    let storage_group_id = serde_json::to_vec(&GroupId::from_slice(group_id))
+        .map_err(|error| format!("could not encode MLS storage group ID: {error}"))?;
+    let group_data = {
+        let mut statement = connection
+            .prepare(
+                "SELECT provider_version, data_type, group_data
+                 FROM openmls_group_data WHERE group_id = ?1 ORDER BY data_type",
+            )
+            .map_err(|error| format!("could not prepare MLS group snapshot: {error}"))?;
+        statement
+            .query_map([&storage_group_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|error| format!("could not read MLS group snapshot: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("could not read MLS group snapshot row: {error}"))?
+    };
+    if group_data.is_empty() {
+        return Err("MLS group snapshot has no OpenMLS group data".to_owned());
+    }
+    let epoch_key_pairs = {
+        let mut statement = connection
+            .prepare(
+                "SELECT provider_version, epoch_id, leaf_index, key_pairs
+                 FROM openmls_epoch_keys_pairs WHERE group_id = ?1
+                 ORDER BY epoch_id, leaf_index",
+            )
+            .map_err(|error| format!("could not prepare MLS epoch-key snapshot: {error}"))?;
+        statement
+            .query_map([&storage_group_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .map_err(|error| format!("could not read MLS epoch-key snapshot: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("could not read MLS epoch-key snapshot row: {error}"))?
+    };
+    let own_leaf_nodes = {
+        let mut statement = connection
+            .prepare(
+                "SELECT provider_version, leaf_node
+                 FROM openmls_own_leaf_nodes WHERE group_id = ?1 ORDER BY id",
+            )
+            .map_err(|error| format!("could not prepare MLS own-leaf snapshot: {error}"))?;
+        statement
+            .query_map([&storage_group_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|error| format!("could not read MLS own-leaf snapshot: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("could not read MLS own-leaf snapshot row: {error}"))?
+    };
+    let proposals = {
+        let mut statement = connection
+            .prepare(
+                "SELECT provider_version, proposal_ref, proposal
+                 FROM openmls_proposals WHERE group_id = ?1 ORDER BY proposal_ref",
+            )
+            .map_err(|error| format!("could not prepare MLS proposal snapshot: {error}"))?;
+        statement
+            .query_map([&storage_group_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|error| format!("could not read MLS proposal snapshot: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("could not read MLS proposal snapshot row: {error}"))?
+    };
+    let snapshot = serde_json::to_vec(&MlsEpochSnapshot {
+        group_data,
+        epoch_key_pairs,
+        own_leaf_nodes,
+        proposals,
+    })
+    .map_err(|error| format!("could not encode MLS epoch snapshot: {error}"))?;
+    let snapshot_hash = blake3::hash(&snapshot);
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO local_mls_epoch_snapshots
+                (group_id, epoch, snapshot, snapshot_hash)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                group_id,
+                epoch as i64,
+                snapshot,
+                snapshot_hash.as_bytes().as_slice()
+            ],
+        )
+        .map_err(|error| format!("could not persist MLS epoch snapshot: {error}"))?;
+    Ok(())
+}
+
+fn ensure_mls_group_not_quarantined(
+    connection: &Connection,
+    group_id: &[u8],
+) -> Result<(), String> {
+    let quarantined: Option<i64> = connection
+        .query_row(
+            "SELECT quarantined FROM local_mls_groups WHERE group_id = ?1",
+            [group_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("could not check MLS quarantine state: {error}"))?;
+    match quarantined {
+        Some(0) => Ok(()),
+        Some(_) => {
+            Err("MLS group is quarantined after authenticated committer equivocation".to_owned())
+        }
+        None => Err("MLS group is not present on this device".to_owned()),
+    }
+}
+
+fn restore_mls_epoch_snapshot_in(
+    connection: &Connection,
+    group_id: &[u8],
+    epoch: u64,
+) -> Result<(), String> {
+    let storage_group_id = serde_json::to_vec(&GroupId::from_slice(group_id))
+        .map_err(|error| format!("could not encode MLS storage group ID: {error}"))?;
+    let (snapshot_bytes, expected_hash): (Vec<u8>, Vec<u8>) = connection
+        .query_row(
+            "SELECT snapshot, snapshot_hash FROM local_mls_epoch_snapshots
+             WHERE group_id = ?1 AND epoch = ?2",
+            params![group_id, epoch as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| format!("could not load historical MLS epoch snapshot: {error}"))?;
+    if expected_hash.as_slice() != blake3::hash(&snapshot_bytes).as_bytes() {
+        return Err("historical MLS epoch snapshot failed its digest check".to_owned());
+    }
+    let snapshot: MlsEpochSnapshot = serde_json::from_slice(&snapshot_bytes)
+        .map_err(|error| format!("historical MLS epoch snapshot is invalid: {error}"))?;
+    connection
+        .execute(
+            "DELETE FROM openmls_group_data WHERE group_id = ?1",
+            [&storage_group_id],
+        )
+        .map_err(|error| format!("could not restore historical MLS group data: {error}"))?;
+    for (provider_version, data_type, group_data) in snapshot.group_data {
+        connection
+            .execute(
+                "INSERT INTO openmls_group_data
+                    (provider_version, group_id, data_type, group_data)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![provider_version, &storage_group_id, data_type, group_data],
+            )
+            .map_err(|error| format!("could not restore historical MLS group data row: {error}"))?;
+    }
+    connection
+        .execute(
+            "DELETE FROM openmls_epoch_keys_pairs WHERE group_id = ?1",
+            [&storage_group_id],
+        )
+        .map_err(|error| format!("could not restore historical MLS epoch keys: {error}"))?;
+    for (provider_version, epoch_id, leaf_index, key_pairs) in snapshot.epoch_key_pairs {
+        connection
+            .execute(
+                "INSERT INTO openmls_epoch_keys_pairs
+                    (provider_version, group_id, epoch_id, leaf_index, key_pairs)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    provider_version,
+                    &storage_group_id,
+                    epoch_id,
+                    leaf_index,
+                    key_pairs
+                ],
+            )
+            .map_err(|error| format!("could not restore historical MLS epoch-key row: {error}"))?;
+    }
+    connection
+        .execute(
+            "DELETE FROM openmls_own_leaf_nodes WHERE group_id = ?1",
+            [&storage_group_id],
+        )
+        .map_err(|error| format!("could not restore historical MLS own leaves: {error}"))?;
+    for (provider_version, leaf_node) in snapshot.own_leaf_nodes {
+        connection
+            .execute(
+                "INSERT INTO openmls_own_leaf_nodes (provider_version, group_id, leaf_node)
+                 VALUES (?1, ?2, ?3)",
+                params![provider_version, &storage_group_id, leaf_node],
+            )
+            .map_err(|error| format!("could not restore historical MLS own-leaf row: {error}"))?;
+    }
+    connection
+        .execute(
+            "DELETE FROM openmls_proposals WHERE group_id = ?1",
+            [&storage_group_id],
+        )
+        .map_err(|error| format!("could not restore historical MLS proposals: {error}"))?;
+    for (provider_version, proposal_ref, proposal) in snapshot.proposals {
+        connection
+            .execute(
+                "INSERT INTO openmls_proposals
+                    (provider_version, group_id, proposal_ref, proposal)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![provider_version, &storage_group_id, proposal_ref, proposal],
+            )
+            .map_err(|error| format!("could not restore historical MLS proposal row: {error}"))?;
+    }
+    Ok(())
+}
+
+fn authenticate_mls_commit_from_epoch_snapshot(
+    connection: &mut Connection,
+    group_id: &[u8],
+    predecessor_epoch: u64,
+    commit_bytes: &[u8],
+    device_identity: &SigningKey,
+    designated_committer: &[u8],
+) -> Result<[u8; 32], String> {
+    use openmls::prelude::{
+        ProcessedMessageContent, tls_codec::Deserialize as TlsCodecDeserialize,
+    };
+
+    connection
+        .execute_batch("SAVEPOINT verify_mls_equivocation")
+        .map_err(|error| {
+            format!("could not open historical MLS verification savepoint: {error}")
+        })?;
+    let validation = (|| {
+        restore_mls_epoch_snapshot_in(connection, group_id, predecessor_epoch)?;
+        let protocol_message = MlsMessageIn::tls_deserialize_exact(commit_bytes)
+            .map_err(|error| format!("invalid conflicting MLS Commit: {error}"))?
+            .try_into_protocol_message()
+            .map_err(|error| {
+                format!("conflicting MLS message is not a protocol message: {error}")
+            })?;
+        if protocol_message.group_id().as_slice() != group_id
+            || protocol_message.epoch().as_u64() != predecessor_epoch
+        {
+            return Err("conflicting Commit does not match its historical group epoch".to_owned());
+        }
+        let author_device = {
+            let provider = LocalOpenMlsProvider::new(connection);
+            let group_identifier = GroupId::from_slice(group_id);
+            let mut group = MlsGroup::load(provider.storage(), &group_identifier)
+                .map_err(|error| format!("could not load historical MLS group: {error}"))?
+                .ok_or_else(|| "historical MLS group snapshot is incomplete".to_owned())?;
+            if group.epoch().as_u64() != predecessor_epoch {
+                return Err("historical MLS group snapshot has the wrong epoch".to_owned());
+            }
+            let own_leaf = group
+                .own_leaf()
+                .ok_or_else(|| "historical MLS local leaf is missing".to_owned())?;
+            let own_binding =
+                MlsSigningKeyBinding::from_bytes(own_leaf.credential().serialized_content())
+                    .ok_or_else(|| {
+                        "historical local credential has no device binding".to_owned()
+                    })?;
+            if own_binding.device_public_key != device_identity.verifying_key().to_bytes()
+                || !own_binding.verifies_mls_credential(
+                    &own_binding.device_public_key,
+                    group.ciphersuite().signature_algorithm() as u16,
+                    own_leaf.signature_key().as_slice(),
+                )
+            {
+                return Err("historical MLS group is not bound to this device".to_owned());
+            }
+            let processed = group
+                .process_message(&provider, protocol_message)
+                .map_err(|error| format!("conflicting Commit signature is invalid: {error:?}"))?;
+            let sender_binding =
+                MlsSigningKeyBinding::from_bytes(processed.credential().serialized_content())
+                    .ok_or_else(|| "conflicting Commit has no device-bound author".to_owned())?;
+            let sender = group
+                .members()
+                .find(|member| {
+                    member.credential.serialized_content()
+                        == processed.credential().serialized_content()
+                })
+                .ok_or_else(|| "conflicting Commit author is not a historical member".to_owned())?;
+            let author_device = sender_binding.device_public_key;
+            if author_device.as_slice() != designated_committer
+                || !sender_binding.verifies_mls_credential(
+                    &author_device,
+                    group.ciphersuite().signature_algorithm() as u16,
+                    sender.signature_key.as_slice(),
+                )
+            {
+                return Err(
+                    "conflicting Commit is not signed by the bound designated committer".to_owned(),
+                );
+            }
+            match processed.into_content() {
+                ProcessedMessageContent::StagedCommitMessage(staged)
+                    if staged.epoch().as_u64() == predecessor_epoch.saturating_add(1) => {}
+                ProcessedMessageContent::StagedCommitMessage(_) => {
+                    return Err("conflicting Commit does not advance one epoch".to_owned());
+                }
+                _ => return Err("conflicting MLS message is not a Commit".to_owned()),
+            }
+            author_device
+        };
+        Ok(author_device)
+    })();
+    let rollback = connection
+        .execute_batch("ROLLBACK TO verify_mls_equivocation; RELEASE verify_mls_equivocation;");
+    match (validation, rollback) {
+        (Ok(author), Ok(())) => Ok(author),
+        (Err(error), Ok(())) => Err(error),
+        (_, Err(error)) => Err(format!(
+            "could not restore active MLS state after verification: {error}"
+        )),
     }
 }
 
@@ -2242,6 +2677,7 @@ fn create_mls_group_in(
                 ],
             )
             .map_err(|error| format!("could not index local MLS group: {error}"))?;
+        capture_mls_epoch_snapshot_in(connection, &group_id, created_group.epoch)?;
         Ok(created_group)
     })();
 
@@ -2578,6 +3014,39 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
                  PRAGMA user_version = 10;",
             )
             .map_err(|error| format!("could not create MLS Commit recipient ledger: {error}"))?;
+    }
+    if version < 11 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE local_mls_epoch_snapshots (
+                     group_id BLOB NOT NULL CHECK (length(group_id) = 16),
+                     epoch INTEGER NOT NULL CHECK (epoch >= 0),
+                     snapshot BLOB NOT NULL CHECK (length(snapshot) > 0),
+                     snapshot_hash BLOB NOT NULL CHECK (length(snapshot_hash) = 32),
+                     PRIMARY KEY (group_id, epoch)
+                 );
+                 ALTER TABLE local_mls_groups
+                     ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0
+                     CHECK (quarantined IN (0, 1));
+                 ALTER TABLE local_mls_groups
+                     ADD COLUMN quarantine_reason TEXT;
+                 CREATE TABLE local_mls_equivocations (
+                     group_id BLOB NOT NULL CHECK (length(group_id) = 16),
+                     predecessor_epoch INTEGER NOT NULL CHECK (predecessor_epoch >= 0),
+                     accepted_event_id BLOB NOT NULL CHECK (length(accepted_event_id) = 16),
+                     accepted_hash BLOB NOT NULL CHECK (length(accepted_hash) = 32),
+                     accepted_bytes BLOB NOT NULL CHECK (length(accepted_bytes) > 0),
+                     conflicting_event_id BLOB NOT NULL CHECK (length(conflicting_event_id) = 16),
+                     conflicting_hash BLOB NOT NULL CHECK (length(conflicting_hash) = 32),
+                     conflicting_bytes BLOB NOT NULL CHECK (length(conflicting_bytes) > 0),
+                     author_device BLOB NOT NULL CHECK (length(author_device) = 32),
+                     PRIMARY KEY (group_id, predecessor_epoch)
+                 );
+                 PRAGMA user_version = 11;",
+            )
+            .map_err(|error| {
+                format!("could not create MLS epoch snapshots and quarantine ledger: {error}")
+            })?;
     }
     transaction
         .commit()
@@ -3195,6 +3664,50 @@ mod tests {
         let another_package =
             create_mls_key_package_in(&mut another_device, ciphersuite, &another_identity)
                 .expect("third device should prepare a KeyPackage");
+        let creator_binding =
+            create_or_load_mls_signing_key_binding_in(&mut creator, ciphersuite, &creator_identity)
+                .expect("designated committer should have its bound MLS signer");
+        let conflicting_commit = {
+            use openmls::prelude::{
+                KeyPackageIn,
+                tls_codec::{Deserialize as TlsCodecDeserialize, Serialize as TlsCodecSerialize},
+            };
+            let provider = LocalOpenMlsProvider::new(&mut creator);
+            let signer = SignatureKeyPair::read(
+                provider.storage(),
+                &creator_binding.mls_signing_public_key,
+                ciphersuite.signature_algorithm(),
+            )
+            .expect("designated committer signing key should load");
+            let key_package = KeyPackageIn::tls_deserialize_exact(&another_package.public_bytes)
+                .expect("third device KeyPackage should decode")
+                .validate(provider.crypto(), ProtocolVersion::Mls10)
+                .expect("third device KeyPackage should validate");
+            let mut fork =
+                MlsGroup::load(provider.storage(), &GroupId::from_slice(&group.group_id))
+                    .expect("current designated committer group should load")
+                    .expect("current designated committer group should exist");
+            let (commit, _, _) = fork
+                .add_members(&provider, &signer, std::slice::from_ref(&key_package))
+                .expect("committer should generate alternate valid Commit");
+            let serialized = commit
+                .tls_serialize_detached()
+                .expect("alternate Commit should serialize");
+            fork.clear_pending_commit(provider.storage())
+                .expect("test should discard alternate local pending Commit");
+            let (second_commit, _, _) = fork
+                .add_members(&provider, &signer, &[key_package])
+                .expect("committer should generate canonical Commit after clearing fork");
+            let canonical = second_commit
+                .tls_serialize_detached()
+                .expect("canonical Commit should serialize");
+            assert_ne!(serialized, canonical);
+            // Keep the group at the predecessor epoch; the production admission below
+            // generates a fresh canonical Commit using the same provider state.
+            fork.clear_pending_commit(provider.storage())
+                .expect("test should discard second locally staged Commit");
+            serialized
+        };
         let invitee_binding =
             create_or_load_mls_signing_key_binding_in(&mut invitee, ciphersuite, &invitee_identity)
                 .expect("existing noncommitter should have a device-bound MLS signer");
@@ -3488,6 +4001,55 @@ mod tests {
         )
         .expect_err("a non-designated member must not create the group Commit");
         assert!(unauthorized.contains("designated MLS committer"));
+
+        let equivocation = process_inbound_mls_commit_in(
+            &mut invitee,
+            &group.group_id,
+            &conflicting_commit,
+            &invitee_identity,
+        )
+        .expect("valid conflicting Commit should trigger authenticated equivocation");
+        assert_eq!(
+            equivocation,
+            ProcessedMlsCommit::EquivocationDetected {
+                predecessor_epoch: 1
+            }
+        );
+        let (quarantined, evidence_count, current_epoch): (i64, i64, i64) = invitee
+            .query_row(
+                "SELECT quarantined,
+                        (SELECT COUNT(*) FROM local_mls_equivocations WHERE group_id = ?1),
+                        epoch
+                 FROM local_mls_groups WHERE group_id = ?1",
+                [&group.group_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("quarantine and its evidence should persist");
+        assert_eq!((quarantined, evidence_count, current_epoch), (1, 1, 2));
+        assert!(
+            create_mls_application_event_in(
+                &mut invitee,
+                &group.group_id,
+                b"blocked after equivocation",
+                1,
+                &invitee_identity,
+            )
+            .is_err(),
+            "quarantined groups must not create outbound application messages"
+        );
+        drop(invitee);
+        let invitee = open_database(&invitee_path, &invitee_key)
+            .expect("quarantined group database should reopen");
+        let (persisted_reason, persisted_epoch): (Option<String>, i64) = invitee
+            .query_row(
+                "SELECT quarantine_reason, epoch FROM local_mls_groups
+                 WHERE group_id = ?1 AND quarantined = 1",
+                [&group.group_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("quarantine should survive database reopen");
+        assert!(persisted_reason.is_some());
+        assert_eq!(persisted_epoch, 2);
 
         drop(another_device);
         drop(fourth_device);
