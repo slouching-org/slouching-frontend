@@ -96,9 +96,11 @@ only after that ACK. Membership Commits are also saved atomically with the
 group epoch in a separate local outbox; the latest pending Commit is restored
 from SQLCipher and can be sent from the MLS screen over an active direct
 session. The sender checks that the pinned peer is an authenticated group
-member; the recipient validates the Commit and persists the new epoch before
-ACK. Exact redelivery is harmless. This sends to one connected member at a
-time; automatic multi-member fan-out and offline delivery are still in progress.
+member recorded at the Commit's predecessor epoch; a newly invited device is
+not sent that older Commit. The recipient validates it and persists the new
+epoch before ACK, and the sender stores that ACK per recipient. Exact redelivery
+is harmless. This sends to one connected member at a time; automatic
+multi-member fan-out and offline delivery are still in progress.
 New members join with the matching Welcome and ratchet tree. The transcript reloads locally, and **Reenviar pendentes**
 sends queued events for the selected group after reconnecting.
 

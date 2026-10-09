@@ -62,12 +62,14 @@ and select the same group ID. Establish the pinned direct LAN session in
 **Texto direto · LAN**, then return to the group screen to send or retry
 messages. Messages are retained in each device's local SQLCipher database.
 When adding later members, the MLS screen can send the pending Commit over the
-active pinned session to a current member. The sender checks that the peer is a
-device-bound MLS member. The receiver validates the Commit signature,
-designated committer, group and next epoch, persists the state, then ACKs.
-Redelivery is idempotent. This sends to one connected member at a time; the new
-member still joins with the matching Welcome and ratchet tree. Automatic
-multi-member fan-out and helper delivery are not implemented.
+active pinned session to one device in the predecessor-epoch member snapshot.
+The sender also checks that the pinned peer remains a device-bound MLS member,
+so a newly invited member never receives the older Commit. The receiver
+validates the Commit signature, designated committer, group and next epoch,
+persists the state, then ACKs. The sender persists that ACK per recipient;
+redelivery is idempotent. The new member joins with the matching Welcome and
+ratchet tree. Automatic multi-member fan-out and helper delivery are not
+implemented.
 
 Allow the selected UDP port through each device's firewall. Wildcard addresses
 such as `0.0.0.0` cannot be shared. If no LAN address is announced, inspect the

@@ -15,6 +15,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -23,7 +24,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 9;
+const PROFILE_SCHEMA_VERSION: u32 = 10;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 type StoredEventEnvelope = (
@@ -443,7 +444,72 @@ fn list_queued_mls_commits_for_peer_in(
     if !is_member {
         return Err("o dispositivo conectado não é membro autenticado deste grupo MLS".to_owned());
     }
-    list_queued_mls_commits_in(connection, group_id, limit)
+    let commits = list_queued_mls_commits_in(connection, group_id, limit)?;
+    let mut eligible = Vec::new();
+    for commit in commits {
+        let delivery_state: Option<String> = connection
+            .query_row(
+                "SELECT delivery_state FROM local_mls_commit_recipients
+                 WHERE commit_event_id = ?1 AND device_public_key = ?2",
+                params![commit.event_id.as_slice(), peer_device.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("could not load Commit recipient state: {error}"))?;
+        if delivery_state.as_deref() == Some("queued") {
+            eligible.push(commit);
+        }
+    }
+    Ok(eligible)
+}
+
+pub fn mark_mls_commit_delivered(
+    event_id: [u8; 16],
+    recipient_device: [u8; 32],
+) -> Result<(), String> {
+    let mut connection = open_local_database()?;
+    mark_mls_commit_delivered_in(&mut connection, event_id, recipient_device)
+}
+
+fn mark_mls_commit_delivered_in(
+    connection: &mut Connection,
+    event_id: [u8; 16],
+    recipient_device: [u8; 32],
+) -> Result<(), String> {
+    let delivered_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock is invalid: {error}"))?
+        .as_secs() as i64;
+    let updated = connection
+        .execute(
+            "UPDATE local_mls_commit_recipients
+             SET delivery_state = 'delivered', delivered_at = ?1
+             WHERE commit_event_id = ?2 AND device_public_key = ?3
+               AND delivery_state = 'queued'",
+            params![
+                delivered_at,
+                event_id.as_slice(),
+                recipient_device.as_slice()
+            ],
+        )
+        .map_err(|error| format!("could not persist MLS Commit delivery ACK: {error}"))?;
+    if updated == 1 {
+        return Ok(());
+    }
+    let existing: Option<String> = connection
+        .query_row(
+            "SELECT delivery_state FROM local_mls_commit_recipients
+             WHERE commit_event_id = ?1 AND device_public_key = ?2",
+            params![event_id.as_slice(), recipient_device.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("could not check MLS Commit delivery ACK: {error}"))?;
+    if existing.as_deref() == Some("delivered") {
+        Ok(())
+    } else {
+        Err("ACK does not match a queued MLS Commit recipient".to_owned())
+    }
 }
 
 pub fn process_inbound_mls_commit_envelope(
@@ -1791,6 +1857,26 @@ fn add_mls_group_member_in(
             )
             .ok_or_else(|| "designated committer signing key is missing".to_owned())?;
             let predecessor_epoch = group.epoch().as_u64();
+            let mut existing_devices = Vec::new();
+            for member in group.members() {
+                let binding =
+                    MlsSigningKeyBinding::from_bytes(member.credential.serialized_content())
+                        .ok_or_else(|| {
+                            "existing MLS member has no device identity binding".to_owned()
+                        })?;
+                if !binding.verifies_mls_credential(
+                    &binding.device_public_key,
+                    ciphersuite.signature_algorithm() as u16,
+                    member.signature_key.as_slice(),
+                ) {
+                    return Err("existing MLS member has an invalid device binding".to_owned());
+                }
+                if binding.device_public_key != device_public_key
+                    && !existing_devices.contains(&binding.device_public_key)
+                {
+                    existing_devices.push(binding.device_public_key);
+                }
+            }
             let (commit, welcome, _) = group
                 .add_members(&provider, &signer, &[package])
                 .map_err(|error| format!("could not add MLS group member: {error:?}"))?;
@@ -1800,10 +1886,9 @@ fn add_mls_group_member_in(
             group
                 .merge_pending_commit(&provider)
                 .map_err(|error| format!("could not persist MLS membership commit: {error:?}"))?;
-            let mut commit_event_id = [0; 16];
-            getrandom::fill(&mut commit_event_id)
-                .map_err(|error| format!("could not generate MLS Commit event id: {error}"))?;
             let commit_hash = *blake3::hash(&commit_bytes).as_bytes();
+            let mut commit_event_id = [0; 16];
+            commit_event_id.copy_from_slice(&commit_hash[..16]);
             let added = AddedMlsMember {
                 group_id: group.group_id().to_vec(),
                 epoch: group.epoch().as_u64(),
@@ -1836,6 +1921,16 @@ fn add_mls_group_member_in(
                 .map_err(|error| {
                     format!("could not persist MLS Commit in the local outbox: {error}")
                 })?;
+            for existing_device in existing_devices {
+                connection
+                    .execute(
+                        "INSERT INTO local_mls_commit_recipients
+                            (commit_event_id, device_public_key, delivery_state)
+                         VALUES (?1, ?2, 'queued')",
+                        params![commit_event_id.as_slice(), existing_device.as_slice()],
+                    )
+                    .map_err(|error| format!("could not persist MLS Commit recipient: {error}"))?;
+            }
             (added, group.epoch().as_u64())
         };
         let updated = connection
@@ -2355,6 +2450,25 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
             )
             .map_err(|error| format!("could not create inbound MLS Commit journal: {error}"))?;
     }
+    if version < 10 {
+        transaction
+            .execute_batch(
+                "UPDATE local_mls_commits
+                 SET event_id = substr(commit_hash, 1, 16);
+                 CREATE TABLE local_mls_commit_recipients (
+                     commit_event_id BLOB NOT NULL CHECK (length(commit_event_id) = 16),
+                     device_public_key BLOB NOT NULL CHECK (length(device_public_key) = 32),
+                     delivery_state TEXT NOT NULL DEFAULT 'queued'
+                         CHECK (delivery_state IN ('queued', 'delivered')),
+                     delivered_at INTEGER,
+                     PRIMARY KEY (commit_event_id, device_public_key)
+                 );
+                 CREATE INDEX local_mls_commit_recipients_by_device
+                     ON local_mls_commit_recipients (device_public_key, delivery_state);
+                 PRAGMA user_version = 10;",
+            )
+            .map_err(|error| format!("could not create MLS Commit recipient ledger: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -2449,6 +2563,10 @@ mod tests {
                 .query_row("PRAGMA cipher_version", [], |row| row.get(0))
                 .expect("database should use SQLCipher");
             assert!(!cipher_version.is_empty());
+            let schema_version: u32 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("local profile schema version should be readable");
+            assert_eq!(schema_version, PROFILE_SCHEMA_VERSION);
             store_direct_message_in(
                 &mut connection,
                 peer,
@@ -2926,16 +3044,15 @@ mod tests {
         assert_eq!(joined.ciphersuite, ciphersuite as u16);
         assert_eq!(joined.epoch, 1);
         assert_eq!(joined.designated_committer_device, creator_public_key);
-        assert_eq!(
+        assert!(
             list_queued_mls_commits_for_peer_in(
                 &mut creator,
                 &group.group_id,
                 &invitee_identity.verifying_key().to_bytes(),
                 10,
             )
-            .expect("authenticated group member should be eligible for Commit delivery")
-            .len(),
-            1
+            .expect("new invitee should have no predecessor-epoch Commit to receive")
+            .is_empty()
         );
         assert!(
             list_queued_mls_commits_for_peer_in(&mut creator, &group.group_id, &[0x99; 32], 10,)
@@ -3015,14 +3132,89 @@ mod tests {
                 .clear_pending_commit(provider.storage())
                 .expect("test should clear its intentionally forged local pending Commit");
         }
+        creator
+            .execute_batch(
+                "CREATE TRIGGER force_mls_recipient_failure
+                 BEFORE INSERT ON local_mls_commit_recipients
+                 BEGIN SELECT RAISE(ABORT, 'simulated recipient ledger failure'); END;",
+            )
+            .expect("test should install a Commit recipient ledger failure");
+        assert!(
+            add_mls_group_member_in(
+                &mut creator,
+                &group.group_id,
+                &another_package.public_bytes,
+                &creator_identity,
+            )
+            .is_err()
+        );
+        let (epoch_after_recipient_failure, recipient_rows): (i64, i64) = creator
+            .query_row(
+                "SELECT (SELECT epoch FROM local_mls_groups WHERE group_id = ?1),
+                        (SELECT COUNT(*) FROM local_mls_commit_recipients)",
+                [&group.group_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("group and recipient ledger should remain queryable after rollback");
+        assert_eq!((epoch_after_recipient_failure, recipient_rows), (1, 0));
+        creator
+            .execute_batch("DROP TRIGGER force_mls_recipient_failure;")
+            .expect("test should remove recipient ledger failure");
+
         let second_admission = add_mls_group_member_in(
             &mut creator,
             &group.group_id,
             &another_package.public_bytes,
             &creator_identity,
-        )
-        .expect("designated committer should generate the next membership Commit");
+        );
+        assert_eq!(second_admission.as_ref().unwrap().epoch, 2);
+        let second_admission = second_admission
+            .expect("designated committer should generate the next membership Commit");
         assert_eq!(second_admission.epoch, 2);
+        assert_eq!(
+            second_admission.commit_event_id.as_slice(),
+            &blake3::hash(&second_admission.commit).as_bytes()[..16]
+        );
+        let invitee_device = invitee_identity.verifying_key().to_bytes();
+        let recipient_commits =
+            list_queued_mls_commits_for_peer_in(&mut creator, &group.group_id, &invitee_device, 10)
+                .expect("predecessor member should receive the next Commit");
+        assert_eq!(recipient_commits.len(), 1);
+        assert_eq!(
+            recipient_commits[0].event_id,
+            second_admission.commit_event_id
+        );
+        mark_mls_commit_delivered_in(
+            &mut creator,
+            second_admission.commit_event_id,
+            invitee_device,
+        )
+        .expect("recipient ACK should persist in the delivery ledger");
+        mark_mls_commit_delivered_in(
+            &mut creator,
+            second_admission.commit_event_id,
+            invitee_device,
+        )
+        .expect("duplicate recipient ACK should be idempotent");
+        drop(creator);
+        let mut creator = open_database(&creator_path, &creator_key)
+            .expect("recipient ACK ledger should survive an encrypted database reopen");
+        assert!(list_queued_mls_commits_for_peer_in(
+            &mut creator,
+            &group.group_id,
+            &invitee_device,
+            10,
+        )
+        .unwrap()
+        .is_empty());
+        assert!(
+            mark_mls_commit_delivered_in(
+                &mut creator,
+                second_admission.commit_event_id,
+                [0x99; 32],
+            )
+            .is_err()
+        );
         let inbound_envelope = crate::peer::MlsCommitEnvelope {
             event_id: second_admission.commit_event_id,
             author_device: creator_public_key,
