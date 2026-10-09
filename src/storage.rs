@@ -2839,6 +2839,9 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
     prepare_database_file(path)?;
     let mut connection = Connection::open(path)
         .map_err(|error| format!("could not open local profile database: {error}"))?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|error| format!("could not configure local database lock wait: {error}"))?;
     let key_hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
     connection
         .execute_batch(&format!(
@@ -4002,19 +4005,55 @@ mod tests {
         .expect_err("a non-designated member must not create the group Commit");
         assert!(unauthorized.contains("designated MLS committer"));
 
-        let equivocation = process_inbound_mls_commit_in(
-            &mut invitee,
-            &group.group_id,
-            &conflicting_commit,
-            &invitee_identity,
-        )
-        .expect("valid conflicting Commit should trigger authenticated equivocation");
-        assert_eq!(
-            equivocation,
-            ProcessedMlsCommit::EquivocationDetected {
-                predecessor_epoch: 1
-            }
+        drop(invitee);
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let delivery_attempts = [
+            (second_admission.commit.clone(), start.clone()),
+            (conflicting_commit.clone(), start.clone()),
+        ];
+        let outcomes = delivery_attempts.map(|(commit, barrier)| {
+            let path = invitee_path.clone();
+            let group_id = group.group_id.clone();
+            std::thread::spawn(move || {
+                let mut connection = open_database(&path, &[0x52; PROFILE_DB_KEY_LEN])
+                    .expect("concurrent delivery connection should open");
+                barrier.wait();
+                process_inbound_mls_commit_in(
+                    &mut connection,
+                    &group_id,
+                    &commit,
+                    &SigningKey::from_bytes(&[0x54; 32]),
+                )
+            })
+        });
+        start.wait();
+        let outcomes = outcomes.map(|thread| {
+            thread
+                .join()
+                .expect("concurrent Commit processing should not panic")
+        });
+        assert!(
+            outcomes.iter().any(|outcome| matches!(
+                outcome,
+                Ok(ProcessedMlsCommit::EquivocationDetected {
+                    predecessor_epoch: 1
+                })
+            )),
+            "concurrent valid conflict must be authenticated and recorded"
         );
+        assert!(
+            outcomes.iter().all(|outcome| match outcome {
+                Ok(ProcessedMlsCommit::Duplicate { epoch: 2 })
+                | Ok(ProcessedMlsCommit::EquivocationDetected {
+                    predecessor_epoch: 1,
+                }) => true,
+                Err(error) => error.contains("quarantined"),
+                _ => false,
+            }),
+            "concurrent redelivery may be accepted before quarantine or rejected after it"
+        );
+        let mut invitee = open_database(&invitee_path, &invitee_key)
+            .expect("concurrent quarantine database should reopen");
         let (quarantined, evidence_count, current_epoch): (i64, i64, i64) = invitee
             .query_row(
                 "SELECT quarantined,

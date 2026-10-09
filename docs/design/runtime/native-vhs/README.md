@@ -38,7 +38,8 @@ device-bound group admission, encrypted messaging, ordered Commit recovery, and
 authenticated conflicting Commits. The equivocation test confirms that the
 valid conflicting Commit is verified against a saved historical epoch, evidence
 and quarantine persist, the accepted epoch is unchanged, and outbound MLS
-messages are blocked.
+messages are blocked. It also races an exact redelivery against that conflict
+through independent database connections and verifies the same durable result.
 
 The familiar-screen capture was refreshed after adding the core's signed
 device-to-MLS key binding primitive. The chat capture now shows the per-peer

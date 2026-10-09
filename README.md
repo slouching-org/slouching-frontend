@@ -156,7 +156,9 @@ both Commit values in the encrypted database, and quarantines that group on
 the device. Its accepted epoch remains intact, and reopening the group restores
 the visible security alert. MLS message creation, event retries, member admission,
 and Commit delivery or manual application are blocked until a recovery or rekey
-flow is implemented.
+flow is implemented. Regression coverage runs an exact redelivery and valid
+conflict simultaneously through two independent SQLite connections; the group
+ends quarantined at its accepted epoch without a transient lock failure.
 
 The eleven design-board views and additional MLS screen are captured in [native-vhs](docs/design/runtime/native-vhs/).
 These are a first implementation of the visual direction, with comparison
