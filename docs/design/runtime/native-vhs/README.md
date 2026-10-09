@@ -26,6 +26,9 @@ The encrypted database initializes OpenMLS's versioned SQLite storage schema
 through the same SQLCipher connection. No MLS client state, credentials, key
 packages, or groups are created yet.
 
+The storage migration test uses a temporary SQLCipher database and confirms
+that opening it twice preserves the OpenMLS schema.
+
 The home view keeps the supplied night scenery and call controls, with an
 icon-based feature strip. Its frog mage and gnome foreground cutouts have been
 removed to keep the scene open.

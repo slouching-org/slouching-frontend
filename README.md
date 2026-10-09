@@ -72,6 +72,8 @@ The same SQLCipher database now initializes the OpenMLS SQLite provider's
 versioned storage schema. This is only a persistence foundation: the app does
 not yet create an MLS provider/client, credentials, key packages, groups, or
 persist live MLS state. MLS remains unconnected to the event journal and UI.
+A storage test verifies the encrypted schema and repeats both migrations
+successfully against a temporary database.
 
 ![Native familiar screen showing local profile and identity keyring status, with a retry action when the system keyring is unavailable](docs/design/runtime/native-vhs/01-familiar.png)
 

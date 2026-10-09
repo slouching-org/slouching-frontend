@@ -693,3 +693,45 @@ fn restrict_directory_permissions(path: &Path) -> Result<(), String> {
     let _ = path;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn encrypted_database_migrates_openmls_storage_idempotently() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-openmls-storage-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary database directory should be created");
+        let path = directory.join("profile.sqlite3");
+        let key = [0x5a; PROFILE_DB_KEY_LEN];
+
+        for _ in 0..2 {
+            let connection = open_database(&path, &key)
+                .expect("encrypted profile and OpenMLS migrations should succeed");
+            let cipher_version: String = connection
+                .query_row("PRAGMA cipher_version", [], |row| row.get(0))
+                .expect("database should use SQLCipher");
+            assert!(!cipher_version.is_empty());
+
+            let openmls_table_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'openmls_signature_keys'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("OpenMLS signature-key table should be queryable");
+            assert_eq!(openmls_table_count, 1);
+        }
+
+        fs::remove_dir_all(directory).expect("temporary database files should be removed");
+    }
+}
