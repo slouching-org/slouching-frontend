@@ -87,13 +87,17 @@ SQLCipher encrypted SQLite; the database key is stored in the operating system
 credential store. Saving fails closed when that store is unavailable. The
 screen can also explicitly create and retain an Ed25519 device signing key in
 the system credential store. It displays the public key as unverified; no
-fingerprint format, contact pairing, or MLS group is implemented. The core can
+fingerprint format or contact pairing is implemented. The core can
 sign a versioned binding from that durable device key to an MLS signing public
 key, including its signature-scheme code, without returning the private seed.
 It can now create a one-use OpenMLS KeyPackage whose BasicCredential carries
 that binding; OpenMLS stores its private bundle in the encrypted database and
 returns only the public package bytes. No UI flow publishes or consumes
-KeyPackages yet, and there is no trusted contact roster. The direct-LAN screen
+KeyPackages yet, and there is no trusted contact roster. The core can also
+create and persist a local single-member MLS group with this device as its
+creator and designated committer. The UI does not expose group creation or
+invitation, and adding members, processing Welcome messages, and MLS messaging
+are not implemented. The direct-LAN screen
 manually pins device public keys separately. The local profile remains
 separate from that key. Character scenes, call views, and design-board examples
 remain visual previews. The dedicated chat screen shows only real direct-LAN
@@ -113,16 +117,19 @@ journal; MLS and durable inbox/outbox UI remain unimplemented.
 
 Opening the same SQLCipher database now composes OpenMLS RustCrypto with the
 SQLite storage provider and initializes its versioned schema. The event
-journal is not yet connected to MLS or the UI. MLS groups, Welcome processing,
-protected application messages, and live group state remain unimplemented.
+journal is not yet connected to MLS or the UI. The core can create and persist
+a local single-member group and index its creator as designated committer.
+There is no UI group flow, member addition, Welcome processing, protected
+application messaging, or event delivery integration.
 A caller can explicitly create or load a distinct MLS signing key for a
 chosen OpenMLS ciphersuite. Its public key is signed by the long-term device
 identity and the MLS key is stored in the encrypted database. Repeated calls
 reuse the key. The core also creates a one-use KeyPackage that embeds the
 device-signed binding in its BasicCredential and stores its private bundle in
-SQLCipher. A test validates the exported public package with OpenMLS and checks
-that the private bundle was persisted. This does not create a group, publish a
-package to a peer, or establish trust by itself.
+SQLCipher. Tests validate the exported public package and persisted private
+bundle, and verify that a single-member group reloads with its device-bound
+credential and creator index. These local primitives do not publish a package
+to a peer or establish trust by themselves.
 
 ![Actual refreshed 1280 × 800 native Iced familiar screen from this transport milestone; Secret Service is unavailable in this capture](docs/design/runtime/native-vhs/01-familiar.png)
 

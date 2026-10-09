@@ -3,8 +3,8 @@ use directories::ProjectDirs;
 use ed25519_dalek::SigningKey;
 use keyring::{Entry, Error as KeyringError};
 use openmls::prelude::{
-    BasicCredential, Ciphersuite, CredentialWithKey, KeyPackage, OpenMlsProvider,
-    tls_codec::Serialize as TlsCodecSerialize,
+    BasicCredential, Ciphersuite, CredentialWithKey, GroupId, KeyPackage, MlsGroup,
+    MlsGroupCreateConfig, OpenMlsProvider, tls_codec::Serialize as TlsCodecSerialize,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
@@ -22,7 +22,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 4;
+const PROFILE_SCHEMA_VERSION: u32 = 5;
 type StoredEventEnvelope = (
     Vec<u8>,
     Vec<u8>,
@@ -131,6 +131,14 @@ pub struct PreparedMlsKeyPackage {
     pub credential_binding: MlsSigningKeyBinding,
     /// Public MLS KeyPackage bytes; the corresponding private bundle stays in SQLCipher.
     pub public_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedMlsGroup {
+    pub group_id: Vec<u8>,
+    pub ciphersuite: u16,
+    pub epoch: u64,
+    pub designated_committer_device: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
@@ -659,6 +667,97 @@ fn create_mls_key_package_in(
     })
 }
 
+/// Create and persist a single-member MLS group locally. The device that creates
+/// it is recorded as its designated committer; no invitation or network message
+/// is produced by this operation.
+pub fn create_mls_group(ciphersuite: Ciphersuite) -> Result<CreatedMlsGroup, String> {
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let device_identity = signing_key_from_secret(secret)?;
+    let mut connection = open_local_database()?;
+    create_mls_group_in(&mut connection, ciphersuite, &device_identity)
+}
+
+fn create_mls_group_in(
+    connection: &mut Connection,
+    ciphersuite: Ciphersuite,
+    device_identity: &SigningKey,
+) -> Result<CreatedMlsGroup, String> {
+    let binding =
+        create_or_load_mls_signing_key_binding_in(connection, ciphersuite, device_identity)?;
+    let credential_identity = binding
+        .to_bytes()
+        .ok_or_else(|| "MLS credential binding could not be encoded".to_owned())?;
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| format!("could not begin MLS group transaction: {error}"))?;
+
+    let result = (|| {
+        let (created_group, group_id) = {
+            let provider = LocalOpenMlsProvider::new(connection);
+            let signer = SignatureKeyPair::read(
+                provider.storage(),
+                &binding.mls_signing_public_key,
+                ciphersuite.signature_algorithm(),
+            )
+            .ok_or_else(|| "persisted MLS signing key could not be loaded".to_owned())?;
+            let credential = BasicCredential::new(credential_identity);
+            let credential_with_key = CredentialWithKey {
+                credential: credential.into(),
+                signature_key: binding.mls_signing_public_key.clone().into(),
+            };
+            let group_id = GroupId::random(provider.rand());
+            let config = MlsGroupCreateConfig::builder()
+                .ciphersuite(ciphersuite)
+                .build();
+            let group = MlsGroup::new_with_group_id(
+                &provider,
+                &signer,
+                &config,
+                group_id.clone(),
+                credential_with_key,
+            )
+            .map_err(|error| format!("could not create local MLS group: {error:?}"))?;
+            let created_group = CreatedMlsGroup {
+                group_id: group.group_id().to_vec(),
+                ciphersuite: ciphersuite as u16,
+                epoch: group.epoch().as_u64(),
+                designated_committer_device: binding.device_public_key,
+            };
+            (created_group, group_id.to_vec())
+        };
+        connection
+            .execute(
+                "INSERT INTO local_mls_groups
+                    (group_id, ciphersuite, designated_committer_device, epoch)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    group_id,
+                    ciphersuite as u16,
+                    binding.device_public_key.as_slice(),
+                    created_group.epoch as i64
+                ],
+            )
+            .map_err(|error| format!("could not index local MLS group: {error}"))?;
+        Ok(created_group)
+    })();
+
+    match result {
+        Ok(group) => {
+            connection
+                .execute_batch("COMMIT")
+                .map_err(|error| format!("could not commit local MLS group: {error}"))?;
+            Ok(group)
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 fn create_or_load_mls_signing_key_binding_in(
     connection: &mut Connection,
     ciphersuite: Ciphersuite,
@@ -877,6 +976,20 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
                  PRAGMA user_version = 4;",
             )
             .map_err(|error| format!("could not create local MLS signing-key index: {error}"))?;
+    }
+    if version < 5 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE local_mls_groups (
+                     group_id BLOB PRIMARY KEY NOT NULL CHECK (length(group_id) = 16),
+                     ciphersuite INTEGER NOT NULL CHECK (ciphersuite BETWEEN 1 AND 65535),
+                     designated_committer_device BLOB NOT NULL
+                         CHECK (length(designated_committer_device) = 32),
+                     epoch INTEGER NOT NULL CHECK (epoch >= 0)
+                 );
+                 PRAGMA user_version = 5;",
+            )
+            .map_err(|error| format!("could not create local MLS group index: {error}"))?;
     }
     transaction
         .commit()
@@ -1131,6 +1244,68 @@ mod tests {
             })
             .expect("OpenMLS private KeyPackage bundle should be stored in SQLCipher");
         assert_eq!(private_bundle_count, 1);
+
+        drop(connection);
+        fs::remove_dir_all(directory).expect("temporary database files should be removed");
+    }
+
+    #[test]
+    fn local_mls_group_persists_creator_as_designated_committer() {
+        use openmls::prelude::{Ciphersuite, GroupId, MlsGroup};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-mls-group-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary database directory should be created");
+        let path = directory.join("profile.sqlite3");
+        let database_key = [0x2d; PROFILE_DB_KEY_LEN];
+        let device_identity = SigningKey::from_bytes(&[0x4f; 32]);
+        let device_public_key = device_identity.verifying_key().to_bytes();
+        let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+
+        let mut connection = open_database(&path, &database_key)
+            .expect("temporary database should initialize with SQLCipher and OpenMLS");
+        let created = create_mls_group_in(&mut connection, ciphersuite, &device_identity)
+            .expect("single-member group should be created and persisted");
+        assert_eq!(created.ciphersuite, ciphersuite as u16);
+        assert_eq!(created.epoch, 0);
+        assert_eq!(created.designated_committer_device, device_public_key);
+        assert_eq!(created.group_id.len(), 16);
+
+        let (indexed_ciphersuite, indexed_committer, indexed_epoch): (i64, Vec<u8>, i64) =
+            connection
+                .query_row(
+                    "SELECT ciphersuite, designated_committer_device, epoch
+                     FROM local_mls_groups WHERE group_id = ?1",
+                    [&created.group_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("local group policy row should be indexed");
+        assert_eq!(indexed_ciphersuite, i64::from(ciphersuite as u16));
+        assert_eq!(indexed_committer, device_public_key);
+        assert_eq!(indexed_epoch, 0);
+
+        {
+            let provider = LocalOpenMlsProvider::new(&mut connection);
+            let group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&created.group_id))
+                .expect("OpenMLS group state should load")
+                .expect("created group should be present in OpenMLS storage");
+            assert_eq!(group.epoch().as_u64(), created.epoch);
+            assert_eq!(group.members().count(), 1);
+            let credential = group
+                .members()
+                .next()
+                .expect("single-member group should have its creator")
+                .credential;
+            let binding = MlsSigningKeyBinding::from_bytes(credential.serialized_content())
+                .expect("creator credential should contain the signed device binding");
+            assert!(binding.verify(&device_public_key));
+        }
 
         drop(connection);
         fs::remove_dir_all(directory).expect("temporary database files should be removed");
