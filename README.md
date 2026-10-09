@@ -83,12 +83,17 @@ widgets, original characters and scenery, extracted outline SVG icons,
 Bricolage Grotesque and JetBrains Mono, translucent panels, scanlines, and
 vignette. The top-right **Telas** button opens the screen gallery.
 
-An additional **Grupo MLS · local** screen exposes two-device group setup:
-create the group on one device; generate a KeyPackage on the other; exchange
-it with the group committer; then exchange Welcome and ratchet tree back to the
-joining device. The screen copies each public artifact and accepts pasted hex.
-Use a trusted channel for this exchange. MLS messages are not yet sent over the
-network or shown in the chat UI.
+An additional **Grupo MLS** screen supports manual two-device group setup:
+create the group on one device, exchange the invitee KeyPackage over a trusted
+channel, then return the Welcome and ratchet tree to the joining device. After
+both devices join, open **Texto direto · LAN** and connect them using the usual
+pinned-key and LAN-address flow. In **Grupo MLS**, select the same group ID on
+both devices; MLS messages are encrypted and sent over that active direct
+Iroh/QUIC session. The receiver validates the MLS event and stores its
+ciphertext, ratchet update, and plaintext transcript in SQLCipher before
+sending the transport ACK. The sender marks the outbox event held by the peer
+only after that ACK. The transcript reloads locally, and **Reenviar pendentes**
+sends queued events for the selected group after reconnecting.
 
 Familiar selection, invitation/draft fields, screen navigation, settings
 tabs, illustrative share-source selection, and interface texture work locally.
@@ -97,60 +102,14 @@ SQLCipher encrypted SQLite; the database key is stored in the operating system
 credential store. Saving fails closed when that store is unavailable. The
 screen can also explicitly create and retain an Ed25519 device signing key in
 the system credential store. It displays the public key as unverified; no
-fingerprint format or contact pairing is implemented. The core can
-sign a versioned binding from that durable device key to an MLS signing public
-key, including its signature-scheme code, without returning the private seed.
-It can now create a one-use OpenMLS KeyPackage whose BasicCredential carries
-that binding; OpenMLS stores its private bundle in the encrypted database and
-returns only the public package bytes. There is no directory or trusted
-contact roster. The core can also
-create and persist a local single-member MLS group with this device as its
-creator and designated committer. The core can admit a device-bound KeyPackage,
-merge its Commit into local group state, return Commit/Welcome/ratchet-tree
-bytes, and process the invitee's Welcome against its locally stored private
-package. The core encrypts MLS application payloads and atomically persists
-the serialized message in the queued outbox alongside the MLS ratchet update.
-Inbound processing authenticates the sender binding and event metadata, stores
-ciphertext before returning plaintext, and deduplicates exact redelivery in the
-same SQLCipher transaction as the MLS ratchet update. Two-database tests verify
-delivery, deduplication, and rejection without partial state. The Iced UI now
-exposes local group creation, KeyPackage exchange, admission, and Welcome
-processing. Network delivery and MLS chat presentation remain unimplemented. The direct-LAN screen
-manually pins device public keys separately. The local profile remains
-separate from that key. Character scenes, call views, and design-board examples
-remain visual previews. The dedicated chat screen shows only real direct-LAN
-messages for its current session. No camera, microphone, or screen is captured. **Rede &
-P2P** in Settings retains the real Elixir HTTP/WebSocket diagnostics and
-manual refresh. On Linux, this uses Secret Service, so a desktop password
-vault must be installed and available in the user session.
-
-The encrypted local database has a bounded event journal. OpenMLS outbound
-and inbound application processing updates its ratchet and writes the opaque
-event in one SQLCipher transaction. Exact event redelivery is deduplicated and
-envelope conflicts are rejected. No transport or authenticated remote receipt
-feeds the delivery states yet. The direct-LAN transcript remains in a separate
-per-peer table, and MLS messages have no chat UI.
-
-Opening the same SQLCipher database now composes OpenMLS RustCrypto with the
-SQLite storage provider and initializes its versioned schema. The event
-journal receives encrypted MLS application messages on send and receive, but
-is not connected to the UI or a delivery transport. Inbound processing
-authenticates event metadata and sender credentials, persists before returning
-plaintext, and safely deduplicates exact redelivery. The core creates and persists a
-local group and indexes its creator as designated committer. The additional
-MLS setup screen admits a device-bound KeyPackage, merges its Commit into local
-state, copies Welcome/ratchet-tree bytes, and processes a Welcome on the joining
-client. There is no network event delivery integration.
-A caller can explicitly create or load a distinct MLS signing key for a
-chosen OpenMLS ciphersuite. Its public key is signed by the long-term device
-identity and the MLS key is stored in the encrypted database. Repeated calls
-reuse the key. The core also creates a one-use KeyPackage that embeds the
-device-signed binding in its BasicCredential and stores its private bundle in
-SQLCipher. Tests validate the exported public package and persisted private
-bundle, verify that a single-member group reloads with its device-bound
-credential and creator index, and exercise admission/Welcome processing with
-two isolated encrypted databases. These local primitives do not distribute
-Commit or Welcome messages or establish a user-approved contact relationship.
+fingerprint format or contact pairing is implemented. OpenMLS credentials
+include a versioned binding signed by the durable device key. One-use
+KeyPackages and private MLS state are stored in SQLCipher. The direct-LAN
+screen separately pins device public keys. Character scenes and call views
+remain visual previews. No camera, microphone, or screen is captured. **Rede &
+P2P** in Settings retains the Elixir HTTP/WebSocket diagnostics and manual
+refresh. On Linux, this uses Secret Service, so a desktop password vault must
+be installed and available in the user session.
 
 ![Actual refreshed 1280 × 800 native Iced familiar screen from this transport milestone; Secret Service is unavailable in this capture](docs/design/runtime/native-vhs/01-familiar.png)
 
@@ -160,7 +119,7 @@ Commit or Welcome messages or establish a user-approved contact relationship.
 
 ![Actual native Iced group-call preview; media and sample messages are illustrative](docs/design/runtime/native-vhs/10-call.png)
 
-![Actual native Iced MLS group setup screen; idle capture without a created group](docs/design/runtime/native-vhs/11-mls.png)
+![Actual native Iced MLS group and chat screen; idle capture without a created group](docs/design/runtime/native-vhs/11-mls.png)
 
 The eleven design-board views and additional MLS screen are captured in [native-vhs](docs/design/runtime/native-vhs/).
 These are a first implementation of the visual direction, with comparison

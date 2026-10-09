@@ -156,13 +156,20 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
     let mut events = Box::pin(session.run(command_rx));
     let event_pump = tokio::spawn(async move {
         while let Some(event) = events.next().await {
-            if let peer::PeerEvent::Received { sequence, text } = &event
-                && text != UNACKNOWLEDGED_TEXT
-            {
+            let sequence_to_ack = match &event {
+                peer::PeerEvent::Received { sequence, text } if text != UNACKNOWLEDGED_TEXT => {
+                    Some(*sequence)
+                }
+                peer::PeerEvent::MlsEventReceived { sequence, event }
+                    if event.event_id[0] != 0xfe =>
+                {
+                    Some(*sequence)
+                }
+                _ => None,
+            };
+            if let Some(sequence) = sequence_to_ack {
                 ack_commands
-                    .send(peer::PeerCommand::AcceptInbound {
-                        sequence: *sequence,
-                    })
+                    .send(peer::PeerCommand::AcceptInbound { sequence })
                     .await
                     .expect("session command receiver should remain open");
             }
@@ -181,9 +188,22 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
             .await
             .expect("session should accept outgoing messages");
     }
+    command_tx
+        .send(peer::PeerCommand::SendMlsEvent {
+            request_id: 100,
+            event: mls_event_for(role, 100),
+        })
+        .await
+        .expect("session should accept an opaque MLS event");
     let mut acknowledged = HashSet::new();
     let mut received = HashSet::new();
-    while acknowledged.len() < MESSAGE_COUNT as usize || received.len() < MESSAGE_COUNT as usize {
+    let mut event_acknowledged = false;
+    let mut event_received = false;
+    while acknowledged.len() < MESSAGE_COUNT as usize
+        || received.len() < MESSAGE_COUNT as usize
+        || !event_acknowledged
+        || !event_received
+    {
         let event = tokio::time::timeout(Duration::from_secs(15), event_rx.recv())
             .await
             .expect("session should exchange messages and ACKs")
@@ -193,6 +213,11 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
             peer::PeerEvent::Acknowledged { request_id, text } => {
                 assert_eq!(text, format!("from-{role}-{request_id}"));
                 assert!(acknowledged.insert(request_id), "duplicate ACK");
+            }
+            peer::PeerEvent::MlsEventAcknowledged { request_id } => {
+                assert_eq!(request_id, 100);
+                assert!(!event_acknowledged, "duplicate MLS event ACK");
+                event_acknowledged = true;
             }
             peer::PeerEvent::Received { sequence, text } => {
                 let expected_role = if role == "listener" {
@@ -206,11 +231,27 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 );
                 assert!(received.insert(sequence), "duplicate receive sequence");
             }
+            peer::PeerEvent::MlsEventReceived { sequence, event } => {
+                let expected_role = if role == "listener" {
+                    "sender"
+                } else {
+                    "listener"
+                };
+                assert_eq!(event, mls_event_for(expected_role, 100));
+                assert!(received.insert(sequence), "duplicate receive sequence");
+                event_received = true;
+            }
             peer::PeerEvent::Rejected { reason, .. } => {
                 panic!("message was unexpectedly rejected: {reason}")
             }
+            peer::PeerEvent::MlsEventRejected { reason, .. } => {
+                panic!("MLS event was unexpectedly rejected: {reason}")
+            }
             peer::PeerEvent::DeliveryUnknown { .. } | peer::PeerEvent::Unauthorized { .. } => {
                 panic!("session failed before completing the expected messages")
+            }
+            peer::PeerEvent::MlsEventDeliveryUnknown { .. } => {
+                panic!("MLS event delivery unexpectedly became unknown")
             }
             peer::PeerEvent::Disconnected { reason } => {
                 panic!("session disconnected before exchange completed: {reason}")
@@ -227,12 +268,20 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
             .await
             .expect("session should accept the pending message");
         command_tx
+            .send(peer::PeerCommand::SendMlsEvent {
+                request_id: 101,
+                event: mls_event_for(role, 101),
+            })
+            .await
+            .expect("session should accept a pending MLS event");
+        command_tx
             .send(peer::PeerCommand::Disconnect)
             .await
             .expect("session should accept explicit disconnect");
         let mut got_unknown = false;
+        let mut got_mls_unknown = false;
         let mut got_disconnected = false;
-        while !got_unknown || !got_disconnected {
+        while !got_unknown || !got_mls_unknown || !got_disconnected {
             match tokio::time::timeout(Duration::from_secs(12), event_rx.recv())
                 .await
                 .expect("disconnect should resolve")
@@ -244,10 +293,18 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                     got_unknown = true;
                 }
                 peer::PeerEvent::Disconnected { .. } => got_disconnected = true,
+                peer::PeerEvent::MlsEventDeliveryUnknown { request_id } => {
+                    assert_eq!(request_id, 101);
+                    got_mls_unknown = true;
+                }
                 peer::PeerEvent::Received { text, .. } => {
                     assert_ne!(text, UNACKNOWLEDGED_TEXT);
                 }
-                peer::PeerEvent::Connected { .. } | peer::PeerEvent::Acknowledged { .. } => {}
+                peer::PeerEvent::Connected { .. }
+                | peer::PeerEvent::Acknowledged { .. }
+                | peer::PeerEvent::MlsEventAcknowledged { .. }
+                | peer::PeerEvent::MlsEventRejected { .. }
+                | peer::PeerEvent::MlsEventReceived { .. } => {}
                 peer::PeerEvent::Rejected { reason, .. } => {
                     panic!("unexpected rejection: {reason}")
                 }
@@ -269,9 +326,16 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 peer::PeerEvent::Disconnected { .. } => got_disconnected = true,
                 peer::PeerEvent::Connected { .. }
                 | peer::PeerEvent::Received { .. }
-                | peer::PeerEvent::Acknowledged { .. } => {}
+                | peer::PeerEvent::Acknowledged { .. }
+                | peer::PeerEvent::MlsEventAcknowledged { .. } => {}
+                peer::PeerEvent::MlsEventReceived { event, .. } if event.event_id[0] == 0xfe => {
+                    got_unacknowledged = true;
+                }
+                peer::PeerEvent::MlsEventReceived { .. } => {}
                 peer::PeerEvent::DeliveryUnknown { .. }
+                | peer::PeerEvent::MlsEventDeliveryUnknown { .. }
                 | peer::PeerEvent::Rejected { .. }
+                | peer::PeerEvent::MlsEventRejected { .. }
                 | peer::PeerEvent::Unauthorized { .. } => panic!("unexpected listener event"),
             }
         }
@@ -281,6 +345,24 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
         .await
         .expect("session event pump should shut down after endpoint close");
     println!("SESSION_COMPLETE {role}");
+}
+
+fn mls_event_for(role: &str, id: u8) -> peer::MlsEventEnvelope {
+    let seed = if role == "sender" {
+        SENDER_SEED
+    } else {
+        LISTENER_SEED
+    };
+    let event_id = if id == 101 { [0xfe; 16] } else { [id; 16] };
+    peer::MlsEventEnvelope {
+        event_id,
+        author_device: SigningKey::from_bytes(&seed).verifying_key().to_bytes(),
+        group_id: [0x44; 16].to_vec(),
+        epoch: 3,
+        checkpoint: Some(vec![0x45, id]),
+        expires_at_unix: 2_000_000_000,
+        ciphertext: format!("opaque MLS bytes {role} {id}").into_bytes(),
+    }
 }
 
 async fn assert_no_application_session(session: peer::DirectPeerSession) {
@@ -307,11 +389,19 @@ async fn assert_no_application_session(session: peer::DirectPeerSession) {
             peer::PeerEvent::Acknowledged { .. } | peer::PeerEvent::Received { .. } => {
                 panic!("wrong pinned device exchanged an application message")
             }
+            peer::PeerEvent::MlsEventReceived { .. }
+            | peer::PeerEvent::MlsEventAcknowledged { .. } => {
+                panic!("wrong pinned device exchanged an MLS event")
+            }
+            peer::PeerEvent::MlsEventRejected { .. } => {
+                panic!("wrong pinned device exchanged an MLS event")
+            }
             peer::PeerEvent::Disconnected { .. } => break,
             peer::PeerEvent::Connected { .. }
             | peer::PeerEvent::Rejected { .. }
             | peer::PeerEvent::Unauthorized { .. }
             | peer::PeerEvent::DeliveryUnknown { .. } => {}
+            peer::PeerEvent::MlsEventDeliveryUnknown { .. } => {}
         }
     }
     assert!(

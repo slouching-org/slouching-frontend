@@ -23,8 +23,9 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 6;
+const PROFILE_SCHEMA_VERSION: u32 = 7;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
+const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 type StoredEventEnvelope = (
     Vec<u8>,
     Vec<u8>,
@@ -97,7 +98,7 @@ impl OpenMlsCodec for OpenMlsJsonCodec {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptedEvent {
     pub event_id: [u8; 16],
     pub author_device: [u8; 32],
@@ -149,6 +150,14 @@ pub struct StoredDirectMessage {
     pub text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredMlsMessage {
+    pub sequence: i64,
+    pub event_id: [u8; 16],
+    pub direction: DirectMessageDirection,
+    pub text: String,
+}
+
 /// Saves a delivered direct-LAN message in the per-device SQLCipher database.
 pub fn store_direct_message(
     peer_device: [u8; 32],
@@ -175,6 +184,50 @@ pub fn list_direct_messages(
 pub fn clear_direct_history(peer_device: [u8; 32]) -> Result<usize, String> {
     let mut connection = open_local_database()?;
     clear_direct_history_in(&mut connection, peer_device)
+}
+
+pub fn list_mls_messages(group_id: &[u8], limit: usize) -> Result<Vec<StoredMlsMessage>, String> {
+    if group_id.len() != 16 || !(1..=500).contains(&limit) {
+        return Err("MLS history requires a 16-byte group and a page between 1 and 500".to_owned());
+    }
+    let connection = open_local_database()?;
+    list_mls_messages_in(&connection, group_id, limit)
+}
+
+fn list_mls_messages_in(
+    connection: &Connection,
+    group_id: &[u8],
+    limit: usize,
+) -> Result<Vec<StoredMlsMessage>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT sequence, event_id, direction, text FROM (
+                 SELECT sequence, event_id, direction, text FROM local_mls_messages
+                 WHERE group_id = ?1 ORDER BY sequence DESC LIMIT ?2
+             ) ORDER BY sequence ASC",
+        )
+        .map_err(|error| format!("could not prepare MLS history query: {error}"))?;
+    let rows = statement
+        .query_map(params![group_id, limit as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| format!("could not query MLS history: {error}"))?;
+    rows.map(|row| {
+        let (sequence, event_id, direction, text) =
+            row.map_err(|error| format!("could not read MLS history row: {error}"))?;
+        Ok(StoredMlsMessage {
+            sequence,
+            event_id: fixed_bytes(event_id, "MLS event id")?,
+            direction: DirectMessageDirection::try_from(direction.as_str())?,
+            text,
+        })
+    })
+    .collect()
 }
 
 fn clear_direct_history_in(
@@ -472,6 +525,8 @@ fn create_mls_application_event_in(
     if expires_at_unix <= 0 {
         return Err("MLS application event expiry must be a positive Unix timestamp".to_owned());
     }
+    let plaintext_text = std::str::from_utf8(plaintext)
+        .map_err(|_| "MLS chat text must be valid UTF-8".to_owned())?;
     let author_device = device_identity.verifying_key().to_bytes();
     let group_id = GroupId::from_slice(group_id);
     connection
@@ -556,6 +611,13 @@ fn create_mls_application_event_in(
             .map_err(|error| {
                 format!("could not persist MLS ciphertext in local outbox: {error}")
             })?;
+        insert_mls_history_in(
+            connection,
+            &event.group_id,
+            event.event_id,
+            "sent",
+            plaintext_text,
+        )?;
         Ok(PreparedMlsApplicationEvent {
             event,
             wire_message,
@@ -712,6 +774,11 @@ fn process_inbound_mls_application_event_in(
         {
             return Err("authenticated MLS message does not match its event envelope".to_owned());
         }
+        let plaintext_text = String::from_utf8(plaintext.clone())
+            .map_err(|_| "MLS chat message is not valid UTF-8".to_owned())?;
+        if plaintext_text.is_empty() || plaintext_text.len() > 16 * 1024 {
+            return Err("MLS chat text must contain 1 to 16384 UTF-8 bytes".to_owned());
+        }
         connection
             .execute(
                 "INSERT INTO local_events
@@ -730,9 +797,43 @@ fn process_inbound_mls_application_event_in(
                 ],
             )
             .map_err(|error| format!("could not persist inbound MLS event: {error}"))?;
+        insert_mls_history_in(
+            connection,
+            &event.group_id,
+            event.event_id,
+            "received",
+            &plaintext_text,
+        )?;
         Ok(ProcessedMlsApplicationEvent::Received(plaintext))
     })();
     finish_sql_transaction(connection, result, "inbound MLS event")
+}
+
+fn insert_mls_history_in(
+    connection: &Connection,
+    group_id: &[u8],
+    event_id: [u8; 16],
+    direction: &'static str,
+    text: &str,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT INTO local_mls_messages (group_id, event_id, direction, text)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![group_id, event_id.as_slice(), direction, text],
+        )
+        .map_err(|error| format!("could not persist MLS local history: {error}"))?;
+    connection
+        .execute(
+            "DELETE FROM local_mls_messages
+             WHERE group_id = ?1 AND sequence NOT IN (
+                 SELECT sequence FROM local_mls_messages
+                 WHERE group_id = ?1 ORDER BY sequence DESC LIMIT ?2
+             )",
+            params![group_id, MAX_MLS_HISTORY_PER_GROUP],
+        )
+        .map_err(|error| format!("could not enforce MLS history limit: {error}"))?;
+    Ok(())
 }
 
 fn mls_event_aad(event: &EncryptedEvent) -> Vec<u8> {
@@ -1775,6 +1876,22 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
             )
             .map_err(|error| format!("could not create encrypted direct history: {error}"))?;
     }
+    if version < 7 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE local_mls_messages (
+                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                     group_id BLOB NOT NULL CHECK (length(group_id) = 16),
+                     event_id BLOB NOT NULL UNIQUE CHECK (length(event_id) = 16),
+                     direction TEXT NOT NULL CHECK (direction IN ('sent', 'received')),
+                     text TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) BETWEEN 1 AND 16384)
+                 );
+                 CREATE INDEX local_mls_messages_by_group
+                     ON local_mls_messages (group_id, sequence);
+                 PRAGMA user_version = 7;",
+            )
+            .map_err(|error| format!("could not create encrypted MLS message history: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -2371,6 +2488,11 @@ mod tests {
             .expect("ciphertext should be saved in the outbox");
         assert_eq!(queued.0, "queued");
         assert_eq!(queued.1, prepared.wire_message);
+        let sender_history = list_mls_messages_in(&sender, &group.group_id, 20)
+            .expect("outbound plaintext should persist in encrypted local history");
+        assert_eq!(sender_history.len(), 1);
+        assert_eq!(sender_history[0].direction, DirectMessageDirection::Sent);
+        assert_eq!(sender_history[0].text, "MLS application payload");
 
         let mut forged = prepared.event.clone();
         forged.event_id = [0x91; 16];
@@ -2416,6 +2538,14 @@ mod tests {
             )
             .expect("inbound ciphertext should be durable before returning plaintext");
         assert_eq!(inbound_count, 1);
+        let receiver_history = list_mls_messages_in(&receiver, &group.group_id, 20)
+            .expect("authenticated inbound plaintext should persist in encrypted history");
+        assert_eq!(receiver_history.len(), 1);
+        assert_eq!(
+            receiver_history[0].direction,
+            DirectMessageDirection::Received
+        );
+        assert_eq!(receiver_history[0].text, "MLS application payload");
         drop(receiver);
         drop(sender);
         fs::remove_dir_all(directory).expect("temporary databases should be removed");

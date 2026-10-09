@@ -195,6 +195,11 @@ struct Slouching {
     mls_welcome: String,
     mls_ratchet_tree: String,
     mls_status: String,
+    mls_message_draft: String,
+    mls_history: Vec<storage::StoredMlsMessage>,
+    mls_history_group: Option<Vec<u8>>,
+    mls_pending_events: std::collections::HashMap<u64, [u8; 16]>,
+    mls_next_request_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -311,6 +316,11 @@ impl Default for Slouching {
             mls_welcome: String::new(),
             mls_ratchet_tree: String::new(),
             mls_status: "Crie uma identidade do dispositivo para começar.".to_owned(),
+            mls_message_draft: String::new(),
+            mls_history: Vec::new(),
+            mls_history_group: None,
+            mls_pending_events: std::collections::HashMap::new(),
+            mls_next_request_id: 1,
         }
     }
 }
@@ -376,6 +386,19 @@ enum Message {
     JoinMlsGroup,
     MlsGroupJoined(Result<storage::JoinedMlsGroup, String>),
     CopyMlsValue(String),
+    MlsMessageDraftChanged(String),
+    MlsHistoryLoaded(Vec<u8>, Result<Vec<storage::StoredMlsMessage>, String>),
+    RetryQueuedMlsEvents,
+    MlsOutboxLoaded(Vec<u8>, Result<Vec<storage::StoredOutboundEvent>, String>),
+    SendMlsApplication,
+    MlsApplicationCreated(Result<storage::PreparedMlsApplicationEvent, String>),
+    MlsPeerCommandSent(u64, Result<(), String>),
+    MlsInboundProcessed(
+        u64,
+        peer::MlsEventEnvelope,
+        Result<storage::ProcessedMlsApplicationEvent, String>,
+    ),
+    MlsOutboundHeld(u64, [u8; 16], Result<(), String>),
 }
 
 fn update(state: &mut Slouching, message: Message) -> Task<Message> {
@@ -780,6 +803,48 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                             move |result| Message::PeerOutboundStored(request_id, text, result),
                         );
                     }
+                    peer::PeerEvent::MlsEventReceived { sequence, event } => {
+                        let stored_event = storage::EncryptedEvent {
+                            event_id: event.event_id,
+                            author_device: event.author_device,
+                            group_id: event.group_id.clone(),
+                            epoch: event.epoch,
+                            checkpoint: event.checkpoint.clone(),
+                            expires_at_unix: event.expires_at_unix,
+                            ciphertext: event.ciphertext.clone(),
+                        };
+                        return Task::perform(
+                            process_inbound_mls_application_task(stored_event),
+                            move |result| Message::MlsInboundProcessed(sequence, event, result),
+                        );
+                    }
+                    peer::PeerEvent::MlsEventAcknowledged { request_id } => {
+                        let Some(event_id) = state.mls_pending_events.get(&request_id).copied()
+                        else {
+                            state.mls_status =
+                                "ACK de um evento MLS desconhecido; sessão encerrada.".to_owned();
+                            if let Some(commands) = state.peer_session_commands.as_ref() {
+                                let _ = commands.try_send(peer::PeerCommand::Disconnect);
+                            }
+                            return Task::none();
+                        };
+                        return Task::perform(
+                            update_mls_outbound_state_task(event_id),
+                            move |result| Message::MlsOutboundHeld(request_id, event_id, result),
+                        );
+                    }
+                    peer::PeerEvent::MlsEventDeliveryUnknown { request_id } => {
+                        state.mls_pending_events.remove(&request_id);
+                        state.mls_status = format!(
+                            "Entrega MLS {request_id} desconhecida; o ciphertext continua no outbox para reenvio."
+                        );
+                    }
+                    peer::PeerEvent::MlsEventRejected { request_id, reason } => {
+                        state.mls_pending_events.remove(&request_id);
+                        state.mls_status = format!(
+                            "Evento continua no outbox e não entrou na fila de transporte: {reason}"
+                        );
+                    }
                     event => apply_peer_event(state, event),
                 },
                 PeerListenEvent::Failed(error) => {
@@ -907,7 +972,16 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.peer_send_status =
                 PeerSendStatus::Failed(format!("Não foi possível enviar na sessão: {error}"));
         }
-        Message::MlsGroupIdChanged(value) => state.mls_group_id = value,
+        Message::MlsGroupIdChanged(value) => {
+            state.mls_group_id = value;
+            state.mls_history.clear();
+            state.mls_history_group = None;
+            if let Ok(group_id) = hex_decode_bytes(&state.mls_group_id)
+                && group_id.len() == 16
+            {
+                return load_mls_history(state, group_id);
+            }
+        }
         Message::MlsKeyPackageChanged(value) => state.mls_key_package = value,
         Message::MlsInviteKeyPackageChanged(value) => state.mls_invite_key_package = value,
         Message::MlsWelcomeChanged(value) => state.mls_welcome = value,
@@ -927,6 +1001,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     "Grupo criado no epoch {}. Este dispositivo é o committer designado.",
                     group.epoch
                 );
+                return load_mls_history(state, group.group_id);
             }
             Err(error) => state.mls_status = format!("Falha ao criar grupo: {error}"),
         },
@@ -1005,10 +1080,226 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     "Grupo ingressado no epoch {}. O grupo e as chaves estão no SQLCipher local.",
                     group.epoch
                 );
+                return load_mls_history(state, group.group_id);
             }
             Err(error) => state.mls_status = format!("Falha ao ingressar no grupo: {error}"),
         },
         Message::CopyMlsValue(value) => return iced::clipboard::write(value),
+        Message::MlsMessageDraftChanged(value) => state.mls_message_draft = value,
+        Message::MlsHistoryLoaded(group_id, result) => {
+            if state.mls_history_group.as_deref() == Some(group_id.as_slice()) {
+                match result {
+                    Ok(messages) => state.mls_history = messages,
+                    Err(error) => {
+                        state.mls_status =
+                            format!("Não foi possível carregar histórico MLS: {error}");
+                    }
+                }
+            }
+        }
+        Message::RetryQueuedMlsEvents => {
+            if !matches!(state.peer_listen_status, PeerListenStatus::Connected) {
+                state.mls_status =
+                    "Conecte a sessão direta antes de reenviar eventos MLS pendentes.".to_owned();
+                return Task::none();
+            }
+            let Ok(group_id) = hex_decode_bytes(&state.mls_group_id) else {
+                state.mls_status =
+                    "Informe o ID do grupo MLS para procurar eventos pendentes.".to_owned();
+                return Task::none();
+            };
+            state.mls_status =
+                "Consultando outbox local para reenviar eventos pendentes…".to_owned();
+            return Task::perform(load_mls_outbox_task(), move |result| {
+                Message::MlsOutboxLoaded(group_id, result)
+            });
+        }
+        Message::MlsOutboxLoaded(group_id, result) => {
+            return match result {
+                Ok(events) => {
+                    let Some(commands) = state.peer_session_commands.clone() else {
+                        state.mls_status =
+                            "Sessão encerrada; os eventos seguem no outbox.".to_owned();
+                        return Task::none();
+                    };
+                    let mut sends = Vec::new();
+                    let available_slots = peer::MAX_PENDING_MESSAGES.saturating_sub(
+                        state.peer_pending_sends.len() + state.mls_pending_events.len(),
+                    );
+                    let pending_event_ids: std::collections::HashSet<_> =
+                        state.mls_pending_events.values().copied().collect();
+                    for stored in events
+                        .into_iter()
+                        .filter(|stored| {
+                            stored.state == storage::OutboundDeliveryState::Queued
+                                && stored.event.group_id == group_id
+                                && !pending_event_ids.contains(&stored.event.event_id)
+                        })
+                        .take(available_slots)
+                    {
+                        let request_id = state.mls_next_request_id;
+                        state.mls_next_request_id = state.mls_next_request_id.saturating_add(1);
+                        state
+                            .mls_pending_events
+                            .insert(request_id, stored.event.event_id);
+                        let event = peer::MlsEventEnvelope {
+                            event_id: stored.event.event_id,
+                            author_device: stored.event.author_device,
+                            group_id: stored.event.group_id,
+                            epoch: stored.event.epoch,
+                            checkpoint: stored.event.checkpoint,
+                            expires_at_unix: stored.event.expires_at_unix,
+                            ciphertext: stored.event.ciphertext,
+                        };
+                        let commands = commands.clone();
+                        sends.push(Task::perform(
+                            async move {
+                                commands
+                                    .send(peer::PeerCommand::SendMlsEvent { request_id, event })
+                                    .await
+                                    .map_err(|error| error.to_string())
+                            },
+                            move |result| Message::MlsPeerCommandSent(request_id, result),
+                        ));
+                    }
+                    if sends.is_empty() {
+                        state.mls_status = "Nenhuma mensagem MLS pendente neste grupo.".to_owned();
+                        Task::none()
+                    } else {
+                        state.mls_status =
+                            format!("Reenviando {} evento(s) MLS salvo(s)…", sends.len());
+                        Task::batch(sends)
+                    }
+                }
+                Err(error) => {
+                    state.mls_status = format!("Falha ao consultar o outbox MLS: {error}");
+                    Task::none()
+                }
+            };
+        }
+        Message::SendMlsApplication => {
+            if state.peer_session_commands.is_none()
+                || !matches!(state.peer_listen_status, PeerListenStatus::Connected)
+            {
+                state.mls_status =
+                    "Conecte ao dispositivo do grupo na tela Texto direto · LAN antes de enviar."
+                        .to_owned();
+                return Task::none();
+            }
+            let group_id = match hex_decode_bytes(&state.mls_group_id) {
+                Ok(group_id) if group_id.len() == 16 => group_id,
+                _ => {
+                    state.mls_status =
+                        "Informe o ID de um grupo MLS ingressado neste dispositivo.".to_owned();
+                    return Task::none();
+                }
+            };
+            let text = state.mls_message_draft.trim().to_owned();
+            if text.is_empty() || text.len() > 16 * 1024 {
+                state.mls_status =
+                    "A mensagem MLS precisa ter entre 1 e 16 KiB em UTF-8.".to_owned();
+                return Task::none();
+            }
+            state.mls_status = "Cifrando com OpenMLS e salvando no outbox local…".to_owned();
+            return Task::perform(
+                create_mls_application_task(group_id, text),
+                Message::MlsApplicationCreated,
+            );
+        }
+        Message::MlsApplicationCreated(result) => match result {
+            Ok(prepared) => {
+                let request_id = state.mls_next_request_id;
+                state.mls_next_request_id = state.mls_next_request_id.saturating_add(1);
+                state
+                    .mls_pending_events
+                    .insert(request_id, prepared.event.event_id);
+                let event = peer::MlsEventEnvelope {
+                    event_id: prepared.event.event_id,
+                    author_device: prepared.event.author_device,
+                    group_id: prepared.event.group_id.clone(),
+                    epoch: prepared.event.epoch,
+                    checkpoint: prepared.event.checkpoint,
+                    expires_at_unix: prepared.event.expires_at_unix,
+                    ciphertext: prepared.event.ciphertext,
+                };
+                state.mls_message_draft.clear();
+                state.mls_status =
+                    "Evento cifrado e salvo localmente; enviando pela sessão QUIC…".to_owned();
+                let Some(commands) = state.peer_session_commands.clone() else {
+                    state.mls_pending_events.remove(&request_id);
+                    state.mls_status =
+                        "Evento salvo no outbox local. Conecte ao peer e reenvie pendentes."
+                            .to_owned();
+                    return load_mls_history(state, event.group_id);
+                };
+                let group_id = event.group_id.clone();
+                return Task::batch([
+                    Task::perform(
+                        async move {
+                            commands
+                                .send(peer::PeerCommand::SendMlsEvent { request_id, event })
+                                .await
+                                .map_err(|error| error.to_string())
+                        },
+                        move |result| Message::MlsPeerCommandSent(request_id, result),
+                    ),
+                    Task::perform(load_mls_history_task(group_id.clone()), move |result| {
+                        Message::MlsHistoryLoaded(group_id, result)
+                    }),
+                ]);
+            }
+            Err(error) => {
+                state.mls_status = format!("Falha ao cifrar/salvar mensagem MLS: {error}")
+            }
+        },
+        Message::MlsPeerCommandSent(request_id, Ok(())) => {
+            state.mls_status = format!("Evento MLS {request_id} enviado; aguardando ACK do peer.");
+        }
+        Message::MlsPeerCommandSent(request_id, Err(error)) => {
+            state.mls_pending_events.remove(&request_id);
+            state.mls_status = format!("Evento salvo no outbox; falha ao iniciar envio: {error}");
+        }
+        Message::MlsInboundProcessed(sequence, event, result) => match result {
+            Ok(processed) => {
+                if let Some(commands) = state.peer_session_commands.as_ref() {
+                    let _ = commands.try_send(peer::PeerCommand::AcceptInbound { sequence });
+                }
+                state.mls_status = match processed {
+                    storage::ProcessedMlsApplicationEvent::Received(_) => {
+                        format!(
+                            "Mensagem MLS de {} recebida, autenticada e salva.",
+                            hex_encode_bytes(&event.author_device[..4])
+                        )
+                    }
+                    storage::ProcessedMlsApplicationEvent::Duplicate => {
+                        "Reenvio MLS idêntico já salvo; ACK confirmado sem reaplicar o ratchet."
+                            .to_owned()
+                    }
+                };
+                return load_mls_history(state, event.group_id);
+            }
+            Err(error) => {
+                state.mls_status = format!("Evento MLS recusado; ACK não enviado: {error}");
+                if let Some(commands) = state.peer_session_commands.as_ref() {
+                    let _ = commands.try_send(peer::PeerCommand::Disconnect);
+                }
+            }
+        },
+        Message::MlsOutboundHeld(request_id, event_id, result) => {
+            state.mls_pending_events.remove(&request_id);
+            match result {
+                Ok(()) => {
+                    state.mls_status = format!(
+                        "Peer confirmou que reteve o evento MLS {}.",
+                        hex_encode_bytes(&event_id[..4])
+                    );
+                }
+                Err(error) => {
+                    state.mls_status =
+                        format!("Peer confirmou o evento, mas o estado local falhou: {error}")
+                }
+            }
+        }
     }
     Task::none()
 }
@@ -1323,6 +1614,62 @@ fn hex_encode_bytes(bytes: &[u8]) -> String {
     encoded
 }
 
+fn load_mls_history(state: &mut Slouching, group_id: Vec<u8>) -> Task<Message> {
+    state.mls_history_group = Some(group_id.clone());
+    Task::perform(load_mls_history_task(group_id.clone()), move |result| {
+        Message::MlsHistoryLoaded(group_id, result)
+    })
+}
+
+async fn load_mls_history_task(
+    group_id: Vec<u8>,
+) -> Result<Vec<storage::StoredMlsMessage>, String> {
+    tokio::task::spawn_blocking(move || storage::list_mls_messages(&group_id, 200))
+        .await
+        .map_err(|error| format!("MLS history task failed: {error}"))?
+}
+
+async fn load_mls_outbox_task() -> Result<Vec<storage::StoredOutboundEvent>, String> {
+    tokio::task::spawn_blocking(|| storage::list_outbound_events(0, 500))
+        .await
+        .map_err(|error| format!("MLS outbox task failed: {error}"))?
+}
+
+async fn create_mls_application_task(
+    group_id: Vec<u8>,
+    text: String,
+) -> Result<storage::PreparedMlsApplicationEvent, String> {
+    let expires_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("system clock is invalid: {error}"))?
+        .as_secs()
+        .saturating_add(30 * 24 * 60 * 60) as i64;
+    tokio::task::spawn_blocking(move || {
+        storage::create_mls_application_event(&group_id, text.as_bytes(), expires_at_unix)
+    })
+    .await
+    .map_err(|error| format!("MLS application encryption task failed: {error}"))?
+}
+
+async fn process_inbound_mls_application_task(
+    event: storage::EncryptedEvent,
+) -> Result<storage::ProcessedMlsApplicationEvent, String> {
+    tokio::task::spawn_blocking(move || storage::process_inbound_mls_application_event(&event))
+        .await
+        .map_err(|error| format!("MLS inbound processing task failed: {error}"))?
+}
+
+async fn update_mls_outbound_state_task(event_id: [u8; 16]) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        storage::update_outbound_delivery_state(
+            event_id,
+            storage::OutboundDeliveryState::HeldByPeer,
+        )
+    })
+    .await
+    .map_err(|error| format!("MLS delivery state task failed: {error}"))?
+}
+
 fn hex_decode_bytes(value: &str) -> Result<Vec<u8>, String> {
     let value = value.trim();
     if value.is_empty() || !value.len().is_multiple_of(2) || value.len() > 256 * 1024 {
@@ -1496,6 +1843,21 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
             state.peer_pending_sends.remove(&request_id);
             state.peer_send_status =
                 PeerSendStatus::Failed(format!("Entrega não confirmada: {text}"));
+        }
+        peer::PeerEvent::MlsEventReceived { .. } => {}
+        peer::PeerEvent::MlsEventAcknowledged { request_id } => {
+            state.peer_send_status = PeerSendStatus::Failed(format!(
+                "ACK do evento MLS {request_id} não está conectado ao estado de entrega."
+            ));
+        }
+        peer::PeerEvent::MlsEventRejected { request_id, reason } => {
+            state.mls_pending_events.remove(&request_id);
+            state.mls_status = format!("Evento MLS {request_id} continua no outbox: {reason}");
+        }
+        peer::PeerEvent::MlsEventDeliveryUnknown { request_id } => {
+            state.peer_send_status = PeerSendStatus::Failed(format!(
+                "Entrega do evento MLS {request_id} não confirmada."
+            ));
         }
         peer::PeerEvent::Unauthorized { .. } => {
             state.peer_listen_status = PeerListenStatus::Unauthorized(

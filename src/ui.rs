@@ -1,13 +1,13 @@
 //! Native widgets composed from the supplied design board. All call/chat
 //! content is explicitly a visual preview until product capabilities exist.
-use crate::{BackendConnection, Message, Screen, Slouching, TransportState};
+use crate::{BackendConnection, Message, Screen, Slouching, TransportState, storage};
 use iced::widget::{
     self, button, canvas, column, container, image, row, scrollable, space, stack, svg, text,
     text_input,
 };
 use iced::{
-    Background, Border, Color, ContentFit, Element, Fill, Font, Point, Rectangle, Renderer, Size,
-    Theme, font,
+    Background, Border, Color, ContentFit, Element, Fill, Font, Length, Point, Rectangle, Renderer,
+    Size, Theme, font,
 };
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -1318,21 +1318,81 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
         )
     ]
     .spacing(l.px(9.0));
+    let history = scrollable(
+        column(
+            state
+                .mls_history
+                .iter()
+                .map(|message| {
+                    let outgoing = message.direction == storage::DirectMessageDirection::Sent;
+                    let bubble = column![
+                        l.label(message.text.clone(), 13.0, PAPER),
+                        l.label(
+                            if outgoing {
+                                "Enviada · sessão atual"
+                            } else {
+                                "Recebida · sessão atual"
+                            },
+                            10.0,
+                            MUTED
+                        )
+                    ]
+                    .spacing(l.px(4.0));
+                    container(bubble)
+                        .padding(l.px(10.0))
+                        .width(Length::Shrink)
+                        .style(move |_| container::Style {
+                            background: Some((if outgoing { NIGHT } else { PANEL }).into()),
+                            border: Border {
+                                color: LINE,
+                                width: 1.0,
+                                radius: 0.0.into(),
+                            },
+                            ..Default::default()
+                        })
+                        .into()
+                })
+                .collect::<Vec<Element<'_, Message>>>(),
+        )
+        .spacing(l.px(8.0)),
+    );
+    let can_send = matches!(state.peer_listen_status, crate::PeerListenStatus::Connected)
+        && !state.mls_message_draft.trim().is_empty()
+        && state.mls_history_group.is_some();
+    let send = button(l.label("Enviar MLS", 14.0, NIGHT))
+        .on_press_maybe(can_send.then_some(Message::SendMlsApplication))
+        .padding([l.px(13.0), l.px(20.0)])
+        .style(|_, status| button_style(status, true, false));
+    let retry = button(l.label("Reenviar pendentes", 12.0, PAPER))
+        .on_press_maybe(
+            (matches!(state.peer_listen_status, crate::PeerListenStatus::Connected)
+                && state.mls_history_group.is_some())
+            .then_some(Message::RetryQueuedMlsEvents),
+        )
+        .padding([l.px(12.0), l.px(16.0)])
+        .style(|_, status| button_style(status, false, false));
     let body = column![
         row![
-            column![l.title("Grupo MLS", 28.0), l.label("OpenMLS · SQLCipher local · sem transporte de grupo", 11.0, MUTED)].spacing(l.px(5.0)),
+            column![l.title("Grupo MLS", 28.0), l.label("OpenMLS · SQLCipher · Iroh/QUIC direto", 11.0, MUTED)].spacing(l.px(5.0)),
             space().width(Fill),
             l.label("INVITE MANUAL · CHAVES NÃO SAEM DO DISPOSITIVO", 10.0, GOLD)
         ].align_y(iced::Center),
         rule(LINE, 1.0),
         row![
-            scrollable(inviter).height(Fill).width(Fill),
+            scrollable(inviter).height(l.px(275.0)).width(Fill),
             rule(LINE, 1.0),
-            scrollable(invitee).height(Fill).width(Fill)
-        ].spacing(l.px(18.0)).height(Fill),
+            scrollable(invitee).height(l.px(275.0)).width(Fill)
+        ].spacing(l.px(18.0)),
         l.label(state.mls_status.clone(), 11.0, GREEN),
+        l.label("TRANSCRIÇÃO MLS · ARMAZENADA LOCALMENTE", 10.0, GOLD),
+        container(history).height(l.px(78.0)).width(Fill),
+        row![
+            container(l.input("Mensagem MLS · até 16 KiB", &state.mls_message_draft, Message::MlsMessageDraftChanged)).width(Fill),
+            send,
+            retry
+        ].spacing(l.px(10.0)),
         l.label(
-            "Este fluxo valida MLS e persiste o grupo neste dispositivo. Troque os bytes por um canal confiável; mensagens de grupo ainda não são enviadas pela rede nem exibidas na tela de chat.",
+            "Convites e árvores ainda são trocados manualmente por canal confiável. Mensagens MLS seguem pela sessão direta ativa e só recebem ACK depois da validação e persistência no outro dispositivo.",
             10.0,
             MUTED
         )
