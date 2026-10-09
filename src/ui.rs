@@ -544,6 +544,45 @@ fn familiar(state: &Slouching, l: Layout) -> Element<'_, Message> {
             "Ative o cofre de senhas do sistema e tente de novo. Não salvamos em texto puro.",
         ),
     };
+    let (identity_title, identity_detail) = match &state.identity_status {
+        crate::IdentityStatus::Loading => (
+            "Carregando identidade do dispositivo",
+            "A chave é consultada no cofre do sistema.".to_owned(),
+        ),
+        crate::IdentityStatus::Missing => (
+            "Identidade Ed25519 ainda não criada",
+            "Crie a chave privada local no cofre do sistema.".to_owned(),
+        ),
+        crate::IdentityStatus::Creating => (
+            "Criando identidade do dispositivo...",
+            "A chave privada será guardada no cofre do sistema.".to_owned(),
+        ),
+        crate::IdentityStatus::Ready(public_key) => (
+            "Chave pública Ed25519 · não verificada",
+            public_key
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        ),
+        crate::IdentityStatus::Failed => (
+            "Identidade local indisponível",
+            "Não foi possível ler a chave no cofre. Confira o serviço e tente novamente."
+                .to_owned(),
+        ),
+    };
+    let identity_action = match state.identity_status {
+        crate::IdentityStatus::Loading => "Carregando chave...",
+        crate::IdentityStatus::Creating => "Criando chave...",
+        crate::IdentityStatus::Ready(_) => "Identidade criada",
+        crate::IdentityStatus::Missing => "Criar identidade",
+        crate::IdentityStatus::Failed => "Tentar novamente",
+    };
+    let identity_message = match state.identity_status {
+        crate::IdentityStatus::Missing | crate::IdentityStatus::Failed => {
+            Some(Message::CreateIdentity)
+        }
+        _ => None,
+    };
     let key = container(
         row![
             l.icon("key", VIOLET, 24.0),
@@ -552,8 +591,16 @@ fn familiar(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 l.label(profile_detail, 11.0, MUTED)
             ]
             .spacing(l.px(5.0))
+            .width(Fill),
+            l.icon("shield", VIOLET, 24.0),
+            column![
+                l.label(identity_title, 13.0, PAPER),
+                l.label(identity_detail, 11.0, MUTED)
+            ]
+            .spacing(l.px(5.0))
+            .width(Fill)
         ]
-        .spacing(l.px(14.0))
+        .spacing(l.px(12.0))
         .align_y(iced::Center),
     )
     .width(Fill)
@@ -593,17 +640,12 @@ fn familiar(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 Some(Message::Navigate(Screen::Home)),
                 false
             ),
-            space().width(Fill),
-            l.control(
-                "check",
-                "Salvar perfil local",
-                Some(Message::SaveProfile),
-                true
-            )
+            l.control("check", "Salvar perfil", Some(Message::SaveProfile), false),
+            l.control("key", identity_action, identity_message, true)
         ]
-        .spacing(l.px(20.0))
+        .spacing(l.px(8.0))
     ]
-    .spacing(l.px(23.0));
+    .spacing(l.px(19.0));
     l.place(l.panel(body), 230.0, 92.0, 820.0, 620.0)
 }
 fn rule(color: Color, height: f32) -> Element<'static, Message> {

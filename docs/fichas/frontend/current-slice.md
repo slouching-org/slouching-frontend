@@ -12,14 +12,18 @@ and chat fields edit in-memory values. Familiar selection, settings and
 share-source tabs, and the interface texture toggle work locally. The
 familiar screen saves only the display name and familiar in SQLCipher
 encrypted SQLite; its random database key is kept in the operating system
-credential store. Linux requires Secret Service in the user session. This
-profile is distinct from device identity and does not create cryptographic
-keys or message history.
+credential store. Linux requires Secret Service in the user session. A
+separate explicit action generates a local Ed25519 device signing key and
+stores its seed in the system credential store; the public key is displayed
+as unverified. Fingerprint/QR derivation, pairing, MLS state, and message
+history remain unimplemented. If the keyring cannot be read, the screen offers
+a retry that reuses an existing key rather than replacing it. The display
+profile is distinct from identity.
 
 Every view is labeled as a visual preview. Character scenes and messages
 are examples. Camera/microphone actions explain their unavailable state;
 send, capture, and verification controls cannot perform product operations.
-The app does not generate identity keys, enumerate devices, send messages,
+The app does not enumerate devices, sign protocol messages, send messages,
 join calls, or persist local conversation history. The settings **Rede & P2P** tab exposes
 real backend diagnostics separately from the illustrative call routes.
 

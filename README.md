@@ -49,15 +49,17 @@ tabs, illustrative share-source selection, and interface texture work locally.
 The familiar screen saves the display name and familiar as a local profile in
 SQLCipher encrypted SQLite; the database key is stored in the operating system
 credential store. Saving fails closed when that store is unavailable. The
-profile is not a device identity and creates no cryptographic keys or message
-history. Every view is labeled as a visual preview: character images,
-messages, and comparison words are illustrative. No identity is generated, no
-message is sent, and no camera, microphone, or screen is captured. **Rede &
+screen can also explicitly create and retain an Ed25519 device signing key in
+the system credential store. It displays the public key as unverified; no
+fingerprint format, contact pairing, or MLS state is implemented. The local
+profile remains separate from that key. Every view is labeled as a visual
+preview: character images, messages, and comparison words are illustrative.
+No message is sent, and no camera, microphone, or screen is captured. **Rede &
 P2P** in Settings retains the real Elixir HTTP/WebSocket diagnostics and
 manual refresh. On Linux, this uses Secret Service, so a desktop password
 vault must be installed and available in the user session.
 
-![Native familiar screen showing the encrypted local profile status](docs/design/runtime/native-vhs/01-familiar.png)
+![Native familiar screen showing local profile and identity keyring status, with a retry action when the system keyring is unavailable](docs/design/runtime/native-vhs/01-familiar.png)
 
 ![Actual native Iced home using the supplied scenery and characters](docs/design/runtime/native-vhs/09-home.png)
 
@@ -79,17 +81,20 @@ SLOUCHING_WINDOW_SIZE=960x640 cargo run -- --capture-dir /tmp/slouching-captures
 The capture command renders all eleven screens, saves screenshots through
 Iced's window screenshot API, and exits. Add `--capture-screen <slug>` to
 capture one view, such as the familiar screen, instead of the full gallery. A tiling compositor may override
-the requested window size; float/resize that window before the initial
-six-second capture delay. `SLOUCHING_WINDOW_SIZE` only requests an initial
-size. The normal default is a compact 1100 × 720 window.
+the requested window size; float/resize that window before the capture delay.
+Set `SLOUCHING_CAPTURE_DELAY_MS` to extend the default six-second delay when
+needed. `SLOUCHING_WINDOW_SIZE` only requests an initial size. The normal
+default is a compact 1100 × 720 window.
 
 Assets and font license/provenance notes are in [assets/README.md](assets/README.md).
 
 ## Architecture
 
 - **UI:** Rust 2024, Iced 0.14.0 (pinned), wgpu renderer.
-- **Local client core:** Rust, with local identity, crypto, storage, transport,
-  and media responsibilities from the source architecture; these remain unbuilt.
+- **Local client core:** Rust owns local identity, cryptography, encrypted
+  storage, peer transport, and media. The encrypted display profile and
+  explicit Ed25519 key storage are implemented; authenticated messaging,
+  local inbox/history, direct peer networking, and media remain unbuilt.
 - **Server/backend:** Elixir in
   [`slouching-org/slouching-backend`](https://github.com/slouching-org/slouching-backend).
 - **Current boundary:** loopback HTTP status and binary protobuf WebSocket

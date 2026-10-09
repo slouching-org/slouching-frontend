@@ -1,4 +1,5 @@
 use directories::ProjectDirs;
+use ed25519_dalek::SigningKey;
 use keyring::{Entry, Error as KeyringError};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
@@ -9,6 +10,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const SERVICE: &str = "org.slouching.desktop";
 const KEY_NAME: &str = "local-profile-database-v1";
+const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
 
@@ -104,9 +106,56 @@ pub fn save_profile(profile: &LocalProfile) -> Result<(), String> {
     Ok(())
 }
 
+pub fn load_identity_public_key() -> Result<Option<[u8; 32]>, String> {
+    let entry = identity_key_entry()?;
+    match entry.get_secret() {
+        Ok(secret) => public_key_from_seed(secret).map(Some),
+        Err(KeyringError::NoEntry) => Ok(None),
+        Err(error) => Err(format!("could not access the device identity key: {error}")),
+    }
+}
+
+pub fn create_or_load_identity_public_key() -> Result<[u8; 32], String> {
+    let entry = identity_key_entry()?;
+    match entry.get_secret() {
+        Ok(secret) => public_key_from_seed(secret),
+        Err(KeyringError::NoEntry) => {
+            let mut seed = Zeroizing::new([0_u8; 32]);
+            getrandom::fill(seed.as_mut())
+                .map_err(|error| format!("could not generate Ed25519 device key: {error}"))?;
+            let signing_key = SigningKey::from_bytes(&seed);
+            let public_key = signing_key.verifying_key().to_bytes();
+            entry.set_secret(seed.as_ref()).map_err(|error| {
+                format!(
+                    "could not save the device identity key in the system credential store: {error}"
+                )
+            })?;
+            Ok(public_key)
+        }
+        Err(error) => Err(format!("could not access the device identity key: {error}")),
+    }
+}
+
 fn key_entry() -> Result<Entry, String> {
     Entry::new(SERVICE, KEY_NAME)
         .map_err(|error| format!("system credential store is unavailable: {error}"))
+}
+
+fn identity_key_entry() -> Result<Entry, String> {
+    Entry::new(SERVICE, IDENTITY_KEY_NAME)
+        .map_err(|error| format!("system credential store is unavailable: {error}"))
+}
+
+fn public_key_from_seed(secret: Vec<u8>) -> Result<[u8; 32], String> {
+    let mut secret = Zeroizing::new(secret);
+    if secret.len() != 32 {
+        return Err("saved Ed25519 device key has an invalid length".to_owned());
+    }
+    let mut seed = Zeroizing::new([0_u8; 32]);
+    seed.copy_from_slice(&secret);
+    secret.zeroize();
+    let signing_key = SigningKey::from_bytes(&seed);
+    Ok(signing_key.verifying_key().to_bytes())
 }
 
 fn secret_key(bytes: Vec<u8>) -> Result<Zeroizing<[u8; PROFILE_DB_KEY_LEN]>, String> {

@@ -165,6 +165,7 @@ struct Slouching {
     capture_index: usize,
     capture_once: bool,
     profile_status: ProfileStatus,
+    identity_status: IdentityStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +174,15 @@ enum ProfileStatus {
     Empty,
     Saved,
     Saving,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+enum IdentityStatus {
+    Loading,
+    Missing,
+    Creating,
+    Ready([u8; 32]),
     Failed,
 }
 
@@ -198,6 +208,7 @@ impl Default for Slouching {
             capture_index: 0,
             capture_once: false,
             profile_status: ProfileStatus::Loading,
+            identity_status: IdentityStatus::Loading,
         }
     }
 }
@@ -224,6 +235,9 @@ enum Message {
     ProfileLoaded(Result<Option<storage::LocalProfile>, String>),
     SaveProfile,
     ProfileSaved(storage::LocalProfile, Result<(), String>),
+    IdentityLoaded(Result<Option<[u8; 32]>, String>),
+    CreateIdentity,
+    IdentityCreated(Result<[u8; 32], String>),
 }
 
 fn update(state: &mut Slouching, message: Message) -> Task<Message> {
@@ -370,6 +384,22 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             Err(_) => {
                 state.profile_status = ProfileStatus::Failed;
                 state.note = Some("Não foi possível salvar o perfil local.");
+            }
+        },
+        Message::IdentityLoaded(result) => match result {
+            Ok(Some(public_key)) => state.identity_status = IdentityStatus::Ready(public_key),
+            Ok(None) => state.identity_status = IdentityStatus::Missing,
+            Err(_) => state.identity_status = IdentityStatus::Failed,
+        },
+        Message::CreateIdentity => {
+            state.identity_status = IdentityStatus::Creating;
+            return Task::perform(create_identity_task(), Message::IdentityCreated);
+        }
+        Message::IdentityCreated(result) => match result {
+            Ok(public_key) => state.identity_status = IdentityStatus::Ready(public_key),
+            Err(_) => {
+                state.identity_status = IdentityStatus::Failed;
+                state.note = Some("Não foi possível criar a chave no cofre do sistema.");
             }
         },
     }
@@ -565,7 +595,12 @@ fn boot() -> (Slouching, Task<Message>) {
         }
     }
     let capture = if state.capture_dir.is_some() {
-        capture_after(Duration::from_secs(6))
+        let delay = std::env::var("SLOUCHING_CAPTURE_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(6));
+        capture_after(delay)
     } else {
         Task::none()
     };
@@ -576,6 +611,7 @@ fn boot() -> (Slouching, Task<Message>) {
         Task::batch([
             Task::perform(fetch_backend_status(), Message::BackendFetched),
             Task::perform(load_profile_task(), Message::ProfileLoaded),
+            Task::perform(load_identity_task(), Message::IdentityLoaded),
             transport,
             capture,
         ]),
@@ -592,6 +628,18 @@ async fn save_profile_task(profile: storage::LocalProfile) -> Result<(), String>
     tokio::task::spawn_blocking(move || storage::save_profile(&profile))
         .await
         .map_err(|error| format!("local profile task failed: {error}"))?
+}
+
+async fn load_identity_task() -> Result<Option<[u8; 32]>, String> {
+    tokio::task::spawn_blocking(storage::load_identity_public_key)
+        .await
+        .map_err(|error| format!("device identity task failed: {error}"))?
+}
+
+async fn create_identity_task() -> Result<[u8; 32], String> {
+    tokio::task::spawn_blocking(storage::create_or_load_identity_public_key)
+        .await
+        .map_err(|error| format!("device identity task failed: {error}"))?
 }
 
 fn view(state: &Slouching) -> Element<'_, Message> {

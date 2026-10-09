@@ -9,13 +9,18 @@ The window gallery, familiar selection, preview fields, tabs, and texture
 control work locally. The familiar screen now persists the display name and
 familiar using SQLCipher encrypted SQLite with a key in the system credential
 store. A missing credential store appears as an unavailable state; no
-plaintext fallback is used. This does not create a device identity. All
-scenes, messages, and comparison words are marked as illustrative. No peer
-route, media capture, messaging, or call is established by these images.
+plaintext fallback is used. A separate explicit action creates and stores an
+Ed25519 device signing seed in the credential store and displays its public
+key as unverified. Fingerprint derivation and contact pairing are not
+implemented. When the keyring cannot be read, the screen explains the failure
+and offers a safe retry that does not replace an existing key. All scenes,
+messages, and comparison words are marked as illustrative. No peer route,
+media capture, messaging, or call is established by these images.
 Exact parity and accessibility remain open.
 
 Reproduce with `cargo run -- --capture-dir /tmp/slouching-captures`.
 Request a size with `SLOUCHING_WINDOW_SIZE=1280x800`; a tiling compositor may
-need this window floated and resized before the six-second capture delay.
+need this window floated and resized before the six-second capture delay;
+`SLOUCHING_CAPTURE_DELAY_MS` can extend the delay.
 The command visits all eleven views and exits after saving them.
 Use `cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 01-familiar` to capture one view at the requested size.
