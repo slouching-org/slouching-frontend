@@ -393,6 +393,11 @@ enum Message {
     MlsCommitsReadyToSend(Vec<u8>, Result<Vec<storage::StoredMlsCommit>, String>),
     MlsCommitPeerCommandSent(u64, Result<(), String>),
     MlsCommitDelivered(u64, Result<(), String>),
+    MlsCommitRequestedReady(
+        Vec<u8>,
+        u64,
+        Result<Option<storage::StoredMlsCommit>, String>,
+    ),
     MlsCommitInboundProcessed(
         u64,
         peer::MlsCommitEnvelope,
@@ -854,6 +859,27 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                             },
                         );
                     }
+                    peer::PeerEvent::MlsCommitRequested {
+                        peer_id,
+                        group_id,
+                        predecessor_epoch,
+                    } => {
+                        let peer_device = *peer_id.as_bytes();
+                        return Task::perform(
+                            load_authorized_mls_commit_task(
+                                group_id.clone(),
+                                predecessor_epoch,
+                                peer_device,
+                            ),
+                            move |result| {
+                                Message::MlsCommitRequestedReady(
+                                    group_id,
+                                    predecessor_epoch,
+                                    result,
+                                )
+                            },
+                        );
+                    }
                     peer::PeerEvent::MlsCommitAcknowledged { request_id } => {
                         let Some(event_id) = state.mls_sending_commits.get(&request_id).copied()
                         else {
@@ -1268,6 +1294,50 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.mls_sending_commits.remove(&request_id);
             state.mls_status = format!("Commit permanece pendente localmente: {error}");
         }
+        Message::MlsCommitRequestedReady(_group_id, predecessor_epoch, result) => match result {
+            Ok(Some(stored)) => {
+                let Some(commands) = state.peer_session_commands.clone() else {
+                    state.mls_status =
+                        "Solicitação recebida sem sessão ativa; Commit permanece salvo.".to_owned();
+                    return Task::none();
+                };
+                let request_id = state.mls_next_request_id;
+                state.mls_next_request_id = state.mls_next_request_id.saturating_add(1);
+                state
+                    .mls_sending_commits
+                    .insert(request_id, stored.event_id);
+                let envelope = peer::MlsCommitEnvelope {
+                    event_id: stored.event_id,
+                    author_device: stored.author_device,
+                    group_id: stored.group_id,
+                    predecessor_epoch: stored.predecessor_epoch,
+                    epoch: stored.epoch,
+                    commit: stored.commit,
+                };
+                state.mls_status =
+                    format!("Enviando predecessor epoch {predecessor_epoch} solicitado pelo peer.");
+                return Task::perform(
+                    async move {
+                        commands
+                            .send(peer::PeerCommand::SendMlsCommit {
+                                request_id,
+                                commit: envelope,
+                            })
+                            .await
+                            .map_err(|error| error.to_string())
+                    },
+                    move |result| Message::MlsCommitPeerCommandSent(request_id, result),
+                );
+            }
+            Ok(None) => {
+                state.mls_status = format!(
+                    "Peer pediu predecessor epoch {predecessor_epoch}, mas não há Commit elegível para esse dispositivo e grupo."
+                );
+            }
+            Err(error) => {
+                state.mls_status = format!("Falha ao buscar predecessor solicitado: {error}")
+            }
+        },
         Message::MlsCommitDelivered(request_id, Ok(())) => {
             state.mls_sending_commits.remove(&request_id);
             state.mls_status =
@@ -1313,13 +1383,41 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 return load_mls_history(state, envelope.group_id);
             }
             Err(error) => {
-                state.mls_status =
-                    format!("Commit recebido foi rejeitado; grupo local intacto: {error}");
                 if let Some(commands) = state.peer_session_commands.as_ref() {
-                    let _ = commands.try_send(peer::PeerCommand::RejectInbound {
+                    if let Err(send_error) = commands.try_send(peer::PeerCommand::RejectInbound {
                         sequence,
-                        reason: error,
-                    });
+                        reason: error.clone(),
+                    }) {
+                        state.mls_status = format!(
+                            "Commit fora de ordem; não foi possível confirmar a rejeição antes da recuperação: {send_error}"
+                        );
+                        return Task::none();
+                    }
+                    let missing = missing_predecessor_from_error(&error)
+                        .filter(|expected| *expected < envelope.predecessor_epoch);
+                    if let Some(predecessor_epoch) = missing {
+                        match commands.try_send(peer::PeerCommand::RequestMlsCommit {
+                            group_id: envelope.group_id.clone(),
+                            predecessor_epoch,
+                        }) {
+                            Ok(()) => {
+                                state.mls_status = format!(
+                                    "Commit fora de ordem; solicitando predecessor epoch {predecessor_epoch} ao committer."
+                                );
+                            }
+                            Err(send_error) => {
+                                state.mls_status = format!(
+                                    "Commit fora de ordem; não foi possível solicitar o predecessor: {send_error}"
+                                );
+                            }
+                        }
+                    } else {
+                        state.mls_status =
+                            format!("Commit recebido foi rejeitado; grupo local intacto: {error}");
+                    }
+                } else {
+                    state.mls_status =
+                        format!("Commit recebido foi rejeitado; grupo local intacto: {error}");
                 }
             }
         },
@@ -1968,6 +2066,18 @@ async fn load_mls_commits_for_peer_task(
     .map_err(|error| format!("MLS Commit peer check failed: {error}"))?
 }
 
+async fn load_authorized_mls_commit_task(
+    group_id: Vec<u8>,
+    predecessor_epoch: u64,
+    peer_device: [u8; 32],
+) -> Result<Option<storage::StoredMlsCommit>, String> {
+    tokio::task::spawn_blocking(move || {
+        storage::load_authorized_mls_commit_for_peer(&group_id, predecessor_epoch, &peer_device)
+    })
+    .await
+    .map_err(|error| format!("MLS predecessor lookup task failed: {error}"))?
+}
+
 async fn mark_mls_commit_delivered_task(
     event_id: [u8; 16],
     peer_device: [u8; 32],
@@ -2055,6 +2165,15 @@ fn hex_decode_bytes(value: &str) -> Result<Vec<u8>, String> {
             Ok((high << 4) | low)
         })
         .collect()
+}
+
+fn missing_predecessor_from_error(error: &str) -> Option<u64> {
+    error
+        .strip_prefix("MLS Commit is out of order: expected predecessor epoch ")?
+        .split_once(',')?
+        .0
+        .parse()
+        .ok()
 }
 
 fn peer_listener_task(
@@ -2211,6 +2330,7 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
         }
         peer::PeerEvent::MlsEventReceived { .. } => {}
         peer::PeerEvent::MlsCommitReceived { .. } => {}
+        peer::PeerEvent::MlsCommitRequested { .. } => {}
         peer::PeerEvent::MlsEventAcknowledged { request_id } => {
             state.peer_send_status = PeerSendStatus::Failed(format!(
                 "ACK do evento MLS {request_id} não está conectado ao estado de entrega."
@@ -2416,6 +2536,23 @@ fn hex_encode_key(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_only_the_expected_predecessor_from_order_errors() {
+        assert_eq!(
+            missing_predecessor_from_error(
+                "MLS Commit is out of order: expected predecessor epoch 4, received 7"
+            ),
+            Some(4)
+        );
+        assert_eq!(
+            missing_predecessor_from_error(
+                "MLS Commit is out of order: expected predecessor epoch x, received 7"
+            ),
+            None
+        );
+        assert_eq!(missing_predecessor_from_error("invalid Commit"), None);
+    }
 
     #[test]
     fn mls_artifact_hex_encoding_round_trips_and_rejects_malformed_input() {

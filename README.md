@@ -103,7 +103,10 @@ epoch before ACK, and the sender stores that ACK per recipient. Exact redelivery
 is harmless. One click drains that recipient's pending Commits in epoch order,
 waiting for each durable ACK before sending the next. Repeat after connecting
 to another member; automatic multi-member fan-out and offline delivery remain
-in progress. The MLS screen
+in progress. If a recipient is behind, it requests the missing predecessor over
+the pinned session; the committer serves it only when that device was in the
+Commit's predecessor snapshot, including Commits already marked delivered.
+The MLS screen
 shows each eligible device's persisted adoption ACK. Storage regression tests
 build a two-Commit chain, verify epoch order, and confirm that the next Commit
 remains queued after the first recipient ACK and a database reopen. New members join with the
@@ -140,6 +143,8 @@ The eleven design-board views and additional MLS screen are captured in [native-
 These are a first implementation of the visual direction, with comparison
 at 1280 × 800 and a compact 960 × 640 window. Exact visual parity,
 accessibility, and live media integration remain to be completed.
+The current direct transport and MLS recovery frames are specified in the
+[v4 peer protocol](docs/fichas/transport/lan-peer-v4.md).
 
 ## Reproduce native captures
 
@@ -169,8 +174,9 @@ Assets and font license/provenance notes are in [assets/README.md](assets/README
   from the Iced UI with a persistent bidirectional session and per-peer history
   in SQLCipher. MLS application messages use the direct pinned Iroh/QUIC session with a
   local SQLCipher transcript and retryable outbox. Membership Commit bytes are
-  atomically journaled with group state; manual import/apply is available, while
-  automatic Commit fan-out, helper delivery, and media remain in progress.
+  atomically journaled with group state; ordered direct delivery, per-device
+  ACKs, and predecessor recovery are available, while automatic multi-member
+  fan-out, helper delivery, and media remain in progress.
 - **Server/backend:** Elixir in
   [`slouching-org/slouching-backend`](https://github.com/slouching-org/slouching-backend).
 - **Current boundary:** loopback HTTP status and binary protobuf WebSocket

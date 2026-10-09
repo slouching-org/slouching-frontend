@@ -10,9 +10,9 @@ use tokio::{
 };
 
 /// Direct-only protocol version used for persistent paired-device text sessions.
-pub const PEER_ALPN: &[u8] = b"org.slouching.peer/3";
+pub const PEER_ALPN: &[u8] = b"org.slouching.peer/4";
 const FRAME_MAGIC: &[u8; 4] = b"SLCH";
-const FRAME_VERSION: u16 = 3;
+const FRAME_VERSION: u16 = 4;
 const FRAME_DATA: u8 = 1;
 const FRAME_ACK: u8 = 2;
 const FRAME_CLOSE: u8 = 3;
@@ -20,6 +20,7 @@ const FRAME_CLOSE_ACK: u8 = 4;
 const FRAME_MLS_EVENT: u8 = 5;
 const FRAME_MLS_COMMIT: u8 = 6;
 const FRAME_REJECT: u8 = 7;
+const FRAME_MLS_COMMIT_REQUEST: u8 = 8;
 const MLS_EVENT_MAGIC: &[u8; 4] = b"SLME";
 const MLS_EVENT_VERSION: u16 = 1;
 const MLS_COMMIT_MAGIC: &[u8; 4] = b"SLMC";
@@ -29,6 +30,7 @@ const MAX_MLS_EVENT_BYTES: usize = 64 * 1024;
 const MAX_MLS_COMMIT_BYTES: usize = 64 * 1024;
 const MAX_CHECKPOINT_BYTES: usize = 16 * 1024;
 pub const MAX_PENDING_MESSAGES: usize = 16;
+const MAX_MLS_COMMIT_REQUESTS_PER_SESSION: u8 = 16;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const ACCEPT_STREAM_TIMEOUT: Duration = Duration::from_secs(8);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -79,6 +81,10 @@ pub enum PeerCommand {
         request_id: u64,
         commit: MlsCommitEnvelope,
     },
+    RequestMlsCommit {
+        group_id: Vec<u8>,
+        predecessor_epoch: u64,
+    },
     /// Send only after the application has stored this message in its in-memory transcript.
     AcceptInbound {
         sequence: u64,
@@ -110,6 +116,11 @@ pub enum PeerEvent {
     MlsCommitReceived {
         sequence: u64,
         commit: MlsCommitEnvelope,
+    },
+    MlsCommitRequested {
+        peer_id: EndpointId,
+        group_id: Vec<u8>,
+        predecessor_epoch: u64,
     },
     MlsEventAcknowledged {
         request_id: u64,
@@ -180,6 +191,10 @@ enum Frame {
     MlsCommit {
         sequence: u64,
         commit: MlsCommitEnvelope,
+    },
+    MlsCommitRequest {
+        group_id: Vec<u8>,
+        predecessor_epoch: u64,
     },
     Ack {
         sequence: u64,
@@ -267,6 +282,7 @@ impl DirectPeerListener {
                 | PeerEvent::Acknowledged { .. }
                 | PeerEvent::MlsEventReceived { .. }
                 | PeerEvent::MlsCommitReceived { .. }
+                | PeerEvent::MlsCommitRequested { .. }
                 | PeerEvent::MlsEventAcknowledged { .. }
                 | PeerEvent::MlsCommitAcknowledged { .. }
                 | PeerEvent::MlsEventRejected { .. }
@@ -300,6 +316,8 @@ impl DirectPeerSession {
             let mut pending_inbound = std::collections::HashSet::<u64>::new();
             let mut next_out_sequence = 1_u64;
             let mut next_in_sequence = 1_u64;
+            let mut received_commit_requests = 0_u8;
+            let mut seen_commit_requests = std::collections::HashSet::new();
             let mut closing = false;
             let mut close_deadline = Box::pin(tokio::time::sleep(CLOSE_TIMEOUT));
             yield PeerEvent::Connected { peer_id: self.peer_id };
@@ -358,6 +376,20 @@ impl DirectPeerSession {
                                 next_in_sequence = next;
                                 pending_inbound.insert(sequence);
                                 yield PeerEvent::MlsCommitReceived { sequence, commit };
+                            }
+                            Ok(Frame::MlsCommitRequest { group_id, predecessor_epoch }) => {
+                                received_commit_requests = received_commit_requests.saturating_add(1);
+                                if received_commit_requests > MAX_MLS_COMMIT_REQUESTS_PER_SESSION {
+                                    break 'session "peer exceeded the MLS predecessor request limit".to_owned();
+                                }
+                                if !seen_commit_requests.insert((group_id.clone(), predecessor_epoch)) {
+                                    continue;
+                                }
+                                yield PeerEvent::MlsCommitRequested {
+                                    peer_id: self.peer_id,
+                                    group_id,
+                                    predecessor_epoch,
+                                };
                             }
                             Ok(Frame::Ack { sequence }) => {
                                 let Some(pending) = pending_sends.remove(&sequence) else {
@@ -481,6 +513,17 @@ impl DirectPeerSession {
                                     break 'session format!("could not send MLS Commit: {error}");
                                 }
                                 next_out_sequence = next;
+                            }
+                            Some(PeerCommand::RequestMlsCommit { group_id, predecessor_epoch }) => {
+                                if group_id.len() != 16 || predecessor_epoch > i64::MAX as u64 {
+                                    continue;
+                                }
+                                let mut payload = Vec::with_capacity(24);
+                                payload.extend_from_slice(&group_id);
+                                payload.extend_from_slice(&predecessor_epoch.to_be_bytes());
+                                if let Err(error) = write_frame(&mut self.send, FRAME_MLS_COMMIT_REQUEST, 0, &payload).await {
+                                    break 'session format!("could not request missing MLS Commit: {error}");
+                                }
                             }
                             Some(PeerCommand::AcceptInbound { sequence }) => {
                                 if !pending_inbound.remove(&sequence) {
@@ -641,6 +684,7 @@ pub async fn send_once(
             | PeerEvent::Acknowledged { .. }
             | PeerEvent::MlsEventReceived { .. }
             | PeerEvent::MlsCommitReceived { .. }
+            | PeerEvent::MlsCommitRequested { .. }
             | PeerEvent::MlsEventAcknowledged { .. }
             | PeerEvent::MlsCommitAcknowledged { .. }
             | PeerEvent::MlsEventRejected { .. }
@@ -739,6 +783,27 @@ where
                 commit: decode_mls_commit(&bytes)?,
             })
         }
+        FRAME_MLS_COMMIT_REQUEST if length == 24 && sequence == 0 => {
+            let mut group_id = vec![0; 16];
+            reader
+                .read_exact(&mut group_id)
+                .await
+                .map_err(|error| format!("could not read MLS Commit request group ID: {error}"))?;
+            let mut epoch = [0; 8];
+            reader
+                .read_exact(&mut epoch)
+                .await
+                .map_err(|error| format!("could not read MLS Commit request epoch: {error}"))?;
+            let predecessor_epoch = u64::from_be_bytes(epoch);
+            if predecessor_epoch > i64::MAX as u64 {
+                return Err("MLS Commit request epoch exceeds the local limit".to_owned());
+            }
+            Ok(Frame::MlsCommitRequest {
+                group_id,
+                predecessor_epoch,
+            })
+        }
+        FRAME_MLS_COMMIT_REQUEST => Err("peer sent an invalid MLS Commit request frame".to_owned()),
         FRAME_ACK if length == 0 && sequence != 0 => Ok(Frame::Ack { sequence }),
         FRAME_ACK => Err("peer sent an invalid ACK frame".to_owned()),
         FRAME_REJECT if (1..=1024).contains(&length) && sequence != 0 => {
@@ -1017,7 +1082,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_v3_frames_reject_unknown_and_malformed_data() {
+    async fn strict_session_frames_reject_unknown_and_malformed_data() {
         let (mut writer, mut reader) = duplex(128);
         write_frame(&mut writer, FRAME_DATA, 1, "hello".as_bytes())
             .await
@@ -1187,5 +1252,30 @@ mod tests {
                 commit
             }
         );
+    }
+
+    #[tokio::test]
+    async fn strict_session_parser_round_trips_and_bounds_commit_requests() {
+        let mut payload = vec![0x91; 16];
+        payload.extend_from_slice(&7_u64.to_be_bytes());
+        let (mut writer, mut reader) = duplex(128);
+        write_frame(&mut writer, FRAME_MLS_COMMIT_REQUEST, 0, &payload)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_frame(&mut reader).await.unwrap(),
+            Frame::MlsCommitRequest {
+                group_id: vec![0x91; 16],
+                predecessor_epoch: 7,
+            }
+        );
+
+        let mut oversized_epoch = vec![0x92; 16];
+        oversized_epoch.extend_from_slice(&u64::MAX.to_be_bytes());
+        let (mut writer, mut reader) = duplex(128);
+        write_frame(&mut writer, FRAME_MLS_COMMIT_REQUEST, 0, &oversized_epoch)
+            .await
+            .unwrap();
+        assert!(read_frame(&mut reader).await.is_err());
     }
 }

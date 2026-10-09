@@ -8,7 +8,7 @@ messages are encrypted with OpenMLS and sent over the active direct session.
 The receiver validates the sender binding and event metadata, advances the
 ratchet, stores ciphertext and the local transcript in SQLCipher, then ACKs.
 The sender marks the outbox event held by the peer after receiving that ACK.
-Queued application events can be retried from the MLS screen after reconnecting. Membership Commit bytes and the predecessor-epoch member roster are saved atomically with the merged group state. The MLS screen drains pending Commits in epoch order over the active pinned QUIC session, sending only to devices in each Commit's predecessor-epoch recipient snapshot. It waits for each durable ACK before advancing. Newly invited members are excluded; a removed device can receive the Commit that removes it. The receiver validates envelope metadata, MLS signature, group, predecessor epoch, designated committer, and device-bound credentials before atomically persisting the Commit and journal record; transport ACK follows persistence and is durably recorded per recipient on the sender. The UI shows each eligible device's saved adoption ACK. Exact redelivery is idempotent. Repeat after connecting to each other member; multi-peer fan-out, offline delivery, and concurrent proposal handling remain open.
+Queued application events can be retried from the MLS screen after reconnecting. Membership Commit bytes and the predecessor-epoch member roster are saved atomically with the merged group state. The MLS screen drains pending Commits in epoch order over the active pinned QUIC session, sending only to devices in each Commit's predecessor-epoch recipient snapshot. It waits for each durable ACK before advancing. If a device receives a later Commit before its expected predecessor, it requests that epoch over the pinned session; the committer can return an already-ACKed Commit only to a device in its original recipient snapshot. Newly invited members are excluded; a removed device can receive the Commit that removes it. The receiver validates envelope metadata, MLS signature, group, predecessor epoch, designated committer, and device-bound credentials before atomically persisting the Commit and journal record; transport ACK follows persistence and is durably recorded per recipient on the sender. The UI shows each eligible device's saved adoption ACK. Exact redelivery is idempotent. Repeat after connecting to each other member; multi-peer fan-out, offline delivery, and concurrent proposal handling remain open.
 
 `src/main.rs` owns application and transport state; `src/ui.rs` composes the
 native Iced views, original art, icons, embedded fonts, and texture effects.
@@ -41,5 +41,5 @@ screen capture, contact discovery, verified pairing, group event distribution,
 relay, and offline delivery are not implemented. The older web UI under
 `prototypes/web/` is a design benchmark, not the product runtime.
 
-See [direct peer transport v3](../transport/lan-peer-v3.md) for the direct session
+See [direct peer transport v4](../transport/lan-peer-v4.md) for the direct session
 contract and [the Iced design plan](iced-design.md) for visual references.

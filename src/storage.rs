@@ -390,6 +390,8 @@ pub struct StoredMlsCommit {
     pub commit: Vec<u8>,
 }
 
+type StoredMlsCommitRow = (Vec<u8>, Vec<u8>, i64, i64, Vec<u8>, Vec<u8>, Vec<u8>);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MlsCommitRecipientStatus {
     pub event_id: [u8; 16],
@@ -470,6 +472,77 @@ pub fn list_queued_mls_commits_for_peer(
     }
     let mut connection = open_local_database()?;
     list_queued_mls_commits_for_peer_in(&mut connection, group_id, peer_device, limit)
+}
+
+pub fn load_authorized_mls_commit_for_peer(
+    group_id: &[u8],
+    predecessor_epoch: u64,
+    peer_device: &[u8; 32],
+) -> Result<Option<StoredMlsCommit>, String> {
+    if group_id.len() != 16 || predecessor_epoch > i64::MAX as u64 {
+        return Err("MLS predecessor request has invalid group or epoch".to_owned());
+    }
+    let connection = open_local_database()?;
+    load_authorized_mls_commit_for_peer_in(&connection, group_id, predecessor_epoch, peer_device)
+}
+
+fn load_authorized_mls_commit_for_peer_in(
+    connection: &Connection,
+    group_id: &[u8],
+    predecessor_epoch: u64,
+    peer_device: &[u8; 32],
+) -> Result<Option<StoredMlsCommit>, String> {
+    if group_id.len() != 16 || predecessor_epoch > i64::MAX as u64 {
+        return Err("MLS predecessor request has invalid group or epoch".to_owned());
+    }
+    let row: Option<StoredMlsCommitRow> = connection
+        .query_row(
+            "SELECT c.event_id, c.group_id, c.predecessor_epoch, c.epoch,
+                    c.author_device, c.commit_hash, c.commit_bytes
+             FROM local_mls_commits c
+             JOIN local_mls_commit_recipients r ON r.commit_event_id = c.event_id
+             JOIN local_mls_groups g ON g.group_id = c.group_id
+             WHERE c.group_id = ?1 AND c.predecessor_epoch = ?2
+               AND r.device_public_key = ?3
+               AND c.author_device = g.designated_committer_device",
+            params![group_id, predecessor_epoch as i64, peer_device.as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("could not load requested MLS predecessor: {error}"))?;
+    row.map(
+        |(event_id, group_id, predecessor_epoch, epoch, author_device, commit_hash, commit)| {
+            let event_id = fixed_bytes(event_id, "MLS Commit event ID")?;
+            let commit_hash = fixed_bytes(commit_hash, "MLS Commit hash")?;
+            if commit_hash != *blake3::hash(&commit).as_bytes()
+                || event_id.as_slice() != &commit_hash[..16]
+            {
+                return Err("stored MLS predecessor failed its digest check".to_owned());
+            }
+            Ok(StoredMlsCommit {
+                event_id,
+                group_id,
+                predecessor_epoch: u64::try_from(predecessor_epoch)
+                    .map_err(|_| "MLS Commit has an invalid predecessor epoch".to_owned())?,
+                epoch: u64::try_from(epoch)
+                    .map_err(|_| "MLS Commit has an invalid epoch".to_owned())?,
+                author_device: fixed_bytes(author_device, "MLS Commit author device")?,
+                commit_hash,
+                commit,
+            })
+        },
+    )
+    .transpose()
 }
 
 fn list_queued_mls_commits_for_peer_in(
@@ -3291,6 +3364,25 @@ mod tests {
                 .expect("unacknowledged next Commit should be available after database reopen");
         assert_eq!(next_commit.len(), 1);
         assert_eq!(next_commit[0].event_id, third_admission.commit_event_id);
+        let recovered_predecessor =
+            load_authorized_mls_commit_for_peer_in(&creator, &group.group_id, 1, &invitee_device)
+                .expect("authorized predecessor should be recoverable after ACK and restart")
+                .expect("recipient snapshot should authorize Commit recovery");
+        assert_eq!(
+            recovered_predecessor.event_id,
+            second_admission.commit_event_id
+        );
+        assert_eq!(recovered_predecessor.commit, second_admission.commit);
+        assert!(
+            load_authorized_mls_commit_for_peer_in(
+                &creator,
+                &group.group_id,
+                1,
+                &another_identity.verifying_key().to_bytes(),
+            )
+            .expect("unauthorized peer lookup should not disclose data")
+            .is_none()
+        );
         assert!(
             mark_mls_commit_delivered_in(
                 &mut creator,

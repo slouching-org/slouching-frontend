@@ -1,8 +1,5 @@
 # Direct peer transport v3
 
-> Historical contract for protocol v3. The active client uses v4; see
-> [lan-peer-v4.md](lan-peer-v4.md) for the current wire format and behavior.
-
 This client-only protocol carries direct pairwise text and opaque OpenMLS
 application events between two Rust clients on a reachable LAN. The Iced chat
 screen exposes pin, listen, connect, send, disconnect, and session transcript
@@ -21,15 +18,15 @@ Relay mode is disabled and callers supply direct socket addresses.
 
 ## Session framing
 
-ALPN: `org.slouching.peer/3`. One QUIC bidirectional stream stays open for a
+ALPN: `org.slouching.peer/4`. One QUIC bidirectional stream stays open for a
 session. Every frame has a 19-byte header followed by its payload:
 
 | Field | Size | Encoding |
 | --- | ---: | --- |
 | Marker | 4 bytes | ASCII `SLCH` |
-| Version | 2 bytes | Unsigned big-endian integer, `3` |
-| Kind | 1 byte | DATA=1, ACK=2, CLOSE=3, CLOSE_ACK=4, MLS_EVENT=5 |
-| Sequence | 8 bytes | Unsigned big-endian, monotonic per direction |
+| Version | 2 bytes | Unsigned big-endian integer, `4` |
+| Kind | 1 byte | DATA=1, ACK=2, CLOSE=3, CLOSE_ACK=4, MLS_EVENT=5, MLS_COMMIT=6, REJECT=7, MLS_COMMIT_REQUEST=8 |
+| Sequence | 8 bytes | Unsigned big-endian; application frames advance monotonically, control requests use zero |
 | Payload length | 4 bytes | Unsigned big-endian byte count |
 
 DATA carries 1–16,384 bytes of valid UTF-8. MLS_EVENT carries a bounded
@@ -81,12 +78,23 @@ Allow the selected UDP port through each device's firewall. Wildcard addresses
 such as `0.0.0.0` cannot be shared. If no LAN address is announced, inspect the
 machine's network interfaces.
 
+An MLS_COMMIT_REQUEST is a control frame with sequence zero and a fixed 24-byte
+payload: group ID (16 bytes) followed by the missing predecessor epoch (u64).
+It does not consume the data sequence. The receiver answers only when its local
+Commit outbox contains that epoch and the requesting pinned device appears in
+the Commit's predecessor-epoch recipient snapshot. An existing recipient may
+recover a Commit already marked delivered; a newly invited or unrelated device
+cannot fetch it. Requests are limited to 16 per session.
+
 ## Automated checks
 
 `cargo test --test peer_process` launches separate operating system processes.
-It exchanges text, opaque MLS events, and MLS Commit frames in both directions;
-checks positive ACK, explicit rejection, and wrong-pin rejection; then disconnects
-with pending sends to verify that delivery remains unknown.
+It exchanges text, opaque MLS events, MLS Commit frames, and predecessor
+requests between separate processes; checks positive ACK, explicit rejection,
+and wrong-pin rejection; then disconnects with pending sends to verify that
+delivery remains unknown. Storage coverage verifies that a recipient can
+recover a previously ACKed Commit after database reopen, while a device absent
+from its recipient snapshot receives no data.
 
 ## Limits
 
@@ -95,6 +103,6 @@ offline delivery, group event distribution service, automatic multi-member
 Commit fan-out, or cross-device history sync. MLS group setup and new-member
 Welcome exchange remain manual. Existing members can receive and atomically
 apply a Commit over the direct session; new members join through the matching
-Welcome/ratchet tree. The protocol v3 ALPN
-and frame version are not compatible with v2 peers. The older command-line
+Welcome/ratchet tree. The protocol v4 ALPN and frame version are not compatible
+with v3 peers. The older command-line
 helpers are diagnostic; the supported user-facing flow is in Iced.
