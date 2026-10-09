@@ -113,14 +113,13 @@ cannot fetch it. Requests are limited to 16 per session.
 ## Automated checks
 
 `cargo test --test peer_process` launches separate operating system processes.
-It exchanges text, opaque MLS events, MLS Commit frames, and predecessor
-requests; checks positive ACK, explicit rejection, and wrong-pin rejection;
-then disconnects with pending sends to verify that delivery remains unknown.
-The loopback proposal test sends a proposal through a direct session, accepts
-it after persistence, and verifies the sender receives ACK. Codec tests cover
-the proposal envelope and bounds. Storage coverage verifies that a recipient
-can recover a previously ACKed Commit after database reopen, while a device
-absent from its recipient snapshot receives no data.
+It exchanges text, opaque MLS events, MLS Commit frames, predecessor requests,
+and proposals between separate processes; checks positive ACK, explicit
+rejection, and wrong-pin rejection; then disconnects with pending text, event,
+Commit, and proposal sends to verify delivery is reported unknown. Storage
+coverage verifies that a recipient can recover a previously ACKed Commit after
+database reopen, while a device absent from its recipient snapshot receives no
+data. Codec tests cover the proposal envelope and bounds.
 
 ## Limits
 

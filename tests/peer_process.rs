@@ -187,6 +187,9 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 {
                     Some((*sequence, None))
                 }
+                peer::PeerEvent::MlsProposalReceived {
+                    sequence, proposal, ..
+                } if proposal.event_id[0] != 0xfe => Some((*sequence, None)),
                 _ => None,
             };
             if let Some((sequence, rejection)) = inbound_action {
@@ -238,6 +241,13 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
         })
         .await
         .expect("session should accept a Commit the remote side rejects");
+    command_tx
+        .send(peer::PeerCommand::SendMlsProposal {
+            request_id: 105,
+            proposal: mls_proposal_for(role, 105),
+        })
+        .await
+        .expect("session should accept an MLS proposal");
     if role == "sender" {
         command_tx
             .send(peer::PeerCommand::RequestMlsCommit {
@@ -254,6 +264,8 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
     let mut commit_acknowledged = false;
     let mut commit_received = false;
     let mut commit_rejected = false;
+    let mut proposal_acknowledged = false;
+    let mut proposal_received = false;
     let mut commit_request_received = role != "listener";
     let mut recovered_commit_received = role == "listener";
     let mut recovered_commit_acknowledged = role == "sender";
@@ -264,6 +276,8 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
         || !commit_acknowledged
         || !commit_received
         || !commit_rejected
+        || !proposal_acknowledged
+        || !proposal_received
         || !commit_request_received
         || !recovered_commit_received
         || !recovered_commit_acknowledged
@@ -298,6 +312,11 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 assert_eq!(reason, "rejected by process test");
                 assert!(!commit_rejected, "duplicate MLS Commit rejection");
                 commit_rejected = true;
+            }
+            peer::PeerEvent::MlsProposalAcknowledged { request_id } => {
+                assert_eq!(request_id, 105);
+                assert!(!proposal_acknowledged, "duplicate MLS proposal ACK");
+                proposal_acknowledged = true;
             }
             peer::PeerEvent::Received { sequence, text } => {
                 let expected_role = if role == "listener" {
@@ -343,11 +362,26 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 assert!(received.insert(sequence), "duplicate receive sequence");
                 commit_received = true;
             }
-            peer::PeerEvent::MlsProposalReceived { .. }
-            | peer::PeerEvent::MlsProposalAcknowledged { .. }
-            | peer::PeerEvent::MlsProposalRejected { .. }
-            | peer::PeerEvent::MlsProposalDeliveryUnknown { .. } => {
-                panic!("unexpected MLS proposal in the existing Commit exchange test")
+            peer::PeerEvent::MlsProposalReceived {
+                sequence, proposal, ..
+            } => {
+                let expected_role = if role == "listener" {
+                    "sender"
+                } else {
+                    "listener"
+                };
+                assert_eq!(proposal, mls_proposal_for(expected_role, 105));
+                assert!(
+                    received.insert(sequence),
+                    "duplicate proposal receive sequence"
+                );
+                proposal_received = true;
+            }
+            peer::PeerEvent::MlsProposalRejected { request_id, reason } => {
+                panic!("proposal {request_id} was unexpectedly rejected: {reason}")
+            }
+            peer::PeerEvent::MlsProposalDeliveryUnknown { request_id } => {
+                panic!("proposal {request_id} unexpectedly became unknown before disconnect")
             }
             peer::PeerEvent::MlsCommitRequested {
                 group_id,
@@ -404,14 +438,27 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
             .await
             .expect("session should accept a pending MLS Commit");
         command_tx
+            .send(peer::PeerCommand::SendMlsProposal {
+                request_id: 106,
+                proposal: mls_proposal_for(role, 0xfe),
+            })
+            .await
+            .expect("session should accept a pending MLS proposal");
+        command_tx
             .send(peer::PeerCommand::Disconnect)
             .await
             .expect("session should accept explicit disconnect");
         let mut got_unknown = false;
         let mut got_mls_unknown = false;
         let mut got_mls_commit_unknown = false;
+        let mut got_mls_proposal_unknown = false;
         let mut got_disconnected = false;
-        while !got_unknown || !got_mls_unknown || !got_mls_commit_unknown || !got_disconnected {
+        while !got_unknown
+            || !got_mls_unknown
+            || !got_mls_commit_unknown
+            || !got_mls_proposal_unknown
+            || !got_disconnected
+        {
             match tokio::time::timeout(Duration::from_secs(12), event_rx.recv())
                 .await
                 .expect("disconnect should resolve")
@@ -431,6 +478,10 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                     assert_eq!(request_id, 103);
                     got_mls_commit_unknown = true;
                 }
+                peer::PeerEvent::MlsProposalDeliveryUnknown { request_id } => {
+                    assert_eq!(request_id, 106);
+                    got_mls_proposal_unknown = true;
+                }
                 peer::PeerEvent::Received { text, .. } => {
                     assert_ne!(text, UNACKNOWLEDGED_TEXT);
                 }
@@ -445,8 +496,7 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 | peer::PeerEvent::MlsCommitRequested { .. }
                 | peer::PeerEvent::MlsProposalReceived { .. }
                 | peer::PeerEvent::MlsProposalAcknowledged { .. }
-                | peer::PeerEvent::MlsProposalRejected { .. }
-                | peer::PeerEvent::MlsProposalDeliveryUnknown { .. } => {}
+                | peer::PeerEvent::MlsProposalRejected { .. } => {}
                 peer::PeerEvent::Rejected { reason, .. } => {
                     panic!("unexpected rejection: {reason}")
                 }
@@ -532,6 +582,45 @@ fn mls_commit_for(role: &str, id: u8) -> peer::MlsCommitEnvelope {
         predecessor_epoch: 0,
         epoch: 1,
         commit: vec![id; 48],
+    }
+}
+
+fn mls_proposal_for(role: &str, id: u8) -> peer::MlsProposalEnvelope {
+    let seed = if role == "sender" {
+        SENDER_SEED
+    } else {
+        LISTENER_SEED
+    };
+    let proposal = format!("signed MLS proposal bytes {role} {id}").into_bytes();
+    let digest = blake3::hash(&proposal);
+    let mut event_id = [0; 16];
+    event_id.copy_from_slice(&digest.as_bytes()[..16]);
+    if id == 0xfe {
+        event_id[0] = 0xfe;
+        let mut proposal = proposal;
+        // Keep the transport's content-derived event ID valid for the pending case.
+        loop {
+            let digest = blake3::hash(&proposal);
+            event_id.copy_from_slice(&digest.as_bytes()[..16]);
+            if event_id[0] == 0xfe {
+                break;
+            }
+            proposal.push(0);
+        }
+        return peer::MlsProposalEnvelope {
+            event_id,
+            author_device: SigningKey::from_bytes(&seed).verifying_key().to_bytes(),
+            group_id: [0x34; 16].to_vec(),
+            epoch: 4,
+            proposal,
+        };
+    }
+    peer::MlsProposalEnvelope {
+        event_id,
+        author_device: SigningKey::from_bytes(&seed).verifying_key().to_bytes(),
+        group_id: [0x34; 16].to_vec(),
+        epoch: 4,
+        proposal,
     }
 }
 
