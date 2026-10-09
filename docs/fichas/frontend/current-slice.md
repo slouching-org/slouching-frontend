@@ -13,7 +13,8 @@ fields edit in-memory values. The chat screen manually pins a peer device key,
 starts a pinned direct listener or connects to a pinned LAN address, and keeps
 a bidirectional session open for multiple messages with live receive and ACK
 states. Received text is saved in SQLCipher before ACK; sent text is saved
-after ACK. The app reloads the newest 200 messages for the pinned peer.
+after ACK. The app reloads the newest 200 messages for the pinned peer and can
+delete that peer's local history after confirmation.
 Familiar selection, settings and share-source tabs, and the interface
 texture toggle work locally. The familiar screen saves only the display name
 and familiar in SQLCipher

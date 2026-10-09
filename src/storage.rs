@@ -162,6 +162,31 @@ pub fn list_direct_messages(
     list_direct_messages_in(&connection, peer_device, limit)
 }
 
+/// Removes only this peer's local direct-message history.
+pub fn clear_direct_history(peer_device: [u8; 32]) -> Result<usize, String> {
+    let mut connection = open_local_database()?;
+    clear_direct_history_in(&mut connection, peer_device)
+}
+
+fn clear_direct_history_in(
+    connection: &mut Connection,
+    peer_device: [u8; 32],
+) -> Result<usize, String> {
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("could not begin direct history deletion: {error}"))?;
+    let deleted = transaction
+        .execute(
+            "DELETE FROM local_direct_messages WHERE peer_device = ?1",
+            [peer_device.as_slice()],
+        )
+        .map_err(|error| format!("could not clear direct history: {error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("could not commit direct history deletion: {error}"))?;
+    Ok(deleted)
+}
+
 fn list_direct_messages_in(
     connection: &Connection,
     peer_device: [u8; 32],
@@ -1552,6 +1577,21 @@ mod tests {
                 .expect("another peer's history should load separately")
                 .iter()
                 .all(|message| message.text == "separate peer")
+        );
+        drop(connection);
+        let mut connection =
+            open_database(&path, &key).expect("encrypted history should reopen before deletion");
+        assert_eq!(clear_direct_history_in(&mut connection, peer).unwrap(), 2);
+        assert!(
+            list_direct_messages_in(&connection, peer, 200)
+                .expect("cleared peer history should remain queryable")
+                .is_empty()
+        );
+        assert_eq!(
+            list_direct_messages_in(&connection, another_peer, 200)
+                .expect("another peer history should remain")
+                .len(),
+            1
         );
 
         fs::remove_dir_all(directory).expect("temporary database files should be removed");

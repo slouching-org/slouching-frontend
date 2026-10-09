@@ -1485,6 +1485,62 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 });
         scrollable(entries).height(Fill).into()
     };
+    let can_clear_history = state.peer_history_loaded_for.as_deref()
+        == Some(state.peer_public_key.as_str())
+        && !listener_active
+        && state.peer_pending_sends.is_empty()
+        && !state.peer_history_clearing;
+    let history_action: Element<'_, Message> = if state.peer_history_clear_confirmation {
+        column![
+            l.label(
+                "Apagar permanentemente o histórico local deste peer?",
+                11.0,
+                GOLD
+            ),
+            row![
+                l.control(
+                    "close",
+                    "Cancelar",
+                    Some(Message::CancelClearPeerHistory),
+                    false
+                ),
+                l.control(
+                    "check",
+                    "Apagar histórico",
+                    Some(Message::ConfirmClearPeerHistory),
+                    true
+                )
+            ]
+            .spacing(l.px(10.0))
+        ]
+        .spacing(l.px(8.0))
+        .into()
+    } else if state.peer_history_clearing {
+        l.label("Apagando histórico local…", 11.0, GOLD).into()
+    } else if can_clear_history {
+        l.control(
+            "close",
+            "Apagar histórico local deste peer",
+            Some(Message::RequestClearPeerHistory),
+            false,
+        )
+    } else if state.peer_history_loaded_for.as_deref() == Some(state.peer_public_key.as_str())
+        && (listener_active || !state.peer_pending_sends.is_empty())
+    {
+        l.label(
+            "Desconecte a sessão e aguarde as mensagens pendentes antes de apagar o histórico.",
+            11.0,
+            MUTED,
+        )
+        .into()
+    } else {
+        l.label(
+            "Cole a chave pública do peer para carregar o histórico local.",
+            11.0,
+            MUTED,
+        )
+        .into()
+    };
     let body = column![
         row![
             column![
@@ -1500,6 +1556,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
         send_address,
         send_status,
         rule(LINE, 1.0),
+        history_action,
         transcript,
         l.label(
             "QUIC cifra a sessão com a identidade pinada. O histórico fica no SQLCipher local deste dispositivo; ACK confirma recebimento antes do salvamento local do remetente, não leitura. Sem MLS, relay ou NAT traversal.",

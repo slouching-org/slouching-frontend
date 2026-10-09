@@ -176,6 +176,9 @@ struct Slouching {
     peer_send_status: PeerSendStatus,
     peer_transcript: Vec<PeerTranscriptEntry>,
     peer_history_loaded_for: Option<String>,
+    peer_history_generation: u64,
+    peer_history_clear_confirmation: bool,
+    peer_history_clearing: bool,
     peer_listener_handle: Option<Handle>,
     peer_listener_generation: u64,
     peer_session_commands: Option<tokio::sync::mpsc::Sender<peer::PeerCommand>>,
@@ -283,6 +286,9 @@ impl Default for Slouching {
             peer_send_status: PeerSendStatus::Idle,
             peer_transcript: Vec::new(),
             peer_history_loaded_for: None,
+            peer_history_generation: 0,
+            peer_history_clear_confirmation: false,
+            peer_history_clearing: false,
             peer_listener_handle: None,
             peer_listener_generation: 0,
             peer_session_commands: None,
@@ -321,7 +327,15 @@ enum Message {
     CopyDeviceKey,
     CopyPeerListenAddress(String),
     PeerPublicKeyChanged(String),
-    PeerHistoryLoaded(String, Result<Vec<storage::StoredDirectMessage>, String>),
+    PeerHistoryLoaded(
+        u64,
+        String,
+        Result<Vec<storage::StoredDirectMessage>, String>,
+    ),
+    RequestClearPeerHistory,
+    ConfirmClearPeerHistory,
+    CancelClearPeerHistory,
+    PeerHistoryCleared(String, Result<usize, String>),
     PeerListenPortChanged(String),
     PeerAddressChanged(String),
     PeerDraftChanged(String),
@@ -516,11 +530,14 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 state.peer_public_key = value.clone();
                 state.peer_transcript.clear();
                 state.peer_history_loaded_for = None;
+                state.peer_history_generation = state.peer_history_generation.saturating_add(1);
+                state.peer_history_clear_confirmation = false;
             }
             return request_peer_history(state);
         }
-        Message::PeerHistoryLoaded(peer_key, result) => {
-            if state.peer_history_loaded_for.as_deref() == Some(peer_key.as_str())
+        Message::PeerHistoryLoaded(generation, peer_key, result) => {
+            if generation == state.peer_history_generation
+                && state.peer_history_loaded_for.as_deref() == Some(peer_key.as_str())
                 && state.peer_public_key == peer_key
             {
                 match result {
@@ -559,6 +576,57 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     Err(error) => {
                         state.peer_send_status = PeerSendStatus::Failed(format!(
                             "Não foi possível carregar o histórico local: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+        Message::RequestClearPeerHistory => {
+            let can_clear = state.peer_history_loaded_for.as_deref()
+                == Some(state.peer_public_key.as_str())
+                && !state.peer_history_clearing
+                && state.peer_listener_handle.is_none()
+                && state.peer_pending_sends.is_empty();
+            if can_clear {
+                state.peer_history_clear_confirmation = true;
+            }
+        }
+        Message::CancelClearPeerHistory => {
+            state.peer_history_clear_confirmation = false;
+        }
+        Message::ConfirmClearPeerHistory => {
+            if !state.peer_history_clear_confirmation
+                || state.peer_listener_handle.is_some()
+                || !state.peer_pending_sends.is_empty()
+            {
+                return Task::none();
+            }
+            let peer_key = state.peer_public_key.clone();
+            let Ok(peer_id) = parse_peer_id(&peer_key) else {
+                state.peer_history_clear_confirmation = false;
+                return Task::none();
+            };
+            state.peer_history_clear_confirmation = false;
+            state.peer_history_clearing = true;
+            state.peer_history_generation = state.peer_history_generation.saturating_add(1);
+            state.peer_history_loaded_for = None;
+            let peer_device = *peer_id.as_bytes();
+            return Task::perform(clear_direct_history_task(peer_device), move |result| {
+                Message::PeerHistoryCleared(peer_key, result)
+            });
+        }
+        Message::PeerHistoryCleared(peer_key, result) => {
+            state.peer_history_clearing = false;
+            if state.peer_public_key == peer_key {
+                state.peer_history_loaded_for = Some(peer_key);
+                match result {
+                    Ok(_) => {
+                        state.peer_transcript.clear();
+                        state.note = Some("Histórico local deste peer apagado.");
+                    }
+                    Err(error) => {
+                        state.peer_send_status = PeerSendStatus::Failed(format!(
+                            "Não foi possível apagar o histórico local: {error}"
                         ));
                     }
                 }
@@ -1039,6 +1107,12 @@ async fn load_direct_history_task(
         .map_err(|error| format!("direct history task failed: {error}"))?
 }
 
+async fn clear_direct_history_task(peer_device: [u8; 32]) -> Result<usize, String> {
+    tokio::task::spawn_blocking(move || storage::clear_direct_history(peer_device))
+        .await
+        .map_err(|error| format!("direct history deletion task failed: {error}"))?
+}
+
 async fn store_direct_message_task(
     peer_device: [u8; 32],
     direction: storage::DirectMessageDirection,
@@ -1266,9 +1340,11 @@ fn request_peer_history(state: &mut Slouching) -> Task<Message> {
         return Task::none();
     }
     state.peer_history_loaded_for = Some(peer_key.clone());
+    state.peer_history_generation = state.peer_history_generation.saturating_add(1);
+    let generation = state.peer_history_generation;
     let peer_device = *peer_id.as_bytes();
     Task::perform(load_direct_history_task(peer_device), move |result| {
-        Message::PeerHistoryLoaded(peer_key, result)
+        Message::PeerHistoryLoaded(generation, peer_key, result)
     })
 }
 
