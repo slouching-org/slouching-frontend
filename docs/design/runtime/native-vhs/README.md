@@ -22,6 +22,10 @@ These captures show only the native UI. The separate encrypted event-journal
 storage primitives are not connected to the screens, MLS, or delivery and do
 not enable chat.
 
+The encrypted database initializes OpenMLS's versioned SQLite storage schema
+through the same SQLCipher connection. No MLS client state, credentials, key
+packages, or groups are created yet.
+
 The home view keeps the supplied night scenery and call controls, with an
 icon-based feature strip. Its frog mage and gnome foreground cutouts have been
 removed to keep the scene open.

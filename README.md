@@ -68,6 +68,11 @@ in bounded pages. No transport or authenticated receipt feeds those states
 yet. MLS, inbox/outbox UI, delivery, and transport are not connected to these
 primitives; this does not enable chat.
 
+The same SQLCipher database now initializes the OpenMLS SQLite provider's
+versioned storage schema. This is only a persistence foundation: the app does
+not yet create an MLS provider/client, credentials, key packages, groups, or
+persist live MLS state. MLS remains unconnected to the event journal and UI.
+
 ![Native familiar screen showing local profile and identity keyring status, with a retry action when the system keyring is unavailable](docs/design/runtime/native-vhs/01-familiar.png)
 
 ![Actual native Iced home with open scenery and icon-based feature strip, without the frog mage or gnome cutouts](docs/design/runtime/native-vhs/09-home.png)

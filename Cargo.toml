@@ -20,8 +20,10 @@ blake3 = "=1.8.7"
 ed25519-dalek = "=2.2.0"
 getrandom = "=0.3.4"
 keyring = "=4.2.0"
-rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
-zeroize = "=1.8.2"
+openmls = { version = "=0.9.1", default-features = false, features = ["sqlite-provider"] }
+openmls_sqlite_storage = "=0.3.0"
+rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
+zeroize = "=1.9.1"
 
 [build-dependencies]
 prost-build = "=0.14.4"

@@ -1,7 +1,9 @@
 use directories::ProjectDirs;
 use ed25519_dalek::SigningKey;
 use keyring::{Entry, Error as KeyringError};
+use openmls_sqlite_storage::{Codec as OpenMlsCodec, SqliteStorageProvider};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Serialize, de::DeserializeOwned};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -14,6 +16,21 @@ const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
 const PROFILE_SCHEMA_VERSION: u32 = 3;
+
+#[derive(Default)]
+struct OpenMlsJsonCodec;
+
+impl OpenMlsCodec for OpenMlsJsonCodec {
+    type Error = serde_json::Error;
+
+    fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>, Self::Error> {
+        serde_json::to_vec(value)
+    }
+
+    fn from_slice<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Self::Error> {
+        serde_json::from_slice(bytes)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct EncryptedEvent {
@@ -557,7 +574,7 @@ fn database_path() -> Result<PathBuf, String> {
 
 fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connection, String> {
     prepare_database_file(path)?;
-    let connection = Connection::open(path)
+    let mut connection = Connection::open(path)
         .map_err(|error| format!("could not open local profile database: {error}"))?;
     let key_hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
     connection
@@ -626,6 +643,9 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
+    SqliteStorageProvider::<OpenMlsJsonCodec, _>::new(&mut connection)
+        .run_migrations()
+        .map_err(|error| format!("could not initialize encrypted OpenMLS storage: {error}"))?;
     Ok(connection)
 }
 
