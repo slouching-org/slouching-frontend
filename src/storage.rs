@@ -2,7 +2,10 @@ use crate::identity::MlsSigningKeyBinding;
 use directories::ProjectDirs;
 use ed25519_dalek::SigningKey;
 use keyring::{Entry, Error as KeyringError};
-use openmls::prelude::{Ciphersuite, OpenMlsProvider};
+use openmls::prelude::{
+    BasicCredential, Ciphersuite, CredentialWithKey, KeyPackage, OpenMlsProvider,
+    tls_codec::Serialize as TlsCodecSerialize,
+};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::RustCrypto;
 use openmls_sqlite_storage::{Codec as OpenMlsCodec, SqliteStorageProvider};
@@ -120,6 +123,14 @@ pub struct StoredOutboundEvent {
 pub struct StoredInboundEvent {
     pub sequence: i64,
     pub event: EncryptedEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedMlsKeyPackage {
+    pub ciphersuite: u16,
+    pub credential_binding: MlsSigningKeyBinding,
+    /// Public MLS KeyPackage bytes; the corresponding private bundle stays in SQLCipher.
+    pub public_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -597,6 +608,57 @@ pub fn create_or_load_mls_signing_key_binding(
     create_or_load_mls_signing_key_binding_in(&mut connection, ciphersuite, &device_identity)
 }
 
+/// Create a one-use public KeyPackage whose BasicCredential carries the
+/// device-signed binding for its MLS signing key. OpenMLS stores its private
+/// bundle in the encrypted local database.
+pub fn create_mls_key_package(ciphersuite: Ciphersuite) -> Result<PreparedMlsKeyPackage, String> {
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let device_identity = signing_key_from_secret(secret)?;
+    let mut connection = open_local_database()?;
+    create_mls_key_package_in(&mut connection, ciphersuite, &device_identity)
+}
+
+fn create_mls_key_package_in(
+    connection: &mut Connection,
+    ciphersuite: Ciphersuite,
+    device_identity: &SigningKey,
+) -> Result<PreparedMlsKeyPackage, String> {
+    let credential_binding =
+        create_or_load_mls_signing_key_binding_in(connection, ciphersuite, device_identity)?;
+    let credential_identity = credential_binding
+        .to_bytes()
+        .ok_or_else(|| "MLS credential binding could not be encoded".to_owned())?;
+    let key_package = {
+        let provider = LocalOpenMlsProvider::new(connection);
+        let signer = SignatureKeyPair::read(
+            provider.storage(),
+            &credential_binding.mls_signing_public_key,
+            ciphersuite.signature_algorithm(),
+        )
+        .ok_or_else(|| "persisted MLS signing key could not be loaded".to_owned())?;
+        let credential = BasicCredential::new(credential_identity);
+        let credential_with_key = CredentialWithKey {
+            credential: credential.into(),
+            signature_key: credential_binding.mls_signing_public_key.clone().into(),
+        };
+        let bundle = KeyPackage::builder()
+            .build(ciphersuite, &provider, &signer, credential_with_key)
+            .map_err(|error| format!("could not create MLS KeyPackage: {error:?}"))?;
+        bundle
+            .key_package()
+            .tls_serialize_detached()
+            .map_err(|error| format!("could not serialize MLS KeyPackage: {error}"))?
+    };
+    Ok(PreparedMlsKeyPackage {
+        ciphersuite: ciphersuite as u16,
+        credential_binding,
+        public_bytes: key_package,
+    })
+}
+
 fn create_or_load_mls_signing_key_binding_in(
     connection: &mut Connection,
     ciphersuite: Ciphersuite,
@@ -1012,6 +1074,65 @@ mod tests {
         assert!(p256_binding.verify(&device_public_key));
 
         drop(reopened);
+        fs::remove_dir_all(directory).expect("temporary database files should be removed");
+    }
+
+    #[test]
+    fn mls_key_package_is_device_bound_valid_and_stored_with_private_material() {
+        use openmls::prelude::{
+            Ciphersuite, KeyPackageIn, ProtocolVersion,
+            tls_codec::Deserialize as TlsCodecDeserialize,
+        };
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-key-package-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary database directory should be created");
+        let path = directory.join("profile.sqlite3");
+        let database_key = [0x3a; PROFILE_DB_KEY_LEN];
+        let device_identity = SigningKey::from_bytes(&[0x6b; 32]);
+        let device_public_key = device_identity.verifying_key().to_bytes();
+        let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+
+        let mut connection = open_database(&path, &database_key)
+            .expect("temporary database should initialize with SQLCipher and OpenMLS");
+        let prepared = create_mls_key_package_in(&mut connection, ciphersuite, &device_identity)
+            .expect("KeyPackage and private bundle should be created");
+        assert_eq!(prepared.ciphersuite, ciphersuite as u16);
+        assert!(prepared.credential_binding.verify(&device_public_key));
+
+        {
+            let provider = LocalOpenMlsProvider::new(&mut connection);
+            let incoming = KeyPackageIn::tls_deserialize_exact(&prepared.public_bytes)
+                .expect("serialized public KeyPackage should decode without trailing bytes");
+            let validated = incoming
+                .validate(provider.crypto(), ProtocolVersion::Mls10)
+                .expect("OpenMLS should validate the public KeyPackage");
+            let credential_binding = MlsSigningKeyBinding::from_bytes(
+                validated.leaf_node().credential().serialized_content(),
+            )
+            .expect("BasicCredential should contain the encoded device binding");
+            assert_eq!(credential_binding, prepared.credential_binding);
+            assert!(credential_binding.verifies_mls_credential(
+                &device_public_key,
+                validated.ciphersuite().signature_algorithm() as u16,
+                validated.leaf_node().signature_key().as_slice(),
+            ));
+        }
+
+        let private_bundle_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM openmls_key_packages", [], |row| {
+                row.get(0)
+            })
+            .expect("OpenMLS private KeyPackage bundle should be stored in SQLCipher");
+        assert_eq!(private_bundle_count, 1);
+
+        drop(connection);
         fs::remove_dir_all(directory).expect("temporary database files should be removed");
     }
 }

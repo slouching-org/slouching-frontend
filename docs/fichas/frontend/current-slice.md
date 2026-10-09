@@ -21,8 +21,11 @@ credential store. Linux requires Secret Service in the user session. A
 separate explicit action generates a local Ed25519 device signing key and
 stores its seed in the system credential store; the public key is displayed
 as unverified. The core can sign the MLS signing key selected for an OpenMLS
-ciphersuite with this long-term device key. Fingerprint/QR derivation, contact
-pairing, MLS groups, and message history remain unimplemented. If the keyring cannot be read, the screen offers
+ciphersuite with this long-term device key. The core can create a one-use
+OpenMLS KeyPackage whose BasicCredential embeds this binding; OpenMLS keeps its
+private bundle in SQLCipher. No UI publishes or consumes packages yet.
+Fingerprint/QR derivation, contact pairing, MLS groups, and message history
+remain unimplemented. If the keyring cannot be read, the screen offers
 a retry that reuses an existing key rather than replacing it. The display
 profile is distinct from identity.
 

@@ -12,7 +12,7 @@ Its Elixir server/backend core and Rust/Iced client direction are retained.
 | Server/backend | Elixir, separately versioned backend repo | Development status and protobuf handshake implemented |
 | State boundary | Versioned protocol | Asynchronous loopback HTTP status and binary protobuf WebSocket handshake v1 integrated; production boundary pending |
 | Browser UI | HTML/CSS/JavaScript | Historical visual prototype in `prototypes/web/`; not product runtime |
-| Identity, MLS, storage, transport, calls | Client and server responsibilities per source PDF | Display profile and Ed25519 key generation/storage exist; event persistence is not connected to MLS or delivery; fingerprint verification, pairing, messaging, production transport, and calls remain unimplemented |
+| Identity, MLS, storage, transport, calls | Client and server responsibilities per source PDF | Device-bound MLS signer and one-use KeyPackage creation/persistence exist in the Rust core; no UI package exchange, groups, protected messages, event-delivery integration, fingerprint verification, production transport, or calls yet |
 
 The frontend must render authoritative implemented state. It must not generate
 security claims, route badges, presence, or capture status independently.

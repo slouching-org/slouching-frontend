@@ -1,6 +1,8 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 const DOMAIN: &[u8] = b"slouching/device-identity/mls-signing-key-binding";
+const SERIALIZED_BINDING_MAGIC: &[u8; 4] = b"SLMB";
+const MAX_SERIALIZED_MLS_KEY_BYTES: usize = 16 * 1024;
 pub const BINDING_VERSION: u16 = 1;
 
 /// Proof that a device identity authorized one MLS signing key and scheme.
@@ -67,6 +69,78 @@ impl MlsSigningKeyBinding {
             .verify_strict(&payload, &Signature::from_bytes(&self.signature))
             .is_ok()
     }
+
+    /// Verify that this device authorized the MLS key actually carried by a credential.
+    pub fn verifies_mls_credential(
+        &self,
+        expected_device: &[u8; 32],
+        signature_scheme: u16,
+        mls_signing_public_key: &[u8],
+    ) -> bool {
+        self.signature_scheme == signature_scheme
+            && self.mls_signing_public_key == mls_signing_public_key
+            && self.verify(expected_device)
+    }
+
+    /// Encode a bounded, versioned representation for an MLS BasicCredential.
+    pub fn to_bytes(&self) -> Option<Vec<u8>> {
+        let mls_key_len = u32::try_from(self.mls_signing_public_key.len()).ok()?;
+        if self.mls_signing_public_key.is_empty()
+            || self.mls_signing_public_key.len() > MAX_SERIALIZED_MLS_KEY_BYTES
+        {
+            return None;
+        }
+        let mut encoded = Vec::with_capacity(
+            SERIALIZED_BINDING_MAGIC.len()
+                + 2
+                + 2
+                + 32
+                + 4
+                + self.mls_signing_public_key.len()
+                + 64,
+        );
+        encoded.extend_from_slice(SERIALIZED_BINDING_MAGIC);
+        encoded.extend_from_slice(&self.version.to_be_bytes());
+        encoded.extend_from_slice(&self.signature_scheme.to_be_bytes());
+        encoded.extend_from_slice(&self.device_public_key);
+        encoded.extend_from_slice(&mls_key_len.to_be_bytes());
+        encoded.extend_from_slice(&self.mls_signing_public_key);
+        encoded.extend_from_slice(&self.signature);
+        Some(encoded)
+    }
+
+    /// Decode the canonical credential representation, rejecting trailing or oversized data.
+    pub fn from_bytes(encoded: &[u8]) -> Option<Self> {
+        const FIXED_LEN: usize = 4 + 2 + 2 + 32 + 4 + 64;
+        if encoded.len() < FIXED_LEN || &encoded[..4] != SERIALIZED_BINDING_MAGIC {
+            return None;
+        }
+        let version = u16::from_be_bytes(encoded[4..6].try_into().ok()?);
+        if version != BINDING_VERSION {
+            return None;
+        }
+        let signature_scheme = u16::from_be_bytes(encoded[6..8].try_into().ok()?);
+        let device_public_key = encoded[8..40].try_into().ok()?;
+        let mls_key_len =
+            usize::try_from(u32::from_be_bytes(encoded[40..44].try_into().ok()?)).ok()?;
+        if mls_key_len == 0 || mls_key_len > MAX_SERIALIZED_MLS_KEY_BYTES {
+            return None;
+        }
+        let expected_len = FIXED_LEN.checked_add(mls_key_len)?;
+        if encoded.len() != expected_len {
+            return None;
+        }
+        let mls_key_end = 44 + mls_key_len;
+        let mls_signing_public_key = encoded[44..mls_key_end].to_vec();
+        let signature = encoded[mls_key_end..].try_into().ok()?;
+        Some(Self {
+            version,
+            device_public_key,
+            signature_scheme,
+            mls_signing_public_key,
+            signature,
+        })
+    }
 }
 
 fn binding_payload(
@@ -112,5 +186,35 @@ mod tests {
         assert!(!changed_version.verify(&device_public));
 
         assert!(!binding.verify(&other_device.verifying_key().to_bytes()));
+    }
+
+    #[test]
+    fn binding_credential_encoding_is_bounded_canonical_and_verifiable() {
+        let device = SigningKey::from_bytes(&[0x37; 32]);
+        let binding = MlsSigningKeyBinding::sign(&device, 0x0807, &[0x51; 32]).unwrap();
+        let encoded = binding.to_bytes().expect("binding should encode");
+        assert_eq!(
+            MlsSigningKeyBinding::from_bytes(&encoded),
+            Some(binding.clone())
+        );
+        assert!(binding.verify(&device.verifying_key().to_bytes()));
+        assert!(binding.verifies_mls_credential(
+            &device.verifying_key().to_bytes(),
+            0x0807,
+            &[0x51; 32]
+        ));
+        assert!(!binding.verifies_mls_credential(
+            &device.verifying_key().to_bytes(),
+            0x0808,
+            &[0x51; 32]
+        ));
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(MlsSigningKeyBinding::from_bytes(&trailing).is_none());
+
+        let mut wrong_version = encoded;
+        wrong_version[4..6].copy_from_slice(&2_u16.to_be_bytes());
+        assert!(MlsSigningKeyBinding::from_bytes(&wrong_version).is_none());
     }
 }
