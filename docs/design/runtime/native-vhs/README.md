@@ -37,8 +37,8 @@ The familiar-screen capture was refreshed after adding the core's signed
 device-to-MLS key binding primitive. The chat capture now shows the per-peer
 SQLCipher history UI. The capture's Secret Service is unavailable, so the
 identity action is shown and sending/listening are gated; no conversation data
-is present. The key binding primitive does not verify contacts or provide
-pairing.
+is present. The UI also offers confirmed deletion of one peer's local history.
+The key binding primitive does not verify contacts or provide pairing.
 
 The home view keeps the supplied night scenery and call controls, with an
 icon-based feature strip. Its frog mage and gnome foreground cutouts have been
