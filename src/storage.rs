@@ -1,6 +1,8 @@
 use directories::ProjectDirs;
 use ed25519_dalek::SigningKey;
 use keyring::{Entry, Error as KeyringError};
+use openmls::prelude::OpenMlsProvider;
+use openmls_rust_crypto::RustCrypto;
 use openmls_sqlite_storage::{Codec as OpenMlsCodec, SqliteStorageProvider};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Serialize, de::DeserializeOwned};
@@ -20,32 +22,30 @@ const PROFILE_SCHEMA_VERSION: u32 = 3;
 #[derive(Default)]
 struct OpenMlsJsonCodec;
 
-#[cfg(test)]
-use openmls::prelude::OpenMlsProvider;
-#[cfg(test)]
-use openmls_rust_crypto::RustCrypto;
-
-#[cfg(test)]
 struct LocalOpenMlsProvider<'connection> {
     crypto: RustCrypto,
-    storage: SqliteStorageProvider<OpenMlsJsonCodec, &'connection Connection>,
+    storage: SqliteStorageProvider<OpenMlsJsonCodec, &'connection mut Connection>,
 }
 
-#[cfg(test)]
 impl<'connection> LocalOpenMlsProvider<'connection> {
-    fn new(connection: &'connection Connection) -> Self {
+    fn new(connection: &'connection mut Connection) -> Self {
         Self {
             crypto: RustCrypto::default(),
             storage: SqliteStorageProvider::new(connection),
         }
     }
+
+    fn run_migrations(&mut self) -> Result<(), String> {
+        self.storage
+            .run_migrations()
+            .map_err(|error| error.to_string())
+    }
 }
 
-#[cfg(test)]
 impl<'connection> OpenMlsProvider for LocalOpenMlsProvider<'connection> {
     type CryptoProvider = RustCrypto;
     type RandProvider = RustCrypto;
-    type StorageProvider = SqliteStorageProvider<OpenMlsJsonCodec, &'connection Connection>;
+    type StorageProvider = SqliteStorageProvider<OpenMlsJsonCodec, &'connection mut Connection>;
 
     fn storage(&self) -> &Self::StorageProvider {
         &self.storage
@@ -683,7 +683,7 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
-    SqliteStorageProvider::<OpenMlsJsonCodec, _>::new(&mut connection)
+    LocalOpenMlsProvider::new(&mut connection)
         .run_migrations()
         .map_err(|error| format!("could not initialize encrypted OpenMLS storage: {error}"))?;
     Ok(connection)
@@ -760,7 +760,7 @@ mod tests {
         let mut public_key = None;
 
         for attempt in 0..2 {
-            let connection = open_database(&path, &key)
+            let mut connection = open_database(&path, &key)
                 .expect("encrypted profile and OpenMLS migrations should succeed");
             let cipher_version: String = connection
                 .query_row("PRAGMA cipher_version", [], |row| row.get(0))
@@ -777,7 +777,7 @@ mod tests {
                 .expect("OpenMLS signature-key table should be queryable");
             assert_eq!(openmls_table_count, 1);
 
-            let provider = LocalOpenMlsProvider::new(&connection);
+            let provider = LocalOpenMlsProvider::new(&mut connection);
             if attempt == 0 {
                 let signer = SignatureKeyPair::new(signature_scheme)
                     .expect("MLS signature key should be generated");
@@ -795,13 +795,13 @@ mod tests {
             )
             .expect("persisted MLS signature key should load through the SQL provider");
             assert_eq!(loaded_signer.public(), public_key.as_deref().unwrap());
+            drop(provider);
             let signature_key_count: i64 = connection
                 .query_row("SELECT COUNT(*) FROM openmls_signature_keys", [], |row| {
                     row.get(0)
                 })
                 .expect("OpenMLS signature keys should be queryable");
             assert_eq!(signature_key_count, 1);
-            drop(provider);
         }
 
         fs::remove_dir_all(directory).expect("temporary database files should be removed");

@@ -68,10 +68,11 @@ in bounded pages. No transport or authenticated receipt feeds those states
 yet. MLS, inbox/outbox UI, delivery, and transport are not connected to these
 primitives; this does not enable chat.
 
-The same SQLCipher database now initializes the OpenMLS SQLite provider's
-versioned storage schema. This is only a persistence foundation: the app does
-not yet create an MLS provider/client, credentials, key packages, groups, or
-persist live MLS state. MLS remains unconnected to the event journal and UI.
+Opening the same SQLCipher database now composes OpenMLS RustCrypto with the
+SQLite storage provider and initializes its versioned schema. This is only a
+persistence foundation: the app does not yet create credentials, key
+packages, groups, or live MLS state. MLS remains unconnected to the event
+journal and UI.
 A storage test verifies the encrypted schema, repeats both migrations, and
 stores then reloads an MLS signing key across database opens in a temporary
 database. The test composes OpenMLS's RustCrypto and SQL storage providers;
