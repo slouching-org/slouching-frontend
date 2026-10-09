@@ -49,6 +49,12 @@ pub struct StoredOutboundEvent {
 }
 
 #[derive(Debug, Clone)]
+pub struct StoredInboundEvent {
+    pub sequence: i64,
+    pub event: EncryptedEvent,
+}
+
+#[derive(Debug, Clone)]
 pub struct LocalProfile {
     pub display_name: String,
     pub familiar: String,
@@ -195,6 +201,66 @@ pub fn list_outbound_events(
                 ciphertext,
             },
             state: OutboundDeliveryState::try_from(state.as_str())?,
+        });
+    }
+    Ok(events)
+}
+
+/// Loads locally persisted inbound ciphertext in bounded cursor pages.
+pub fn list_inbound_events(
+    after_sequence: i64,
+    limit: usize,
+) -> Result<Vec<StoredInboundEvent>, String> {
+    if after_sequence < 0 || !(1..=500).contains(&limit) {
+        return Err("inbound event batch size must be between 1 and 500".to_owned());
+    }
+    let connection = open_local_database()?;
+    let mut statement = connection
+        .prepare(
+            "SELECT rowid, event_id, author_device, group_id, epoch, checkpoint,
+                    expires_at_unix, ciphertext
+             FROM local_events WHERE direction = 'inbound' AND rowid > ?1
+             ORDER BY rowid LIMIT ?2",
+        )
+        .map_err(|error| format!("could not prepare local inbox query: {error}"))?;
+    let rows = statement
+        .query_map(params![after_sequence, limit as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Vec<u8>>(7)?,
+            ))
+        })
+        .map_err(|error| format!("could not query local inbox: {error}"))?;
+    let mut events = Vec::new();
+    for row in rows {
+        let (
+            sequence,
+            event_id,
+            author_device,
+            group_id,
+            epoch,
+            checkpoint,
+            expires_at_unix,
+            ciphertext,
+        ) = row.map_err(|error| format!("could not read local inbox event: {error}"))?;
+        events.push(StoredInboundEvent {
+            sequence,
+            event: EncryptedEvent {
+                event_id: fixed_bytes(event_id, "event id")?,
+                author_device: fixed_bytes(author_device, "author device key")?,
+                group_id,
+                epoch: u64::try_from(epoch)
+                    .map_err(|_| "saved event has an invalid MLS epoch".to_owned())?,
+                checkpoint,
+                expires_at_unix,
+                ciphertext,
+            },
         });
     }
     Ok(events)
