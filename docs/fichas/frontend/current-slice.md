@@ -2,8 +2,8 @@
 
 **Status:** eleven native Rust/Iced screens, including direct-LAN Iroh/QUIC
 text with per-peer local history in SQLCipher. Core MLS membership and atomic
-application-message encryption plus outbox persistence now work; product UI,
-inbound event handling, and network delivery remain open.
+application-message encryption plus inbound/outbound journal processing now
+work; product UI and network delivery remain open.
 
 The frontend's `src/main.rs` owns application state and local transport;
 `src/ui.rs` composes the eleven source-board views with native widgets,
@@ -33,8 +33,10 @@ merge its Commit into local state, return Commit/Welcome/ratchet-tree bytes, and
 process a Welcome on the joining device. It can encrypt an application payload
 at the current epoch and persist the serialized MLS message as a queued outbox
 event in the same SQLCipher transaction as the MLS ratchet update. Inbound
-event handling, network delivery, fingerprint/QR derivation, contact pairing,
-and MLS group history remain unimplemented. If the keyring cannot be read, the screen offers
+processing authenticates the event AAD and sender binding, persists ciphertext
+before returning plaintext, and deduplicates exact redelivery in the same
+transaction as the ratchet update. Network delivery, fingerprint/QR derivation,
+contact pairing, and MLS group history remain unimplemented. If the keyring cannot be read, the screen offers
 a retry that reuses an existing key rather than replacing it. The display
 profile is distinct from identity.
 
@@ -42,9 +44,9 @@ The encrypted SQLite schema now includes an event journal for opaque inbound
 and outbound ciphertext, with stable random IDs, envelope metadata, BLAKE3
 ciphertext digests, and duplicate/conflict handling. These storage primitives
 also retain queued, peer-held, received, expired, or failed outbox state and
-load bounded cursor pages for both inbox and outbox. They are not connected to
-the UI, MLS, or peer transport; only trusted protocol code may record a real
-receipt.
+load bounded cursor pages for both inbox and outbox. MLS application processing
+now stores ciphertext in this journal and changes OpenMLS state transactionally;
+transport delivery, UI, and authenticated remote receipts remain open.
 
 Character scenes and call views remain visual previews. The chat screen sends
 and receives actual multiple-message sessions over pinned-device Iroh/QUIC and

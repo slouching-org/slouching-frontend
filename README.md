@@ -101,11 +101,14 @@ create and persist a local single-member MLS group with this device as its
 creator and designated committer. The core can admit a device-bound KeyPackage,
 merge its Commit into local group state, return Commit/Welcome/ratchet-tree
 bytes, and process the invitee's Welcome against its locally stored private
-package. The core can encrypt MLS application payloads and atomically persist
+package. The core encrypts MLS application payloads and atomically persists
 the serialized message in the queued outbox alongside the MLS ratchet update.
-A two-database test verifies that another member authenticates and decrypts
-the payload. The Iced UI does not expose group creation, invitation, or MLS
-messaging; inbound event processing and network delivery remain unimplemented. The direct-LAN screen
+Inbound processing authenticates the sender binding and event metadata, stores
+ciphertext before returning plaintext, and deduplicates exact redelivery in the
+same SQLCipher transaction as the MLS ratchet update. Two-database tests verify
+delivery, deduplication, and rejection without partial state. The Iced UI does
+not expose group creation, invitation, or MLS messaging; network delivery
+remains unimplemented. The direct-LAN screen
 manually pins device public keys separately. The local profile remains
 separate from that key. Character scenes, call views, and design-board examples
 remain visual previews. The dedicated chat screen shows only real direct-LAN
@@ -119,21 +122,22 @@ primitives for opaque, already-encrypted inbound and outbound events. It
 deduplicates identical event IDs and rejects reuse with different ciphertext
 or envelope metadata. Outbound rows have local queued/held/received/expired/
 failed states and bounded cursor-paginated reads; the inbox can also be read
-in bounded pages. No transport or authenticated receipt feeds those states
-yet. The direct-LAN transcript is persisted in a separate per-peer table, not
-this journal. Outbound MLS application ciphertext now enters its retryable
-outbox atomically with the ratchet update; inbound processing and durable
-inbox UI remain unimplemented.
+in bounded pages. No transport or authenticated remote receipt feeds those
+states yet. The direct-LAN transcript is persisted in a separate per-peer
+table, not this journal. OpenMLS outbound and inbound application processing
+now updates its ratchet and writes the opaque event in one SQLCipher
+transaction; there is no product UI or delivery transport for these events.
 
 Opening the same SQLCipher database now composes OpenMLS RustCrypto with the
 SQLite storage provider and initializes its versioned schema. The event
-journal receives outbound MLS application messages, but is not yet connected
-to an incoming-message flow or the UI. The core creates and persists a
+journal receives encrypted MLS application messages on send and receive, but
+is not connected to the UI or a delivery transport. Inbound processing
+authenticates event metadata and sender credentials, persists before returning
+plaintext, and safely deduplicates exact redelivery. The core creates and persists a
 local group and indexes its creator as designated committer. It can admit a
 device-bound KeyPackage, merge its Commit into local state, return
 Commit/Welcome/ratchet-tree bytes, and process a Welcome on the joining client.
-There is no UI group or invitation flow, MLS inbound processing, or network
-event delivery integration.
+There is no UI group or invitation flow, or network event delivery integration.
 A caller can explicitly create or load a distinct MLS signing key for a
 chosen OpenMLS ciphersuite. Its public key is signed by the long-term device
 identity and the MLS key is stored in the encrypted database. Repeated calls
@@ -185,7 +189,7 @@ Assets and font license/provenance notes are in [assets/README.md](assets/README
   are implemented. A pinned-device Iroh/QUIC LAN text exchange is available
   from the Iced UI with a persistent bidirectional session and per-peer history
   in SQLCipher. Outbound MLS application encryption is atomically persisted in
-  the event outbox; inbound MLS handling, transport delivery, and media remain unbuilt.
+  the event journal; transport delivery, UI exposure, and media remain unbuilt.
 - **Server/backend:** Elixir in
   [`slouching-org/slouching-backend`](https://github.com/slouching-org/slouching-backend).
 - **Current boundary:** loopback HTTP status and binary protobuf WebSocket

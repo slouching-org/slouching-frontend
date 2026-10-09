@@ -34,6 +34,15 @@ type StoredEventEnvelope = (
     Option<Vec<u8>>,
     i64,
 );
+type StoredInboundEnvelope = (
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    i64,
+    Option<Vec<u8>>,
+    i64,
+    Vec<u8>,
+);
 
 #[derive(Default)]
 struct OpenMlsJsonCodec;
@@ -329,6 +338,12 @@ pub struct PreparedMlsApplicationEvent {
     pub wire_message: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessedMlsApplicationEvent {
+    Received(Vec<u8>),
+    Duplicate,
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalProfile {
     pub display_name: String,
@@ -496,12 +511,6 @@ fn create_mls_application_event_in(
             )
             .ok_or_else(|| "MLS signing key material is missing".to_owned())?;
             let epoch = group.epoch().as_u64();
-            let message = group
-                .create_message(&provider, &signer, plaintext)
-                .map_err(|error| format!("could not encrypt MLS application message: {error:?}"))?;
-            let wire_message = message
-                .tls_serialize_detached()
-                .map_err(|error| format!("could not serialize MLS application message: {error}"))?;
             let mut event_id = [0_u8; 16];
             getrandom::fill(&mut event_id)
                 .map_err(|error| format!("could not generate MLS event id: {error}"))?;
@@ -512,7 +521,18 @@ fn create_mls_application_event_in(
                 epoch,
                 checkpoint: None,
                 expires_at_unix,
+                ciphertext: Vec::new(),
+            };
+            group.set_aad(mls_event_aad(&event));
+            let message = group
+                .create_message(&provider, &signer, plaintext)
+                .map_err(|error| format!("could not encrypt MLS application message: {error:?}"))?;
+            let wire_message = message
+                .tls_serialize_detached()
+                .map_err(|error| format!("could not serialize MLS application message: {error}"))?;
+            let event = EncryptedEvent {
                 ciphertext: wire_message.clone(),
+                ..event
             };
             (event, wire_message)
         };
@@ -542,6 +562,189 @@ fn create_mls_application_event_in(
         })
     })();
     finish_sql_transaction(connection, result, "MLS application outbox")
+}
+
+/// Authenticates and decrypts a queued MLS event, saving its ciphertext before
+/// returning plaintext to the caller. Callers may acknowledge only after this
+/// function succeeds.
+pub fn process_inbound_mls_application_event(
+    event: &EncryptedEvent,
+) -> Result<ProcessedMlsApplicationEvent, String> {
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let device_identity = signing_key_from_secret(secret)?;
+    let mut connection = open_local_database()?;
+    process_inbound_mls_application_event_in(&mut connection, event, &device_identity)
+}
+
+fn process_inbound_mls_application_event_in(
+    connection: &mut Connection,
+    event: &EncryptedEvent,
+    device_identity: &SigningKey,
+) -> Result<ProcessedMlsApplicationEvent, String> {
+    use openmls::prelude::{
+        MlsMessageIn, ProcessedMessageContent, tls_codec::Deserialize as TlsCodecDeserialize,
+    };
+
+    if event.event_id.iter().all(|byte| *byte == 0)
+        || event.author_device.iter().all(|byte| *byte == 0)
+        || event.group_id.len() != 16
+        || event.epoch > i64::MAX as u64
+        || event.expires_at_unix <= 0
+        || event.ciphertext.is_empty()
+        || event.ciphertext.len() > 32 * 1024
+    {
+        return Err("inbound MLS event envelope is incomplete or invalid".to_owned());
+    }
+    let digest = blake3::hash(&event.ciphertext);
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| format!("could not begin inbound MLS transaction: {error}"))?;
+    let result = (|| {
+        let existing: Option<StoredInboundEnvelope> = connection
+            .query_row(
+                "SELECT author_device, group_id, ciphertext_digest, epoch, checkpoint,
+                            expires_at_unix, ciphertext FROM local_events WHERE event_id = ?1",
+                [event.event_id.as_slice()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("could not check inbound MLS deduplication: {error}"))?;
+        if let Some((author, group, stored_digest, epoch, checkpoint, expiry, ciphertext)) =
+            existing
+        {
+            if author != event.author_device
+                || group != event.group_id
+                || stored_digest != digest.as_bytes()
+                || epoch != event.epoch as i64
+                || checkpoint != event.checkpoint
+                || expiry != event.expires_at_unix
+                || ciphertext != event.ciphertext
+            {
+                return Err(
+                    "MLS event id was reused with different envelope or ciphertext".to_owned(),
+                );
+            }
+            return Ok(ProcessedMlsApplicationEvent::Duplicate);
+        }
+
+        let incoming = MlsMessageIn::tls_deserialize_exact(&event.ciphertext)
+            .map_err(|error| format!("invalid serialized MLS message: {error}"))?;
+        let expected_group_id = GroupId::from_slice(&event.group_id);
+        let (plaintext, processed_epoch, processed_group_id, authenticated_data, sender_device) = {
+            let provider = LocalOpenMlsProvider::new(connection);
+            let mut group = MlsGroup::load(provider.storage(), &expected_group_id)
+                .map_err(|error| format!("could not load inbound MLS group: {error}"))?
+                .ok_or_else(|| "inbound MLS group is not joined on this device".to_owned())?;
+            let own_leaf = group
+                .own_leaf()
+                .ok_or_else(|| "local MLS member leaf is missing".to_owned())?;
+            let own_binding =
+                MlsSigningKeyBinding::from_bytes(own_leaf.credential().serialized_content())
+                    .ok_or_else(|| {
+                        "local MLS credential has no device identity binding".to_owned()
+                    })?;
+            if own_binding.device_public_key != device_identity.verifying_key().to_bytes()
+                || !own_binding.verifies_mls_credential(
+                    &own_binding.device_public_key,
+                    group.ciphersuite().signature_algorithm() as u16,
+                    own_leaf.signature_key().as_slice(),
+                )
+            {
+                return Err("MLS group is not bound to this device identity".to_owned());
+            }
+            let processed = group
+                .process_message(
+                    &provider,
+                    incoming.try_into_protocol_message().map_err(|error| {
+                        format!("inbound message is not an MLS protocol message: {error}")
+                    })?,
+                )
+                .map_err(|error| {
+                    format!("could not authenticate or decrypt MLS message: {error:?}")
+                })?;
+            let sender_binding =
+                MlsSigningKeyBinding::from_bytes(processed.credential().serialized_content())
+                    .ok_or_else(|| {
+                        "MLS sender credential has no device identity binding".to_owned()
+                    })?;
+            if sender_binding.device_public_key != event.author_device
+                || !sender_binding.verifies_mls_credential(
+                    &event.author_device,
+                    group.ciphersuite().signature_algorithm() as u16,
+                    // OpenMLS has authenticated the sender's credential and signature.
+                    &sender_binding.mls_signing_public_key,
+                )
+            {
+                return Err("MLS sender does not match the event author device".to_owned());
+            }
+            let authenticated_data = processed.aad().to_vec();
+            let processed_group_id = processed.group_id().to_vec();
+            let processed_epoch = processed.epoch().as_u64();
+            let plaintext = match processed.into_content() {
+                ProcessedMessageContent::ApplicationMessage(message) => message.into_bytes(),
+                _ => return Err("inbound MLS event is not an application message".to_owned()),
+            };
+            (
+                plaintext,
+                processed_epoch,
+                processed_group_id,
+                authenticated_data,
+                sender_binding.device_public_key,
+            )
+        };
+        if processed_group_id != event.group_id
+            || processed_epoch != event.epoch
+            || sender_device != event.author_device
+            || authenticated_data != mls_event_aad(event)
+        {
+            return Err("authenticated MLS message does not match its event envelope".to_owned());
+        }
+        connection
+            .execute(
+                "INSERT INTO local_events
+                    (event_id, direction, author_device, group_id, epoch, checkpoint,
+                     ciphertext_digest, ciphertext, expires_at_unix, delivery_state)
+                 VALUES (?1, 'inbound', ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'received_by_device')",
+                params![
+                    event.event_id.as_slice(),
+                    event.author_device.as_slice(),
+                    event.group_id,
+                    event.epoch as i64,
+                    event.checkpoint,
+                    digest.as_bytes().as_slice(),
+                    event.ciphertext,
+                    event.expires_at_unix
+                ],
+            )
+            .map_err(|error| format!("could not persist inbound MLS event: {error}"))?;
+        Ok(ProcessedMlsApplicationEvent::Received(plaintext))
+    })();
+    finish_sql_transaction(connection, result, "inbound MLS event")
+}
+
+fn mls_event_aad(event: &EncryptedEvent) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(80 + event.group_id.len());
+    aad.extend_from_slice(b"slouching/mls-event/v1");
+    aad.extend_from_slice(&event.event_id);
+    aad.extend_from_slice(&event.author_device);
+    aad.extend_from_slice(&(event.group_id.len() as u32).to_be_bytes());
+    aad.extend_from_slice(&event.group_id);
+    aad.extend_from_slice(&event.epoch.to_be_bytes());
+    aad.extend_from_slice(&event.expires_at_unix.to_be_bytes());
+    aad
 }
 
 /// Loads a bounded page for a future delivery worker; this does not send it.
@@ -2111,10 +2314,7 @@ mod tests {
 
     #[test]
     fn mls_application_event_encrypts_and_atomically_enters_retryable_outbox() {
-        use openmls::prelude::{
-            Ciphersuite, MlsMessageIn, ProcessedMessageContent,
-            tls_codec::Deserialize as TlsCodecDeserialize,
-        };
+        use openmls::prelude::Ciphersuite;
 
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2172,24 +2372,50 @@ mod tests {
         assert_eq!(queued.0, "queued");
         assert_eq!(queued.1, prepared.wire_message);
 
-        let incoming = MlsMessageIn::tls_deserialize_exact(&prepared.wire_message)
-            .expect("serialized MLS message should decode exactly");
-        let decrypted = {
-            let provider = LocalOpenMlsProvider::new(&mut receiver);
-            let mut joined =
-                MlsGroup::load(provider.storage(), &GroupId::from_slice(&group.group_id))
-                    .expect("receiver group should load")
-                    .expect("receiver group should exist");
-            joined
-                .process_message(&provider, incoming.try_into_protocol_message().unwrap())
-                .expect("receiver should authenticate and decrypt MLS message")
-        };
-        match decrypted.into_content() {
-            ProcessedMessageContent::ApplicationMessage(message) => {
-                assert_eq!(message.into_bytes(), payload);
-            }
-            other => panic!("expected MLS application content, got {other:?}"),
-        }
+        let mut forged = prepared.event.clone();
+        forged.event_id = [0x91; 16];
+        forged.author_device = [0x92; 32];
+        assert!(
+            process_inbound_mls_application_event_in(&mut receiver, &forged, &receiver_identity,)
+                .is_err()
+        );
+        let rejected_rows: i64 = receiver
+            .query_row(
+                "SELECT COUNT(*) FROM local_events WHERE event_id = ?1",
+                [forged.event_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("rejected message should not remain in the inbox");
+        assert_eq!(rejected_rows, 0);
+
+        assert_eq!(
+            process_inbound_mls_application_event_in(
+                &mut receiver,
+                &prepared.event,
+                &receiver_identity,
+            )
+            .expect("receiver should authenticate, persist, and decrypt MLS message"),
+            ProcessedMlsApplicationEvent::Received(payload.to_vec())
+        );
+        assert_eq!(
+            process_inbound_mls_application_event_in(
+                &mut receiver,
+                &prepared.event,
+                &receiver_identity,
+            )
+            .expect("redelivery of the same event should deduplicate"),
+            ProcessedMlsApplicationEvent::Duplicate
+        );
+        let inbound_count: i64 = receiver
+            .query_row(
+                "SELECT COUNT(*) FROM local_events
+                 WHERE event_id = ?1 AND direction = 'inbound'
+                   AND delivery_state = 'received_by_device'",
+                [prepared.event.event_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("inbound ciphertext should be durable before returning plaintext");
+        assert_eq!(inbound_count, 1);
         drop(receiver);
         drop(sender);
         fs::remove_dir_all(directory).expect("temporary databases should be removed");
