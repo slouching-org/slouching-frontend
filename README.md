@@ -47,13 +47,15 @@ screen, then exchange the 64-character public-key hex values out of band.
 Start the receiver on device A, pinning device B's public key:
 
 ```sh
-cargo run -- --lan-listen 45873 --expect-peer <DEVICE_B_PUBLIC_KEY_HEX>
+PEER_KEY='REPLACE_WITH_DEVICE_B_64_CHAR_PUBLIC_KEY_HEX'
+cargo run -- --lan-listen 45873 --expect-peer "$PEER_KEY"
 ```
 
 On device B, use A's LAN IPv4 address and public key:
 
 ```sh
-cargo run -- --lan-send 192.168.1.20:45873 --expect-peer <DEVICE_A_PUBLIC_KEY_HEX> --text 'hello from the crew'
+PEER_KEY='REPLACE_WITH_DEVICE_A_64_CHAR_PUBLIC_KEY_HEX'
+cargo run -- --lan-send 192.168.1.20:45873 --expect-peer "$PEER_KEY" --text 'hello from the crew'
 ```
 
 The listener accepts only the pinned Iroh EndpointId, and the sender dials the

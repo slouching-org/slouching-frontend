@@ -47,13 +47,15 @@ Create an identity on each device in the Familiar screen and exchange the
 displayed public-key hex values out of band. On device A:
 
 ```sh
-cargo run -- --lan-listen 45873 --expect-peer <DEVICE_B_PUBLIC_KEY_HEX>
+PEER_KEY='REPLACE_WITH_DEVICE_B_64_CHAR_PUBLIC_KEY_HEX'
+cargo run -- --lan-listen 45873 --expect-peer "$PEER_KEY"
 ```
 
 Find A's LAN IPv4 address with `ip -4 addr`. On device B:
 
 ```sh
-cargo run -- --lan-send 192.168.1.20:45873 --expect-peer <DEVICE_A_PUBLIC_KEY_HEX> --text 'hello from the crew'
+PEER_KEY='REPLACE_WITH_DEVICE_A_64_CHAR_PUBLIC_KEY_HEX'
+cargo run -- --lan-send 192.168.1.20:45873 --expect-peer "$PEER_KEY" --text 'hello from the crew'
 ```
 
 Both machines need to allow the selected UDP port on their local networks. The
