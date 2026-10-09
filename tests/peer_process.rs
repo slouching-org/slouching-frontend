@@ -156,20 +156,37 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
     let mut events = Box::pin(session.run(command_rx));
     let event_pump = tokio::spawn(async move {
         while let Some(event) = events.next().await {
-            let sequence_to_ack = match &event {
+            let inbound_action = match &event {
                 peer::PeerEvent::Received { sequence, text } if text != UNACKNOWLEDGED_TEXT => {
-                    Some(*sequence)
+                    Some((*sequence, None))
                 }
                 peer::PeerEvent::MlsEventReceived { sequence, event }
                     if event.event_id[0] != 0xfe =>
                 {
-                    Some(*sequence)
+                    Some((*sequence, None))
+                }
+                peer::PeerEvent::MlsCommitReceived { sequence, commit }
+                    if commit.event_id[0] == 103 =>
+                {
+                    Some((*sequence, Some("rejected by process test")))
+                }
+                peer::PeerEvent::MlsCommitReceived { sequence, commit }
+                    if commit.event_id[0] != 0xfe =>
+                {
+                    Some((*sequence, None))
                 }
                 _ => None,
             };
-            if let Some(sequence) = sequence_to_ack {
+            if let Some((sequence, rejection)) = inbound_action {
+                let command = match rejection {
+                    Some(reason) => peer::PeerCommand::RejectInbound {
+                        sequence,
+                        reason: reason.to_owned(),
+                    },
+                    None => peer::PeerCommand::AcceptInbound { sequence },
+                };
                 ack_commands
-                    .send(peer::PeerCommand::AcceptInbound { sequence })
+                    .send(command)
                     .await
                     .expect("session command receiver should remain open");
             }
@@ -195,14 +212,34 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
         })
         .await
         .expect("session should accept an opaque MLS event");
+    command_tx
+        .send(peer::PeerCommand::SendMlsCommit {
+            request_id: 102,
+            commit: mls_commit_for(role, 102),
+        })
+        .await
+        .expect("session should accept an MLS Commit");
+    command_tx
+        .send(peer::PeerCommand::SendMlsCommit {
+            request_id: 103,
+            commit: mls_commit_for(role, 103),
+        })
+        .await
+        .expect("session should accept a Commit the remote side rejects");
     let mut acknowledged = HashSet::new();
     let mut received = HashSet::new();
     let mut event_acknowledged = false;
     let mut event_received = false;
+    let mut commit_acknowledged = false;
+    let mut commit_received = false;
+    let mut commit_rejected = false;
     while acknowledged.len() < MESSAGE_COUNT as usize
         || received.len() < MESSAGE_COUNT as usize
         || !event_acknowledged
         || !event_received
+        || !commit_acknowledged
+        || !commit_received
+        || !commit_rejected
     {
         let event = tokio::time::timeout(Duration::from_secs(15), event_rx.recv())
             .await
@@ -218,6 +255,17 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 assert_eq!(request_id, 100);
                 assert!(!event_acknowledged, "duplicate MLS event ACK");
                 event_acknowledged = true;
+            }
+            peer::PeerEvent::MlsCommitAcknowledged { request_id } => {
+                assert_eq!(request_id, 102);
+                assert!(!commit_acknowledged, "duplicate MLS Commit ACK");
+                commit_acknowledged = true;
+            }
+            peer::PeerEvent::MlsCommitRejected { request_id, reason } => {
+                assert_eq!(request_id, 103);
+                assert_eq!(reason, "rejected by process test");
+                assert!(!commit_rejected, "duplicate MLS Commit rejection");
+                commit_rejected = true;
             }
             peer::PeerEvent::Received { sequence, text } => {
                 let expected_role = if role == "listener" {
@@ -241,6 +289,21 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 assert!(received.insert(sequence), "duplicate receive sequence");
                 event_received = true;
             }
+            peer::PeerEvent::MlsCommitReceived { sequence, commit } => {
+                let expected_role = if role == "listener" {
+                    "sender"
+                } else {
+                    "listener"
+                };
+                if commit.event_id[0] == 103 {
+                    assert_eq!(commit, mls_commit_for(expected_role, 103));
+                    assert!(received.insert(sequence), "duplicate receive sequence");
+                    continue;
+                }
+                assert_eq!(commit, mls_commit_for(expected_role, 102));
+                assert!(received.insert(sequence), "duplicate receive sequence");
+                commit_received = true;
+            }
             peer::PeerEvent::Rejected { reason, .. } => {
                 panic!("message was unexpectedly rejected: {reason}")
             }
@@ -252,6 +315,9 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
             }
             peer::PeerEvent::MlsEventDeliveryUnknown { .. } => {
                 panic!("MLS event delivery unexpectedly became unknown")
+            }
+            peer::PeerEvent::MlsCommitDeliveryUnknown { .. } => {
+                panic!("MLS Commit delivery unexpectedly became unknown")
             }
             peer::PeerEvent::Disconnected { reason } => {
                 panic!("session disconnected before exchange completed: {reason}")
@@ -275,13 +341,21 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
             .await
             .expect("session should accept a pending MLS event");
         command_tx
+            .send(peer::PeerCommand::SendMlsCommit {
+                request_id: 103,
+                commit: mls_commit_for(role, 0xfe),
+            })
+            .await
+            .expect("session should accept a pending MLS Commit");
+        command_tx
             .send(peer::PeerCommand::Disconnect)
             .await
             .expect("session should accept explicit disconnect");
         let mut got_unknown = false;
         let mut got_mls_unknown = false;
+        let mut got_mls_commit_unknown = false;
         let mut got_disconnected = false;
-        while !got_unknown || !got_mls_unknown || !got_disconnected {
+        while !got_unknown || !got_mls_unknown || !got_mls_commit_unknown || !got_disconnected {
             match tokio::time::timeout(Duration::from_secs(12), event_rx.recv())
                 .await
                 .expect("disconnect should resolve")
@@ -297,6 +371,10 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                     assert_eq!(request_id, 101);
                     got_mls_unknown = true;
                 }
+                peer::PeerEvent::MlsCommitDeliveryUnknown { request_id } => {
+                    assert_eq!(request_id, 103);
+                    got_mls_commit_unknown = true;
+                }
                 peer::PeerEvent::Received { text, .. } => {
                     assert_ne!(text, UNACKNOWLEDGED_TEXT);
                 }
@@ -304,7 +382,10 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 | peer::PeerEvent::Acknowledged { .. }
                 | peer::PeerEvent::MlsEventAcknowledged { .. }
                 | peer::PeerEvent::MlsEventRejected { .. }
-                | peer::PeerEvent::MlsEventReceived { .. } => {}
+                | peer::PeerEvent::MlsEventReceived { .. }
+                | peer::PeerEvent::MlsCommitAcknowledged { .. }
+                | peer::PeerEvent::MlsCommitRejected { .. }
+                | peer::PeerEvent::MlsCommitReceived { .. } => {}
                 peer::PeerEvent::Rejected { reason, .. } => {
                     panic!("unexpected rejection: {reason}")
                 }
@@ -332,10 +413,17 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                     got_unacknowledged = true;
                 }
                 peer::PeerEvent::MlsEventReceived { .. } => {}
+                peer::PeerEvent::MlsCommitReceived { commit, .. } if commit.event_id[0] == 0xfe => {
+                    got_unacknowledged = true;
+                }
+                peer::PeerEvent::MlsCommitReceived { .. } => {}
                 peer::PeerEvent::DeliveryUnknown { .. }
                 | peer::PeerEvent::MlsEventDeliveryUnknown { .. }
+                | peer::PeerEvent::MlsCommitDeliveryUnknown { .. }
                 | peer::PeerEvent::Rejected { .. }
                 | peer::PeerEvent::MlsEventRejected { .. }
+                | peer::PeerEvent::MlsCommitRejected { .. }
+                | peer::PeerEvent::MlsCommitAcknowledged { .. }
                 | peer::PeerEvent::Unauthorized { .. } => panic!("unexpected listener event"),
             }
         }
@@ -365,6 +453,22 @@ fn mls_event_for(role: &str, id: u8) -> peer::MlsEventEnvelope {
     }
 }
 
+fn mls_commit_for(role: &str, id: u8) -> peer::MlsCommitEnvelope {
+    let author_device = if role == "sender" {
+        [0x31; 32]
+    } else {
+        [0x32; 32]
+    };
+    peer::MlsCommitEnvelope {
+        event_id: [id; 16],
+        author_device,
+        group_id: [0x33; 16].to_vec(),
+        predecessor_epoch: 0,
+        epoch: 1,
+        commit: vec![id; 48],
+    }
+}
+
 async fn assert_no_application_session(session: peer::DirectPeerSession) {
     let (command_tx, command_rx) = mpsc::channel(4);
     let mut events = Box::pin(session.run(command_rx));
@@ -390,10 +494,13 @@ async fn assert_no_application_session(session: peer::DirectPeerSession) {
                 panic!("wrong pinned device exchanged an application message")
             }
             peer::PeerEvent::MlsEventReceived { .. }
-            | peer::PeerEvent::MlsEventAcknowledged { .. } => {
+            | peer::PeerEvent::MlsEventAcknowledged { .. }
+            | peer::PeerEvent::MlsCommitReceived { .. }
+            | peer::PeerEvent::MlsCommitAcknowledged { .. } => {
                 panic!("wrong pinned device exchanged an MLS event")
             }
-            peer::PeerEvent::MlsEventRejected { .. } => {
+            peer::PeerEvent::MlsEventRejected { .. }
+            | peer::PeerEvent::MlsCommitRejected { .. } => {
                 panic!("wrong pinned device exchanged an MLS event")
             }
             peer::PeerEvent::Disconnected { .. } => break,
@@ -402,6 +509,7 @@ async fn assert_no_application_session(session: peer::DirectPeerSession) {
             | peer::PeerEvent::Unauthorized { .. }
             | peer::PeerEvent::DeliveryUnknown { .. } => {}
             peer::PeerEvent::MlsEventDeliveryUnknown { .. } => {}
+            peer::PeerEvent::MlsCommitDeliveryUnknown { .. } => {}
         }
     }
     assert!(

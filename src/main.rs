@@ -202,6 +202,7 @@ struct Slouching {
     mls_history_group: Option<Vec<u8>>,
     mls_pending_commits: Vec<storage::StoredMlsCommit>,
     mls_pending_events: std::collections::HashMap<u64, [u8; 16]>,
+    mls_sending_commits: std::collections::HashMap<u64, [u8; 16]>,
     mls_next_request_id: u64,
 }
 
@@ -326,6 +327,7 @@ impl Default for Slouching {
             mls_history_group: None,
             mls_pending_commits: Vec::new(),
             mls_pending_events: std::collections::HashMap::new(),
+            mls_sending_commits: std::collections::HashMap::new(),
             mls_next_request_id: 1,
         }
     }
@@ -385,6 +387,14 @@ enum Message {
     MlsReceivedCommitChanged(String),
     ApplyMlsCommit,
     MlsCommitProcessed(Result<storage::ProcessedMlsCommit, String>),
+    DistributeMlsCommit,
+    MlsCommitsReadyToSend(Vec<u8>, Result<Vec<storage::StoredMlsCommit>, String>),
+    MlsCommitPeerCommandSent(u64, Result<(), String>),
+    MlsCommitInboundProcessed(
+        u64,
+        peer::MlsCommitEnvelope,
+        Result<storage::ProcessedMlsCommit, String>,
+    ),
     MlsWelcomeChanged(String),
     MlsRatchetTreeChanged(String),
     CreateMlsGroup,
@@ -829,6 +839,38 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                             move |result| Message::MlsInboundProcessed(sequence, event, result),
                         );
                     }
+                    peer::PeerEvent::MlsCommitReceived { sequence, commit } => {
+                        return Task::perform(
+                            process_mls_commit_envelope_task(commit.clone()),
+                            move |result| {
+                                Message::MlsCommitInboundProcessed(sequence, commit, result)
+                            },
+                        );
+                    }
+                    peer::PeerEvent::MlsCommitAcknowledged { request_id } => {
+                        if state.mls_sending_commits.remove(&request_id).is_some() {
+                            state.mls_status = format!(
+                                "Membro autenticou e aplicou o Commit {request_id}; epoch atualizado."
+                            );
+                        } else {
+                            state.mls_status =
+                                "ACK de Commit desconhecido; sessão encerrada.".to_owned();
+                            if let Some(commands) = state.peer_session_commands.as_ref() {
+                                let _ = commands.try_send(peer::PeerCommand::Disconnect);
+                            }
+                        }
+                    }
+                    peer::PeerEvent::MlsCommitRejected { request_id, reason } => {
+                        state.mls_sending_commits.remove(&request_id);
+                        state.mls_status =
+                            format!("Commit {request_id} não foi aplicado pelo peer: {reason}");
+                    }
+                    peer::PeerEvent::MlsCommitDeliveryUnknown { request_id } => {
+                        state.mls_sending_commits.remove(&request_id);
+                        state.mls_status = format!(
+                            "Entrega do Commit {request_id} desconhecida; ele continua salvo para redelivery idempotente."
+                        );
+                    }
                     peer::PeerEvent::MlsEventAcknowledged { request_id } => {
                         let Some(event_id) = state.mls_pending_events.get(&request_id).copied()
                         else {
@@ -1104,6 +1146,131 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         Message::MlsMessageDraftChanged(value) => state.mls_message_draft = value,
         Message::MlsCommitChanged(value) => state.mls_commit = value,
         Message::MlsReceivedCommitChanged(value) => state.mls_received_commit = value,
+        Message::DistributeMlsCommit => {
+            if state.peer_session_commands.is_none()
+                || !matches!(state.peer_listen_status, PeerListenStatus::Connected)
+            {
+                state.mls_status =
+                    "Conecte primeiro ao dispositivo que já é membro do grupo.".to_owned();
+                return Task::none();
+            }
+            let group_id = match hex_decode_bytes(&state.mls_group_id) {
+                Ok(group_id) if group_id.len() == 16 => group_id,
+                _ => {
+                    state.mls_status = "Informe o ID do grupo MLS.".to_owned();
+                    return Task::none();
+                }
+            };
+            let peer_id = match parse_peer_id(&state.peer_public_key) {
+                Ok(peer_id) => *peer_id.as_bytes(),
+                Err(error) => {
+                    state.mls_status = format!("Peer inválido: {error}");
+                    return Task::none();
+                }
+            };
+            state.mls_status = "Verificando se o peer é membro autenticado do grupo…".to_owned();
+            return Task::perform(
+                load_mls_commits_for_peer_task(group_id.clone(), peer_id),
+                move |result| Message::MlsCommitsReadyToSend(group_id, result),
+            );
+        }
+        Message::MlsCommitsReadyToSend(group_id, result) => {
+            return match result {
+                Ok(commits) => {
+                    let Some(commands) = state.peer_session_commands.clone() else {
+                        state.mls_status =
+                            "Sessão encerrou; Commits continuam pendentes localmente.".to_owned();
+                        return Task::none();
+                    };
+                    let available = peer::MAX_PENDING_MESSAGES.saturating_sub(
+                        state.peer_pending_sends.len()
+                            + state.mls_pending_events.len()
+                            + state.mls_sending_commits.len(),
+                    );
+                    let mut sends = Vec::new();
+                    for stored in commits.into_iter().take(available.min(1)) {
+                        let request_id = state.mls_next_request_id;
+                        state.mls_next_request_id = state.mls_next_request_id.saturating_add(1);
+                        state
+                            .mls_sending_commits
+                            .insert(request_id, stored.event_id);
+                        let envelope = peer::MlsCommitEnvelope {
+                            event_id: stored.event_id,
+                            author_device: stored.author_device,
+                            group_id: stored.group_id,
+                            predecessor_epoch: stored.predecessor_epoch,
+                            epoch: stored.epoch,
+                            commit: stored.commit,
+                        };
+                        let commands = commands.clone();
+                        sends.push(Task::perform(
+                            async move {
+                                commands
+                                    .send(peer::PeerCommand::SendMlsCommit {
+                                        request_id,
+                                        commit: envelope,
+                                    })
+                                    .await
+                                    .map_err(|error| error.to_string())
+                            },
+                            move |result| Message::MlsCommitPeerCommandSent(request_id, result),
+                        ));
+                    }
+                    state
+                        .mls_pending_commits
+                        .retain(|commit| commit.group_id != group_id);
+                    if sends.is_empty() {
+                        state.mls_status = "Nenhum Commit pendente para este grupo, ou a janela de envio está cheia.".to_owned();
+                        Task::none()
+                    } else {
+                        state.mls_status = format!(
+                            "Enviando {} Commit(s) ao membro conectado; aguardando aplicação e ACK…",
+                            sends.len()
+                        );
+                        Task::batch(sends)
+                    }
+                }
+                Err(error) => {
+                    state.mls_status = format!("Commit não distribuído: {error}");
+                    Task::none()
+                }
+            };
+        }
+        Message::MlsCommitPeerCommandSent(request_id, Ok(())) => {
+            state.mls_status = format!(
+                "Commit {request_id} enviado; aguardando autenticação e aplicação pelo membro."
+            );
+        }
+        Message::MlsCommitPeerCommandSent(request_id, Err(error)) => {
+            state.mls_sending_commits.remove(&request_id);
+            state.mls_status = format!("Commit permanece pendente localmente: {error}");
+        }
+        Message::MlsCommitInboundProcessed(sequence, envelope, result) => match result {
+            Ok(processed) => {
+                if let Some(commands) = state.peer_session_commands.as_ref() {
+                    let _ = commands.try_send(peer::PeerCommand::AcceptInbound { sequence });
+                }
+                state.mls_status = match processed {
+                    storage::ProcessedMlsCommit::Applied { epoch } => format!(
+                        "Commit recebido, autenticado e aplicado; epoch {epoch}. ACK enviado ao committer."
+                    ),
+                    storage::ProcessedMlsCommit::Duplicate { epoch } => {
+                        format!("Commit já aplicado; epoch {epoch}. ACK de redelivery enviado.")
+                    }
+                };
+                return load_mls_history(state, envelope.group_id);
+            }
+            Err(error) => {
+                state.mls_status =
+                    format!("Commit recebido foi rejeitado; grupo local intacto: {error}");
+                if let Some(commands) = state.peer_session_commands.as_ref() {
+                    let _ = commands.try_send(peer::PeerCommand::RejectInbound {
+                        sequence,
+                        reason: error,
+                    });
+                }
+            }
+        },
         Message::ApplyMlsCommit => {
             let group_id = match hex_decode_bytes(&state.mls_group_id) {
                 Ok(group_id) if group_id.len() == 16 => group_id,
@@ -1712,6 +1879,17 @@ async fn load_mls_commits_task(group_id: Vec<u8>) -> Result<Vec<storage::StoredM
         .map_err(|error| format!("MLS Commit outbox task failed: {error}"))?
 }
 
+async fn load_mls_commits_for_peer_task(
+    group_id: Vec<u8>,
+    peer_device: [u8; 32],
+) -> Result<Vec<storage::StoredMlsCommit>, String> {
+    tokio::task::spawn_blocking(move || {
+        storage::list_queued_mls_commits_for_peer(&group_id, &peer_device, 100)
+    })
+    .await
+    .map_err(|error| format!("MLS Commit peer check failed: {error}"))?
+}
+
 async fn load_mls_outbox_task() -> Result<Vec<storage::StoredOutboundEvent>, String> {
     tokio::task::spawn_blocking(|| storage::list_outbound_events(0, 500))
         .await
@@ -1760,6 +1938,14 @@ async fn process_mls_commit_task(
     tokio::task::spawn_blocking(move || storage::process_inbound_mls_commit(&group_id, &commit))
         .await
         .map_err(|error| format!("MLS Commit task failed: {error}"))?
+}
+
+async fn process_mls_commit_envelope_task(
+    envelope: peer::MlsCommitEnvelope,
+) -> Result<storage::ProcessedMlsCommit, String> {
+    tokio::task::spawn_blocking(move || storage::process_inbound_mls_commit_envelope(&envelope))
+        .await
+        .map_err(|error| format!("MLS Commit authentication task failed: {error}"))?
 }
 
 fn hex_decode_bytes(value: &str) -> Result<Vec<u8>, String> {
@@ -1937,6 +2123,7 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
                 PeerSendStatus::Failed(format!("Entrega não confirmada: {text}"));
         }
         peer::PeerEvent::MlsEventReceived { .. } => {}
+        peer::PeerEvent::MlsCommitReceived { .. } => {}
         peer::PeerEvent::MlsEventAcknowledged { request_id } => {
             state.peer_send_status = PeerSendStatus::Failed(format!(
                 "ACK do evento MLS {request_id} não está conectado ao estado de entrega."
@@ -1951,6 +2138,9 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
                 "Entrega do evento MLS {request_id} não confirmada."
             ));
         }
+        peer::PeerEvent::MlsCommitAcknowledged { .. }
+        | peer::PeerEvent::MlsCommitRejected { .. }
+        | peer::PeerEvent::MlsCommitDeliveryUnknown { .. } => {}
         peer::PeerEvent::Unauthorized { .. } => {
             state.peer_listen_status = PeerListenStatus::Unauthorized(
                 "peer não corresponde à chave pública fixada".to_owned(),

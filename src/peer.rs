@@ -18,10 +18,15 @@ const FRAME_ACK: u8 = 2;
 const FRAME_CLOSE: u8 = 3;
 const FRAME_CLOSE_ACK: u8 = 4;
 const FRAME_MLS_EVENT: u8 = 5;
+const FRAME_MLS_COMMIT: u8 = 6;
+const FRAME_REJECT: u8 = 7;
 const MLS_EVENT_MAGIC: &[u8; 4] = b"SLME";
 const MLS_EVENT_VERSION: u16 = 1;
+const MLS_COMMIT_MAGIC: &[u8; 4] = b"SLMC";
+const MLS_COMMIT_VERSION: u16 = 1;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
 const MAX_MLS_EVENT_BYTES: usize = 64 * 1024;
+const MAX_MLS_COMMIT_BYTES: usize = 64 * 1024;
 const MAX_CHECKPOINT_BYTES: usize = 16 * 1024;
 pub const MAX_PENDING_MESSAGES: usize = 16;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -45,6 +50,16 @@ pub struct MlsEventEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlsCommitEnvelope {
+    pub event_id: [u8; 16],
+    pub author_device: [u8; 32],
+    pub group_id: Vec<u8>,
+    pub predecessor_epoch: u64,
+    pub epoch: u64,
+    pub commit: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerAcceptError {
     Unauthorized(EndpointId),
     Failed(String),
@@ -60,9 +75,17 @@ pub enum PeerCommand {
         request_id: u64,
         event: MlsEventEnvelope,
     },
+    SendMlsCommit {
+        request_id: u64,
+        commit: MlsCommitEnvelope,
+    },
     /// Send only after the application has stored this message in its in-memory transcript.
     AcceptInbound {
         sequence: u64,
+    },
+    RejectInbound {
+        sequence: u64,
+        reason: String,
     },
     Disconnect,
 }
@@ -84,10 +107,21 @@ pub enum PeerEvent {
         sequence: u64,
         event: MlsEventEnvelope,
     },
+    MlsCommitReceived {
+        sequence: u64,
+        commit: MlsCommitEnvelope,
+    },
     MlsEventAcknowledged {
         request_id: u64,
     },
+    MlsCommitAcknowledged {
+        request_id: u64,
+    },
     MlsEventRejected {
+        request_id: u64,
+        reason: String,
+    },
+    MlsCommitRejected {
         request_id: u64,
         reason: String,
     },
@@ -100,6 +134,9 @@ pub enum PeerEvent {
         text: String,
     },
     MlsEventDeliveryUnknown {
+        request_id: u64,
+    },
+    MlsCommitDeliveryUnknown {
         request_id: u64,
     },
     #[allow(dead_code)]
@@ -119,6 +156,7 @@ struct PendingSend {
 enum PendingOutbound {
     Text(PendingSend),
     MlsEvent { request_id: u64 },
+    MlsCommit { request_id: u64 },
 }
 
 pub struct DirectPeerSession {
@@ -139,8 +177,16 @@ enum Frame {
         sequence: u64,
         event: MlsEventEnvelope,
     },
+    MlsCommit {
+        sequence: u64,
+        commit: MlsCommitEnvelope,
+    },
     Ack {
         sequence: u64,
+    },
+    Reject {
+        sequence: u64,
+        reason: String,
     },
     Close,
     CloseAck,
@@ -220,11 +266,15 @@ impl DirectPeerListener {
                 PeerEvent::Connected { .. }
                 | PeerEvent::Acknowledged { .. }
                 | PeerEvent::MlsEventReceived { .. }
+                | PeerEvent::MlsCommitReceived { .. }
                 | PeerEvent::MlsEventAcknowledged { .. }
+                | PeerEvent::MlsCommitAcknowledged { .. }
                 | PeerEvent::MlsEventRejected { .. }
+                | PeerEvent::MlsCommitRejected { .. }
                 | PeerEvent::Rejected { .. }
                 | PeerEvent::DeliveryUnknown { .. }
-                | PeerEvent::MlsEventDeliveryUnknown { .. } => {}
+                | PeerEvent::MlsEventDeliveryUnknown { .. }
+                | PeerEvent::MlsCommitDeliveryUnknown { .. } => {}
             }
         }
         received.ok_or_else(|| "peer session ended before receiving text".to_owned())
@@ -292,6 +342,23 @@ impl DirectPeerSession {
                                 pending_inbound.insert(sequence);
                                 yield PeerEvent::MlsEventReceived { sequence, event };
                             }
+                            Ok(Frame::MlsCommit { sequence, commit }) => {
+                                if closing {
+                                    break 'session "peer sent application data while disconnecting".to_owned();
+                                }
+                                if sequence != next_in_sequence {
+                                    break 'session format!("peer data sequence {sequence} did not match expected {next_in_sequence}");
+                                }
+                                if pending_inbound.len() >= MAX_PENDING_MESSAGES {
+                                    break 'session "peer exceeded the inbound pending-message limit".to_owned();
+                                }
+                                let Some(next) = next_in_sequence.checked_add(1) else {
+                                    break 'session "inbound message sequence exhausted".to_owned();
+                                };
+                                next_in_sequence = next;
+                                pending_inbound.insert(sequence);
+                                yield PeerEvent::MlsCommitReceived { sequence, commit };
+                            }
                             Ok(Frame::Ack { sequence }) => {
                                 let Some(pending) = pending_sends.remove(&sequence) else {
                                     break 'session format!("peer acknowledged sequence {sequence} that is not outstanding");
@@ -304,6 +371,19 @@ impl DirectPeerSession {
                                     PendingOutbound::MlsEvent { request_id } => {
                                         yield PeerEvent::MlsEventAcknowledged { request_id };
                                     }
+                                    PendingOutbound::MlsCommit { request_id } => {
+                                        yield PeerEvent::MlsCommitAcknowledged { request_id };
+                                    }
+                                }
+                            }
+                            Ok(Frame::Reject { sequence, reason }) => {
+                                let Some(pending) = pending_sends.remove(&sequence) else {
+                                    break 'session format!("peer rejected sequence {sequence} that is not outstanding");
+                                };
+                                match pending {
+                                    PendingOutbound::Text(pending) => yield PeerEvent::Rejected { request_id: pending.request_id, reason },
+                                    PendingOutbound::MlsEvent { request_id } => yield PeerEvent::MlsEventRejected { request_id, reason },
+                                    PendingOutbound::MlsCommit { request_id } => yield PeerEvent::MlsCommitRejected { request_id, reason },
                                 }
                             }
                             Ok(Frame::Close) => {
@@ -377,12 +457,49 @@ impl DirectPeerSession {
                                 }
                                 next_out_sequence = next;
                             }
+                            Some(PeerCommand::SendMlsCommit { request_id, commit }) => {
+                                let payload = match encode_mls_commit(&commit) {
+                                    Ok(payload) => payload,
+                                    Err(reason) => {
+                                        yield PeerEvent::MlsCommitRejected { request_id, reason };
+                                        continue;
+                                    }
+                                };
+                                if pending_sends.len() >= MAX_PENDING_MESSAGES {
+                                    yield PeerEvent::MlsCommitRejected {
+                                        request_id,
+                                        reason: format!("at most {MAX_PENDING_MESSAGES} messages may await acknowledgement"),
+                                    };
+                                    continue;
+                                }
+                                let sequence = next_out_sequence;
+                                let Some(next) = next_out_sequence.checked_add(1) else {
+                                    break 'session "outbound message sequence exhausted".to_owned();
+                                };
+                                pending_sends.insert(sequence, PendingOutbound::MlsCommit { request_id });
+                                if let Err(error) = write_frame(&mut self.send, FRAME_MLS_COMMIT, sequence, &payload).await {
+                                    break 'session format!("could not send MLS Commit: {error}");
+                                }
+                                next_out_sequence = next;
+                            }
                             Some(PeerCommand::AcceptInbound { sequence }) => {
                                 if !pending_inbound.remove(&sequence) {
                                     break 'session format!("cannot acknowledge inbound sequence {sequence}: no pending delivery");
                                 }
                                 if let Err(error) = write_frame(&mut self.send, FRAME_ACK, sequence, &[]).await {
                                     break 'session format!("could not acknowledge peer message: {error}");
+                                }
+                            }
+                            Some(PeerCommand::RejectInbound { sequence, reason }) => {
+                                if !pending_inbound.remove(&sequence) {
+                                    break 'session format!("cannot reject inbound sequence {sequence}: no pending delivery");
+                                }
+                                let reason = reason.chars().take(256).collect::<String>();
+                                if reason.is_empty() {
+                                    break 'session "inbound rejection reason cannot be empty".to_owned();
+                                }
+                                if let Err(error) = write_frame(&mut self.send, FRAME_REJECT, sequence, reason.as_bytes()).await {
+                                    break 'session format!("could not reject peer message: {error}");
                                 }
                             }
                             Some(PeerCommand::Disconnect) | None => {
@@ -414,6 +531,9 @@ impl DirectPeerSession {
                     },
                     PendingOutbound::MlsEvent { request_id } => {
                         yield PeerEvent::MlsEventDeliveryUnknown { request_id };
+                    }
+                    PendingOutbound::MlsCommit { request_id } => {
+                        yield PeerEvent::MlsCommitDeliveryUnknown { request_id };
                     }
                 }
             }
@@ -520,11 +640,17 @@ pub async fn send_once(
             PeerEvent::Connected { .. }
             | PeerEvent::Acknowledged { .. }
             | PeerEvent::MlsEventReceived { .. }
+            | PeerEvent::MlsCommitReceived { .. }
             | PeerEvent::MlsEventAcknowledged { .. }
+            | PeerEvent::MlsCommitAcknowledged { .. }
             | PeerEvent::MlsEventRejected { .. }
+            | PeerEvent::MlsCommitRejected { .. }
             | PeerEvent::Unauthorized { .. } => {}
             PeerEvent::MlsEventDeliveryUnknown { .. } => {
                 return Err("MLS event delivery could not be confirmed".to_owned());
+            }
+            PeerEvent::MlsCommitDeliveryUnknown { .. } => {
+                return Err("MLS Commit delivery could not be confirmed".to_owned());
             }
         }
     }
@@ -597,14 +723,118 @@ where
                 event: decode_mls_event(&bytes)?,
             })
         }
+        FRAME_MLS_COMMIT => {
+            if length == 0 || length > MAX_MLS_COMMIT_BYTES {
+                return Err(format!(
+                    "MLS Commit length must be between 1 and {MAX_MLS_COMMIT_BYTES}"
+                ));
+            }
+            let mut bytes = vec![0_u8; length];
+            reader
+                .read_exact(&mut bytes)
+                .await
+                .map_err(|error| format!("could not read MLS Commit frame: {error}"))?;
+            Ok(Frame::MlsCommit {
+                sequence,
+                commit: decode_mls_commit(&bytes)?,
+            })
+        }
         FRAME_ACK if length == 0 && sequence != 0 => Ok(Frame::Ack { sequence }),
         FRAME_ACK => Err("peer sent an invalid ACK frame".to_owned()),
+        FRAME_REJECT if (1..=1024).contains(&length) && sequence != 0 => {
+            let mut bytes = vec![0; length];
+            reader
+                .read_exact(&mut bytes)
+                .await
+                .map_err(|error| format!("could not read peer rejection reason: {error}"))?;
+            let reason = String::from_utf8(bytes)
+                .map_err(|error| format!("peer rejection reason is not valid UTF-8: {error}"))?;
+            Ok(Frame::Reject { sequence, reason })
+        }
+        FRAME_REJECT => Err("peer sent an invalid rejection frame".to_owned()),
         FRAME_CLOSE if length == 0 && sequence == 0 => Ok(Frame::Close),
         FRAME_CLOSE => Err("peer sent an invalid disconnect frame".to_owned()),
         FRAME_CLOSE_ACK if length == 0 && sequence == 0 => Ok(Frame::CloseAck),
         FRAME_CLOSE_ACK => Err("peer sent an invalid disconnect acknowledgement".to_owned()),
         _ => Err(format!("unknown peer session frame type: {kind}")),
     }
+}
+
+fn encode_mls_commit(commit: &MlsCommitEnvelope) -> Result<Vec<u8>, String> {
+    if commit.event_id.iter().all(|byte| *byte == 0)
+        || commit.author_device.iter().all(|byte| *byte == 0)
+        || commit.group_id.len() != 16
+        || commit.predecessor_epoch > i64::MAX as u64
+        || commit.epoch != commit.predecessor_epoch.saturating_add(1)
+        || commit.commit.is_empty()
+        || commit.commit.len() > MAX_MLS_COMMIT_BYTES
+    {
+        return Err("MLS Commit has an invalid or oversized envelope".to_owned());
+    }
+    let mut output = Vec::with_capacity(4 + 2 + 16 + 32 + 2 + 16 + 8 + 8 + 4 + commit.commit.len());
+    output.extend_from_slice(MLS_COMMIT_MAGIC);
+    output.extend_from_slice(&MLS_COMMIT_VERSION.to_be_bytes());
+    output.extend_from_slice(&commit.event_id);
+    output.extend_from_slice(&commit.author_device);
+    output.extend_from_slice(&(commit.group_id.len() as u16).to_be_bytes());
+    output.extend_from_slice(&commit.group_id);
+    output.extend_from_slice(&commit.predecessor_epoch.to_be_bytes());
+    output.extend_from_slice(&commit.epoch.to_be_bytes());
+    output.extend_from_slice(&(commit.commit.len() as u32).to_be_bytes());
+    output.extend_from_slice(&commit.commit);
+    if output.len() > MAX_MLS_COMMIT_BYTES {
+        return Err("serialized MLS Commit exceeds the transport limit".to_owned());
+    }
+    Ok(output)
+}
+
+fn decode_mls_commit(bytes: &[u8]) -> Result<MlsCommitEnvelope, String> {
+    const FIXED: usize = 4 + 2 + 16 + 32 + 2 + 16 + 8 + 8 + 4;
+    if bytes.len() < FIXED || bytes.len() > MAX_MLS_COMMIT_BYTES || &bytes[..4] != MLS_COMMIT_MAGIC
+    {
+        return Err("invalid or oversized MLS Commit envelope".to_owned());
+    }
+    let version = u16::from_be_bytes(bytes[4..6].try_into().unwrap());
+    if version != MLS_COMMIT_VERSION {
+        return Err(format!(
+            "unsupported MLS Commit envelope version: {version}"
+        ));
+    }
+    let mut cursor = 6;
+    let event_id: [u8; 16] = bytes[cursor..cursor + 16].try_into().unwrap();
+    cursor += 16;
+    let author_device: [u8; 32] = bytes[cursor..cursor + 32].try_into().unwrap();
+    cursor += 32;
+    let group_len = u16::from_be_bytes(bytes[cursor..cursor + 2].try_into().unwrap()) as usize;
+    cursor += 2;
+    if group_len != 16 {
+        return Err("MLS Commit group ID must be 16 bytes".to_owned());
+    }
+    let group_id = bytes[cursor..cursor + group_len].to_vec();
+    cursor += group_len;
+    let predecessor_epoch = u64::from_be_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+    cursor += 8;
+    let epoch = u64::from_be_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+    cursor += 8;
+    let commit_len = u32::from_be_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+    cursor += 4;
+    if commit_len == 0
+        || cursor.checked_add(commit_len) != Some(bytes.len())
+        || event_id.iter().all(|byte| *byte == 0)
+        || author_device.iter().all(|byte| *byte == 0)
+        || predecessor_epoch > i64::MAX as u64
+        || epoch != predecessor_epoch.saturating_add(1)
+    {
+        return Err("MLS Commit envelope metadata or lengths are invalid".to_owned());
+    }
+    Ok(MlsCommitEnvelope {
+        event_id,
+        author_device,
+        group_id,
+        predecessor_epoch,
+        epoch,
+        commit: bytes[cursor..].to_vec(),
+    })
 }
 
 fn encode_mls_event(event: &MlsEventEnvelope) -> Result<Vec<u8>, String> {
@@ -803,6 +1033,7 @@ mod tests {
         for (kind, sequence, payload, message) in [
             (FRAME_DATA, 2, &b""[..], "peer data length"),
             (FRAME_ACK, 2, &b"x"[..], "invalid ACK"),
+            (FRAME_REJECT, 0, &b"bad"[..], "invalid rejection"),
             (99, 2, &b""[..], "unknown peer session frame type"),
         ] {
             let (mut writer, mut reader) = duplex(128);
@@ -909,6 +1140,52 @@ mod tests {
         assert_eq!(
             read_frame(&mut reader).await.unwrap(),
             Frame::MlsEvent { sequence: 7, event }
+        );
+    }
+
+    #[test]
+    fn mls_commit_envelope_round_trips_and_rejects_wrong_epoch() {
+        let commit = MlsCommitEnvelope {
+            event_id: [0x71; 16],
+            author_device: [0x72; 32],
+            group_id: [0x73; 16].to_vec(),
+            predecessor_epoch: 8,
+            epoch: 9,
+            commit: vec![0x74; 96],
+        };
+        let encoded = encode_mls_commit(&commit).expect("valid Commit should serialize");
+        assert_eq!(decode_mls_commit(&encoded).unwrap(), commit);
+
+        let mut tampered = encoded;
+        tampered[6 + 16 + 32 + 2 + 16 + 8 + 7] = 10;
+        assert!(decode_mls_commit(&tampered).is_err());
+
+        let mut invalid = commit;
+        invalid.epoch = 11;
+        assert!(encode_mls_commit(&invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn strict_session_parser_round_trips_mls_commit_frame() {
+        let commit = MlsCommitEnvelope {
+            event_id: [0x81; 16],
+            author_device: [0x82; 32],
+            group_id: [0x83; 16].to_vec(),
+            predecessor_epoch: 0,
+            epoch: 1,
+            commit: vec![0x84; 64],
+        };
+        let payload = encode_mls_commit(&commit).unwrap();
+        let (mut writer, mut reader) = duplex(1024);
+        write_frame(&mut writer, FRAME_MLS_COMMIT, 3, &payload)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_frame(&mut reader).await.unwrap(),
+            Frame::MlsCommit {
+                sequence: 3,
+                commit
+            }
         );
     }
 }

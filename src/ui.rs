@@ -1243,6 +1243,12 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             (!state.mls_commit.is_empty()).then(|| Message::CopyMlsValue(state.mls_commit.clone())),
             false
         ),
+        l.control(
+            "arrow",
+            "Enviar próximo Commit ao membro conectado",
+            Some(Message::DistributeMlsCommit),
+            true
+        ),
         l.label("WELCOME · COPIE PARA O DISPOSITIVO CONVIDADO", 10.0, GOLD),
         l.input(
             "Welcome hexadecimal",

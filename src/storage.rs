@@ -400,6 +400,103 @@ pub fn list_queued_mls_commits(
     list_queued_mls_commits_in(&connection, group_id, limit)
 }
 
+pub fn list_queued_mls_commits_for_peer(
+    group_id: &[u8],
+    peer_device: &[u8; 32],
+    limit: usize,
+) -> Result<Vec<StoredMlsCommit>, String> {
+    if group_id.len() != 16 {
+        return Err("MLS group ID must be 16 bytes".to_owned());
+    }
+    let mut connection = open_local_database()?;
+    list_queued_mls_commits_for_peer_in(&mut connection, group_id, peer_device, limit)
+}
+
+fn list_queued_mls_commits_for_peer_in(
+    connection: &mut Connection,
+    group_id: &[u8],
+    peer_device: &[u8; 32],
+    limit: usize,
+) -> Result<Vec<StoredMlsCommit>, String> {
+    if group_id.len() != 16 || !(1..=100).contains(&limit) {
+        return Err("MLS group ID must be 16 bytes and limit must be 1..100".to_owned());
+    }
+    let group_identifier = GroupId::from_slice(group_id);
+    let group = {
+        let provider = LocalOpenMlsProvider::new(connection);
+        MlsGroup::load(provider.storage(), &group_identifier)
+            .map_err(|error| format!("could not load MLS group membership: {error}"))?
+            .ok_or_else(|| "MLS group state is missing".to_owned())?
+    };
+    let is_member = group.members().any(|member| {
+        MlsSigningKeyBinding::from_bytes(member.credential.serialized_content()).is_some_and(
+            |binding| {
+                binding.device_public_key.as_slice() == peer_device
+                    && binding.verifies_mls_credential(
+                        &binding.device_public_key,
+                        group.ciphersuite().signature_algorithm() as u16,
+                        member.signature_key.as_slice(),
+                    )
+            },
+        )
+    });
+    if !is_member {
+        return Err("o dispositivo conectado não é membro autenticado deste grupo MLS".to_owned());
+    }
+    list_queued_mls_commits_in(connection, group_id, limit)
+}
+
+pub fn process_inbound_mls_commit_envelope(
+    envelope: &crate::peer::MlsCommitEnvelope,
+) -> Result<ProcessedMlsCommit, String> {
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let device_identity = signing_key_from_secret(secret)?;
+    let mut connection = open_local_database()?;
+    process_inbound_mls_commit_envelope_in(&mut connection, envelope, &device_identity)
+}
+
+fn process_inbound_mls_commit_envelope_in(
+    connection: &mut Connection,
+    envelope: &crate::peer::MlsCommitEnvelope,
+    device_identity: &SigningKey,
+) -> Result<ProcessedMlsCommit, String> {
+    use openmls::prelude::tls_codec::Deserialize as TlsCodecDeserialize;
+
+    if envelope.epoch != envelope.predecessor_epoch.saturating_add(1)
+        || envelope.event_id.as_slice() != &blake3::hash(&envelope.commit).as_bytes()[..16]
+    {
+        return Err("MLS Commit envelope metadata does not match its bytes".to_owned());
+    }
+    let protocol_message = MlsMessageIn::tls_deserialize_exact(&envelope.commit)
+        .map_err(|error| format!("invalid serialized MLS Commit: {error}"))?
+        .try_into_protocol_message()
+        .map_err(|error| format!("MLS Commit is not a protocol message: {error}"))?;
+    if protocol_message.group_id().as_slice() != envelope.group_id
+        || protocol_message.epoch().as_u64() != envelope.predecessor_epoch
+    {
+        return Err("MLS Commit envelope group or epoch does not match the MLS message".to_owned());
+    }
+    let expected_author: Vec<u8> = connection
+        .query_row(
+            "SELECT designated_committer_device FROM local_mls_groups WHERE group_id = ?1",
+            [&envelope.group_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("could not load MLS designated committer: {error}"))?;
+    if expected_author.as_slice() != envelope.author_device {
+        return Err("MLS Commit envelope author is not the designated committer".to_owned());
+    }
+    process_inbound_mls_commit_in(
+        connection,
+        &envelope.group_id,
+        &envelope.commit,
+        device_identity,
+    )
+}
+
 fn list_queued_mls_commits_in(
     connection: &Connection,
     group_id: &[u8],
@@ -2829,6 +2926,21 @@ mod tests {
         assert_eq!(joined.ciphersuite, ciphersuite as u16);
         assert_eq!(joined.epoch, 1);
         assert_eq!(joined.designated_committer_device, creator_public_key);
+        assert_eq!(
+            list_queued_mls_commits_for_peer_in(
+                &mut creator,
+                &group.group_id,
+                &invitee_identity.verifying_key().to_bytes(),
+                10,
+            )
+            .expect("authenticated group member should be eligible for Commit delivery")
+            .len(),
+            1
+        );
+        assert!(
+            list_queued_mls_commits_for_peer_in(&mut creator, &group.group_id, &[0x99; 32], 10,)
+                .is_err()
+        );
 
         {
             let provider = LocalOpenMlsProvider::new(&mut creator);
@@ -2911,6 +3023,26 @@ mod tests {
         )
         .expect("designated committer should generate the next membership Commit");
         assert_eq!(second_admission.epoch, 2);
+        let inbound_envelope = crate::peer::MlsCommitEnvelope {
+            event_id: second_admission.commit_event_id,
+            author_device: creator_public_key,
+            group_id: group.group_id.clone(),
+            predecessor_epoch: 1,
+            epoch: 2,
+            commit: second_admission.commit.clone(),
+        };
+        let mut wrong_epoch = inbound_envelope.clone();
+        wrong_epoch.predecessor_epoch = 0;
+        assert!(
+            process_inbound_mls_commit_envelope_in(&mut invitee, &wrong_epoch, &invitee_identity,)
+                .is_err()
+        );
+        let mut wrong_author = inbound_envelope.clone();
+        wrong_author.author_device = [0xa7; 32];
+        assert!(
+            process_inbound_mls_commit_envelope_in(&mut invitee, &wrong_author, &invitee_identity,)
+                .is_err()
+        );
         let mut tampered_commit = second_admission.commit.clone();
         let last = tampered_commit
             .last_mut()
@@ -2933,10 +3065,9 @@ mod tests {
             )
             .expect("test should install an inbound Commit journal failure");
         assert!(
-            process_inbound_mls_commit_in(
+            process_inbound_mls_commit_envelope_in(
                 &mut invitee,
-                &group.group_id,
-                &second_admission.commit,
+                &inbound_envelope,
                 &invitee_identity,
             )
             .is_err()
