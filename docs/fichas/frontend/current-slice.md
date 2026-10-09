@@ -8,7 +8,7 @@ messages are encrypted with OpenMLS and sent over the active direct session.
 The receiver validates the sender binding and event metadata, advances the
 ratchet, stores ciphertext and the local transcript in SQLCipher, then ACKs.
 The sender marks the outbox event held by the peer after receiving that ACK.
-Queued events can be retried from the MLS screen after reconnecting.
+Queued application events can be retried from the MLS screen after reconnecting. Membership Commit bytes are saved atomically with the merged group state; pending Commits reload from SQLCipher and can be copied for distribution. Network Commit delivery/adoption by existing members remains open.
 
 `src/main.rs` owns application and transport state; `src/ui.rs` composes the
 native Iced views, original art, icons, embedded fonts, and texture effects.

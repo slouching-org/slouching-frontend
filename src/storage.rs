@@ -23,7 +23,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 7;
+const PROFILE_SCHEMA_VERSION: u32 = 8;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 type StoredEventEnvelope = (
@@ -369,12 +369,89 @@ pub struct CreatedMlsGroup {
 pub struct AddedMlsMember {
     pub group_id: Vec<u8>,
     pub epoch: u64,
+    pub commit_event_id: [u8; 16],
     /// Public MLS Commit bytes to distribute alongside the Welcome.
     pub commit: Vec<u8>,
     /// Encrypted MLS Welcome bytes for the admitted member.
     pub welcome: Vec<u8>,
     /// Public ratchet tree required to process the Welcome.
     pub ratchet_tree: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredMlsCommit {
+    pub event_id: [u8; 16],
+    pub group_id: Vec<u8>,
+    pub predecessor_epoch: u64,
+    pub epoch: u64,
+    pub author_device: [u8; 32],
+    pub commit_hash: [u8; 32],
+    pub commit: Vec<u8>,
+}
+
+pub fn list_queued_mls_commits(
+    group_id: &[u8],
+    limit: usize,
+) -> Result<Vec<StoredMlsCommit>, String> {
+    if group_id.len() != 16 || !(1..=100).contains(&limit) {
+        return Err("MLS commit query requires a 16-byte group ID and limit 1..100".to_owned());
+    }
+    let connection = open_local_database()?;
+    list_queued_mls_commits_in(&connection, group_id, limit)
+}
+
+fn list_queued_mls_commits_in(
+    connection: &Connection,
+    group_id: &[u8],
+    limit: usize,
+) -> Result<Vec<StoredMlsCommit>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT event_id, group_id, predecessor_epoch, epoch, author_device,
+                    commit_hash, commit_bytes FROM local_mls_commits
+             WHERE group_id = ?1 AND delivery_state = 'queued'
+             ORDER BY predecessor_epoch, epoch LIMIT ?2",
+        )
+        .map_err(|error| format!("could not prepare MLS Commit outbox query: {error}"))?;
+    let rows = statement
+        .query_map(params![group_id, limit as i64], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
+            ))
+        })
+        .map_err(|error| format!("could not query MLS Commit outbox: {error}"))?;
+    let mut commits = Vec::new();
+    for row in rows {
+        let (id, group, predecessor, epoch, author, digest, commit) =
+            row.map_err(|error| format!("could not read MLS Commit outbox: {error}"))?;
+        let commit_hash = fixed_bytes(digest, "MLS Commit digest")?;
+        if blake3::hash(&commit).as_bytes() != &commit_hash {
+            return Err("saved MLS Commit bytes do not match their digest".to_owned());
+        }
+        let predecessor_epoch = u64::try_from(predecessor)
+            .map_err(|_| "saved MLS Commit has an invalid predecessor epoch".to_owned())?;
+        let epoch =
+            u64::try_from(epoch).map_err(|_| "saved MLS Commit has an invalid epoch".to_owned())?;
+        if epoch != predecessor_epoch.saturating_add(1) {
+            return Err("saved MLS Commit is not the next group epoch".to_owned());
+        }
+        commits.push(StoredMlsCommit {
+            event_id: fixed_bytes(id, "MLS Commit event id")?,
+            group_id: fixed_bytes::<16>(group, "MLS Commit group id")?.to_vec(),
+            predecessor_epoch,
+            epoch,
+            author_device: fixed_bytes(author, "MLS Commit author")?,
+            commit_hash,
+            commit,
+        });
+    }
+    Ok(commits)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1390,18 +1467,25 @@ fn add_mls_group_member_in(
                 ciphersuite.signature_algorithm(),
             )
             .ok_or_else(|| "designated committer signing key is missing".to_owned())?;
+            let predecessor_epoch = group.epoch().as_u64();
             let (commit, welcome, _) = group
                 .add_members(&provider, &signer, &[package])
                 .map_err(|error| format!("could not add MLS group member: {error:?}"))?;
+            let commit_bytes = commit
+                .tls_serialize_detached()
+                .map_err(|error| format!("could not serialize MLS Commit: {error}"))?;
             group
                 .merge_pending_commit(&provider)
                 .map_err(|error| format!("could not persist MLS membership commit: {error:?}"))?;
+            let mut commit_event_id = [0; 16];
+            getrandom::fill(&mut commit_event_id)
+                .map_err(|error| format!("could not generate MLS Commit event id: {error}"))?;
+            let commit_hash = *blake3::hash(&commit_bytes).as_bytes();
             let added = AddedMlsMember {
                 group_id: group.group_id().to_vec(),
                 epoch: group.epoch().as_u64(),
-                commit: commit
-                    .tls_serialize_detached()
-                    .map_err(|error| format!("could not serialize MLS Commit: {error}"))?,
+                commit_event_id,
+                commit: commit_bytes.clone(),
                 welcome: welcome
                     .tls_serialize_detached()
                     .map_err(|error| format!("could not serialize MLS Welcome: {error}"))?,
@@ -1410,6 +1494,25 @@ fn add_mls_group_member_in(
                     .tls_serialize_detached()
                     .map_err(|error| format!("could not serialize MLS ratchet tree: {error}"))?,
             };
+            connection
+                .execute(
+                    "INSERT INTO local_mls_commits
+                        (event_id, group_id, predecessor_epoch, epoch, author_device,
+                         commit_hash, commit_bytes, delivery_state)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued')",
+                    params![
+                        commit_event_id.as_slice(),
+                        group.group_id().as_slice(),
+                        predecessor_epoch as i64,
+                        group.epoch().as_u64() as i64,
+                        device_public_key.as_slice(),
+                        commit_hash.as_slice(),
+                        commit_bytes
+                    ],
+                )
+                .map_err(|error| {
+                    format!("could not persist MLS Commit in the local outbox: {error}")
+                })?;
             (added, group.epoch().as_u64())
         };
         let updated = connection
@@ -1892,6 +1995,26 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
             )
             .map_err(|error| format!("could not create encrypted MLS message history: {error}"))?;
     }
+    if version < 8 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE local_mls_commits (
+                     event_id BLOB PRIMARY KEY NOT NULL CHECK (length(event_id) = 16),
+                     group_id BLOB NOT NULL CHECK (length(group_id) = 16),
+                     predecessor_epoch INTEGER NOT NULL CHECK (predecessor_epoch >= 0),
+                     epoch INTEGER NOT NULL CHECK (epoch = predecessor_epoch + 1),
+                     author_device BLOB NOT NULL CHECK (length(author_device) = 32),
+                     commit_hash BLOB NOT NULL CHECK (length(commit_hash) = 32),
+                     commit_bytes BLOB NOT NULL CHECK (length(commit_bytes) > 0),
+                     delivery_state TEXT NOT NULL DEFAULT 'queued'
+                         CHECK (delivery_state IN ('queued', 'held_by_peer'))
+                 );
+                 CREATE INDEX local_mls_commits_by_group
+                     ON local_mls_commits (group_id, predecessor_epoch, epoch);
+                 PRAGMA user_version = 8;",
+            )
+            .map_err(|error| format!("could not create durable MLS Commit outbox: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -2370,6 +2493,41 @@ mod tests {
             open_database(&invitee_path, &invitee_key).expect("invitee database should initialize");
         let package = create_mls_key_package_in(&mut invitee, ciphersuite, &invitee_identity)
             .expect("invitee should prepare a device-bound KeyPackage");
+        creator
+            .execute_batch(
+                "CREATE TRIGGER force_mls_commit_outbox_failure
+                 BEFORE INSERT ON local_mls_commits
+                 BEGIN SELECT RAISE(ABORT, 'simulated outbox disk failure'); END;",
+            )
+            .expect("test should install a one-shot commit outbox failure");
+        assert!(
+            add_mls_group_member_in(
+                &mut creator,
+                &group.group_id,
+                &package.public_bytes,
+                &creator_identity,
+            )
+            .is_err()
+        );
+        let (rolled_back_epoch, rolled_back_members): (i64, usize) = {
+            let provider = LocalOpenMlsProvider::new(&mut creator);
+            let loaded = MlsGroup::load(provider.storage(), &GroupId::from_slice(&group.group_id))
+                .expect("group should reload after transaction rollback")
+                .expect("original group should remain available");
+            (loaded.epoch().as_u64() as i64, loaded.members().count())
+        };
+        let queued_after_rollback: i64 = creator
+            .query_row(
+                "SELECT COUNT(*) FROM local_mls_commits WHERE group_id = ?1",
+                [&group.group_id],
+                |row| row.get(0),
+            )
+            .expect("outbox should remain queryable after rollback");
+        assert_eq!((rolled_back_epoch, rolled_back_members), (0, 1));
+        assert_eq!(queued_after_rollback, 0);
+        creator
+            .execute_batch("DROP TRIGGER force_mls_commit_outbox_failure;")
+            .expect("test should remove its failure trigger");
         let admission = add_mls_group_member_in(
             &mut creator,
             &group.group_id,
@@ -2381,6 +2539,41 @@ mod tests {
         assert_eq!(admission.epoch, 1);
         assert!(!admission.commit.is_empty());
         assert!(!admission.welcome.is_empty());
+        let (stored_group, predecessor_epoch, stored_epoch): (Vec<u8>, i64, i64) = creator
+            .query_row(
+                "SELECT group_id, predecessor_epoch, epoch FROM local_mls_commits
+                 WHERE event_id = ?1",
+                [admission.commit_event_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("membership Commit row should persist");
+        let (author, commit_hash, commit_bytes, state): (Vec<u8>, Vec<u8>, Vec<u8>, String) =
+            creator
+                .query_row(
+                    "SELECT author_device, commit_hash, commit_bytes, delivery_state
+                     FROM local_mls_commits WHERE event_id = ?1",
+                    [admission.commit_event_id.as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("membership Commit payload and outbox state should persist");
+        assert_eq!(stored_group, group.group_id);
+        assert_eq!((predecessor_epoch, stored_epoch), (0, 1));
+        assert_eq!(author, creator_public_key);
+        assert_eq!(commit_hash, blake3::hash(&admission.commit).as_bytes());
+        assert_eq!(commit_bytes, admission.commit);
+        assert_eq!(state, "queued");
+        let recovered_commits = list_queued_mls_commits_in(&creator, &group.group_id, 10)
+            .expect("pending Commit should reload from its outbox");
+        assert_eq!(recovered_commits.len(), 1);
+        assert_eq!(recovered_commits[0].event_id, admission.commit_event_id);
+        assert_eq!(recovered_commits[0].commit, admission.commit);
+        assert_eq!(
+            (
+                recovered_commits[0].predecessor_epoch,
+                recovered_commits[0].epoch
+            ),
+            (0, 1)
+        );
 
         let joined = join_mls_group_from_welcome_in(
             &mut invitee,

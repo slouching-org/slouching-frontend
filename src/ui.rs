@@ -1231,6 +1231,18 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             Some(Message::AdmitMlsMember),
             true
         ),
+        l.label("COMMIT PÚBLICO · DISTRIBUA AOS MEMBROS ATUAIS", 10.0, GOLD),
+        l.input(
+            "Commit hexadecimal",
+            &state.mls_commit,
+            Message::MlsCommitChanged
+        ),
+        l.control(
+            "key",
+            "Copiar Commit",
+            (!state.mls_commit.is_empty()).then(|| Message::CopyMlsValue(state.mls_commit.clone())),
+            false
+        ),
         l.label("WELCOME · COPIE PARA O DISPOSITIVO CONVIDADO", 10.0, GOLD),
         l.input(
             "Welcome hexadecimal",

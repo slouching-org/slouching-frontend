@@ -192,12 +192,14 @@ struct Slouching {
     mls_group_id: String,
     mls_key_package: String,
     mls_invite_key_package: String,
+    mls_commit: String,
     mls_welcome: String,
     mls_ratchet_tree: String,
     mls_status: String,
     mls_message_draft: String,
     mls_history: Vec<storage::StoredMlsMessage>,
     mls_history_group: Option<Vec<u8>>,
+    mls_pending_commits: Vec<storage::StoredMlsCommit>,
     mls_pending_events: std::collections::HashMap<u64, [u8; 16]>,
     mls_next_request_id: u64,
 }
@@ -313,12 +315,14 @@ impl Default for Slouching {
             mls_group_id: String::new(),
             mls_key_package: String::new(),
             mls_invite_key_package: String::new(),
+            mls_commit: String::new(),
             mls_welcome: String::new(),
             mls_ratchet_tree: String::new(),
             mls_status: "Crie uma identidade do dispositivo para começar.".to_owned(),
             mls_message_draft: String::new(),
             mls_history: Vec::new(),
             mls_history_group: None,
+            mls_pending_commits: Vec::new(),
             mls_pending_events: std::collections::HashMap::new(),
             mls_next_request_id: 1,
         }
@@ -375,6 +379,7 @@ enum Message {
     MlsGroupIdChanged(String),
     MlsKeyPackageChanged(String),
     MlsInviteKeyPackageChanged(String),
+    MlsCommitChanged(String),
     MlsWelcomeChanged(String),
     MlsRatchetTreeChanged(String),
     CreateMlsGroup,
@@ -388,6 +393,7 @@ enum Message {
     CopyMlsValue(String),
     MlsMessageDraftChanged(String),
     MlsHistoryLoaded(Vec<u8>, Result<Vec<storage::StoredMlsMessage>, String>),
+    MlsCommitsLoaded(Vec<u8>, Result<Vec<storage::StoredMlsCommit>, String>),
     RetryQueuedMlsEvents,
     MlsOutboxLoaded(Vec<u8>, Result<Vec<storage::StoredOutboundEvent>, String>),
     SendMlsApplication,
@@ -976,6 +982,8 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.mls_group_id = value;
             state.mls_history.clear();
             state.mls_history_group = None;
+            state.mls_commit.clear();
+            state.mls_pending_commits.clear();
             if let Ok(group_id) = hex_decode_bytes(&state.mls_group_id)
                 && group_id.len() == 16
             {
@@ -1046,12 +1054,15 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         }
         Message::MlsMemberAdded(result) => match result {
             Ok(admission) => {
+                state.mls_commit = hex_encode_bytes(&admission.commit);
                 state.mls_welcome = hex_encode_bytes(&admission.welcome);
                 state.mls_ratchet_tree = hex_encode_bytes(&admission.ratchet_tree);
                 state.mls_status = format!(
-                    "Membro admitido no epoch {}. Envie Welcome e ratchet tree ao convidado.",
+                    "Commit {} salvo no outbox local; envie também aos membros MLS existentes. Envie Welcome e ratchet tree ao convidado (epoch {}).",
+                    hex_encode_bytes(&admission.commit_event_id[..4]),
                     admission.epoch
                 );
+                return load_mls_history(state, admission.group_id);
             }
             Err(error) => state.mls_status = format!("Falha ao admitir membro: {error}"),
         },
@@ -1086,6 +1097,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         },
         Message::CopyMlsValue(value) => return iced::clipboard::write(value),
         Message::MlsMessageDraftChanged(value) => state.mls_message_draft = value,
+        Message::MlsCommitChanged(value) => state.mls_commit = value,
         Message::MlsHistoryLoaded(group_id, result) => {
             if state.mls_history_group.as_deref() == Some(group_id.as_slice()) {
                 match result {
@@ -1093,6 +1105,23 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     Err(error) => {
                         state.mls_status =
                             format!("Não foi possível carregar histórico MLS: {error}");
+                    }
+                }
+            }
+        }
+        Message::MlsCommitsLoaded(group_id, result) => {
+            if state.mls_history_group.as_deref() == Some(group_id.as_slice()) {
+                match result {
+                    Ok(commits) => {
+                        state.mls_commit = commits
+                            .last()
+                            .map(|commit| hex_encode_bytes(&commit.commit))
+                            .unwrap_or_default();
+                        state.mls_pending_commits = commits;
+                    }
+                    Err(error) => {
+                        state.mls_status =
+                            format!("Não foi possível ler Commits pendentes: {error}");
                     }
                 }
             }
@@ -1616,9 +1645,15 @@ fn hex_encode_bytes(bytes: &[u8]) -> String {
 
 fn load_mls_history(state: &mut Slouching, group_id: Vec<u8>) -> Task<Message> {
     state.mls_history_group = Some(group_id.clone());
-    Task::perform(load_mls_history_task(group_id.clone()), move |result| {
-        Message::MlsHistoryLoaded(group_id, result)
-    })
+    let history_group_id = group_id.clone();
+    Task::batch([
+        Task::perform(load_mls_history_task(group_id.clone()), move |result| {
+            Message::MlsHistoryLoaded(history_group_id, result)
+        }),
+        Task::perform(load_mls_commits_task(group_id.clone()), move |result| {
+            Message::MlsCommitsLoaded(group_id, result)
+        }),
+    ])
 }
 
 async fn load_mls_history_task(
@@ -1627,6 +1662,12 @@ async fn load_mls_history_task(
     tokio::task::spawn_blocking(move || storage::list_mls_messages(&group_id, 200))
         .await
         .map_err(|error| format!("MLS history task failed: {error}"))?
+}
+
+async fn load_mls_commits_task(group_id: Vec<u8>) -> Result<Vec<storage::StoredMlsCommit>, String> {
+    tokio::task::spawn_blocking(move || storage::list_queued_mls_commits(&group_id, 100))
+        .await
+        .map_err(|error| format!("MLS Commit outbox task failed: {error}"))?
 }
 
 async fn load_mls_outbox_task() -> Result<Vec<storage::StoredOutboundEvent>, String> {

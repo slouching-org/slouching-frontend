@@ -92,7 +92,11 @@ both devices; MLS messages are encrypted and sent over that active direct
 Iroh/QUIC session. The receiver validates the MLS event and stores its
 ciphertext, ratchet update, and plaintext transcript in SQLCipher before
 sending the transport ACK. The sender marks the outbox event held by the peer
-only after that ACK. The transcript reloads locally, and **Reenviar pendentes**
+only after that ACK. Membership Commits are also saved atomically with the
+group epoch in a separate local outbox; the latest pending Commit is restored
+from SQLCipher and can be copied for distribution to existing members. Commit
+transport and adoption by existing members are still in progress. The transcript
+reloads locally, and **Reenviar pendentes**
 sends queued events for the selected group after reconnecting.
 
 Familiar selection, invitation/draft fields, screen navigation, settings
@@ -152,8 +156,10 @@ Assets and font license/provenance notes are in [assets/README.md](assets/README
   explicit Ed25519 key storage plus initial opaque encrypted-event storage
   are implemented. A pinned-device Iroh/QUIC LAN text exchange is available
   from the Iced UI with a persistent bidirectional session and per-peer history
-  in SQLCipher. Outbound MLS application encryption is atomically persisted in
-  the event journal; transport delivery, UI exposure, and media remain unbuilt.
+  in SQLCipher. MLS application messages use the direct pinned Iroh/QUIC session with a
+  local SQLCipher transcript and retryable outbox. Membership Commit bytes are
+  atomically journaled with group state; Commit distribution/adoption, helper
+  delivery, and media remain in progress.
 - **Server/backend:** Elixir in
   [`slouching-org/slouching-backend`](https://github.com/slouching-org/slouching-backend).
 - **Current boundary:** loopback HTTP status and binary protobuf WebSocket
