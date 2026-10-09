@@ -69,10 +69,11 @@ receiver saves an inbound message to its encrypted local history before ACK;
 the sender saves an outbound message after receiving ACK. ACK confirms
 acceptance into the receiver's local transcript, not that the user read it.
 History stays on each device and is scoped to the pinned peer key; it is not
-synchronized. This is pairwise QUIC channel encryption and pinned device
-identity, not MLS messaging or contact verification. There is no address
-discovery, relay, cross-NAT support, retry/offline delivery, or media. Allow
-the chosen UDP port through each device's local firewall. The automated
+synchronized. **Apagar histórico local deste peer** removes only that peer's
+rows after an explicit confirmation. This is pairwise QUIC channel encryption
+and pinned device identity, not MLS messaging or contact verification. There
+is no address discovery, relay, cross-NAT support, retry/offline delivery, or
+media. Allow the chosen UDP port through each device's local firewall. The automated
 `cargo test --test peer_process` launches separate OS processes, exchanges
 multiple messages in both directions over one connection, checks wrong-pin
 rejection, and verifies a pending send is reported as unknown on disconnect.
