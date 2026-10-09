@@ -1170,11 +1170,56 @@ pub fn process_mls_self_update_proposal(
     process_mls_self_update_proposal_in(&mut connection, group_id, proposal_bytes, &device_identity)
 }
 
+/// Processes a direct-session proposal only when its signed MLS author is the
+/// same device authenticated by the pinned peer transport.
+pub fn process_mls_self_update_proposal_from_peer(
+    envelope: &crate::peer::MlsProposalEnvelope,
+    pinned_peer_device: [u8; 32],
+) -> Result<ProcessedMlsProposal, String> {
+    if envelope.author_device != pinned_peer_device
+        || envelope.event_id.as_slice() != &blake3::hash(&envelope.proposal).as_bytes()[..16]
+    {
+        return Err("MLS proposal envelope does not match its pinned author or bytes".to_owned());
+    }
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let device_identity = signing_key_from_secret(secret)?;
+    let mut connection = open_local_database()?;
+    process_mls_self_update_proposal_with_author_in(
+        &mut connection,
+        &envelope.group_id,
+        &envelope.proposal,
+        &device_identity,
+        Some(pinned_peer_device),
+        Some(envelope.epoch),
+    )
+}
+
 fn process_mls_self_update_proposal_in(
     connection: &mut Connection,
     group_id: &[u8],
     proposal_bytes: &[u8],
     device_identity: &SigningKey,
+) -> Result<ProcessedMlsProposal, String> {
+    process_mls_self_update_proposal_with_author_in(
+        connection,
+        group_id,
+        proposal_bytes,
+        device_identity,
+        None,
+        None,
+    )
+}
+
+fn process_mls_self_update_proposal_with_author_in(
+    connection: &mut Connection,
+    group_id: &[u8],
+    proposal_bytes: &[u8],
+    device_identity: &SigningKey,
+    expected_author: Option<[u8; 32]>,
+    expected_epoch: Option<u64>,
 ) -> Result<ProcessedMlsProposal, String> {
     use openmls::prelude::tls_codec::Deserialize as TlsCodecDeserialize;
 
@@ -1189,6 +1234,9 @@ fn process_mls_self_update_proposal_in(
         return Err("MLS proposal belongs to another group".to_owned());
     }
     let epoch = message.epoch().as_u64();
+    if expected_epoch.is_some_and(|expected| expected != epoch) {
+        return Err("MLS proposal envelope epoch does not match its signed message".to_owned());
+    }
     let digest = *blake3::hash(proposal_bytes).as_bytes();
     let mut proposal_id = [0; 16];
     proposal_id.copy_from_slice(&digest[..16]);
@@ -1207,16 +1255,20 @@ fn process_mls_self_update_proposal_in(
         if designated_committer.as_slice() != device_identity.verifying_key().as_bytes() {
             return Err("only the designated committer can accept an MLS proposal".to_owned());
         }
-        let duplicate: Option<(Vec<u8>, Vec<u8>)> = connection
+        let duplicate: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = connection
             .query_row(
-                "SELECT proposal_hash, proposal_bytes FROM local_mls_proposals WHERE proposal_id = ?1",
+                "SELECT author_device, proposal_hash, proposal_bytes
+                 FROM local_mls_proposals WHERE proposal_id = ?1",
                 [proposal_id.as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|error| format!("could not check MLS proposal redelivery: {error}"))?;
-        if let Some((saved_hash, saved_bytes)) = duplicate {
-            if saved_hash.as_slice() == digest && saved_bytes == proposal_bytes {
+        if let Some((saved_author, saved_hash, saved_bytes)) = duplicate {
+            if saved_hash.as_slice() == digest
+                && saved_bytes == proposal_bytes
+                && expected_author.is_none_or(|expected| saved_author.as_slice() == expected)
+            {
                 return Ok(ProcessedMlsProposal::Duplicate { epoch });
             }
             return Err("MLS proposal ID collision".to_owned());
@@ -1266,6 +1318,10 @@ fn process_mls_self_update_proposal_in(
                 sender_member.signature_key.as_slice(),
             ) {
                 return Err("MLS proposal author has an invalid device binding".to_owned());
+            }
+            if expected_author.is_some_and(|expected| expected != sender_binding.device_public_key)
+            {
+                return Err("MLS proposal author does not match the pinned peer device".to_owned());
             }
             let queued = match processed.into_content() {
                 ProcessedMessageContent::ProposalMessage(proposal) => proposal,
@@ -4022,12 +4078,25 @@ mod tests {
             create_mls_self_update_proposal_in(&mut member, &group.group_id, &member_identity)
                 .expect("member should create a self-update proposal");
         assert_eq!(proposal.epoch, 1);
-        assert_eq!(
-            process_mls_self_update_proposal_in(
+        assert!(
+            process_mls_self_update_proposal_with_author_in(
                 &mut creator,
                 &group.group_id,
                 &proposal.proposal,
                 &creator_identity,
+                Some([0x99; 32]),
+                Some(proposal.epoch),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            process_mls_self_update_proposal_with_author_in(
+                &mut creator,
+                &group.group_id,
+                &proposal.proposal,
+                &creator_identity,
+                Some(member_identity.verifying_key().to_bytes()),
+                Some(proposal.epoch),
             )
             .expect("designated committer should accept the signed update proposal"),
             ProcessedMlsProposal::Accepted { epoch: 1 }

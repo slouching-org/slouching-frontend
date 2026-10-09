@@ -28,11 +28,13 @@ banner when authenticated committer
 equivocation has quarantined a group; MLS sends, retries, and Commit delivery
 are disabled for that group.
 
-The screen also supports signed member self-update proposals exchanged through
-a separately trusted channel. The designated committer authenticates and stores
-the proposal, then creates a Commit for the existing per-member delivery flow.
-This path currently handles self-updates only; it does not send proposals over
-the peer session.
+The screen also supports signed member self-update proposals sent to the
+designated committer over the active pinned peer session. The committer checks
+the MLS author against the transport peer, authenticates and stores the
+proposal before ACK, then creates a Commit for the existing per-member
+delivery flow. Copy/paste over a separately trusted channel remains available.
+This path currently handles self-updates only; other proposal types and
+approval controls are not implemented.
 
 Opening the encrypted database composes OpenMLS RustCrypto with its versioned
 SQLite storage schema through the same SQLCipher connection. The Rust core

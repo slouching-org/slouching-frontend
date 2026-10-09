@@ -1437,6 +1437,12 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             Message::MlsUpdateProposalChanged
         ),
         l.control(
+            "arrow",
+            "Enviar proposta ao committer conectado",
+            (!state.mls_update_proposal.is_empty()).then_some(Message::SendMlsUpdateProposal),
+            state.mls_quarantine_reason.is_none()
+        ),
+        l.control(
             "key",
             "Copiar proposta para o committer",
             (!state.mls_update_proposal.is_empty())

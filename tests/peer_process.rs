@@ -343,6 +343,12 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 assert!(received.insert(sequence), "duplicate receive sequence");
                 commit_received = true;
             }
+            peer::PeerEvent::MlsProposalReceived { .. }
+            | peer::PeerEvent::MlsProposalAcknowledged { .. }
+            | peer::PeerEvent::MlsProposalRejected { .. }
+            | peer::PeerEvent::MlsProposalDeliveryUnknown { .. } => {
+                panic!("unexpected MLS proposal in the existing Commit exchange test")
+            }
             peer::PeerEvent::MlsCommitRequested {
                 group_id,
                 predecessor_epoch,
@@ -436,7 +442,11 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 | peer::PeerEvent::MlsCommitAcknowledged { .. }
                 | peer::PeerEvent::MlsCommitRejected { .. }
                 | peer::PeerEvent::MlsCommitReceived { .. }
-                | peer::PeerEvent::MlsCommitRequested { .. } => {}
+                | peer::PeerEvent::MlsCommitRequested { .. }
+                | peer::PeerEvent::MlsProposalReceived { .. }
+                | peer::PeerEvent::MlsProposalAcknowledged { .. }
+                | peer::PeerEvent::MlsProposalRejected { .. }
+                | peer::PeerEvent::MlsProposalDeliveryUnknown { .. } => {}
                 peer::PeerEvent::Rejected { reason, .. } => {
                     panic!("unexpected rejection: {reason}")
                 }
@@ -460,7 +470,8 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 | peer::PeerEvent::Received { .. }
                 | peer::PeerEvent::Acknowledged { .. }
                 | peer::PeerEvent::MlsEventAcknowledged { .. }
-                | peer::PeerEvent::MlsCommitRequested { .. } => {}
+                | peer::PeerEvent::MlsCommitRequested { .. }
+                | peer::PeerEvent::MlsProposalAcknowledged { .. } => {}
                 peer::PeerEvent::MlsEventReceived { event, .. } if event.event_id[0] == 0xfe => {
                     got_unacknowledged = true;
                 }
@@ -469,6 +480,9 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                     got_unacknowledged = true;
                 }
                 peer::PeerEvent::MlsCommitReceived { .. } => {}
+                peer::PeerEvent::MlsProposalReceived { .. }
+                | peer::PeerEvent::MlsProposalRejected { .. }
+                | peer::PeerEvent::MlsProposalDeliveryUnknown { .. } => {}
                 peer::PeerEvent::DeliveryUnknown { .. }
                 | peer::PeerEvent::MlsEventDeliveryUnknown { .. }
                 | peer::PeerEvent::MlsCommitDeliveryUnknown { .. }
@@ -548,11 +562,14 @@ async fn assert_no_application_session(session: peer::DirectPeerSession) {
             peer::PeerEvent::MlsEventReceived { .. }
             | peer::PeerEvent::MlsEventAcknowledged { .. }
             | peer::PeerEvent::MlsCommitReceived { .. }
-            | peer::PeerEvent::MlsCommitAcknowledged { .. } => {
+            | peer::PeerEvent::MlsCommitAcknowledged { .. }
+            | peer::PeerEvent::MlsProposalReceived { .. }
+            | peer::PeerEvent::MlsProposalAcknowledged { .. } => {
                 panic!("wrong pinned device exchanged an MLS event")
             }
             peer::PeerEvent::MlsEventRejected { .. }
-            | peer::PeerEvent::MlsCommitRejected { .. } => {
+            | peer::PeerEvent::MlsCommitRejected { .. }
+            | peer::PeerEvent::MlsProposalRejected { .. } => {
                 panic!("wrong pinned device exchanged an MLS event")
             }
             peer::PeerEvent::Disconnected { .. } => break,
@@ -562,6 +579,7 @@ async fn assert_no_application_session(session: peer::DirectPeerSession) {
             | peer::PeerEvent::DeliveryUnknown { .. } => {}
             peer::PeerEvent::MlsEventDeliveryUnknown { .. } => {}
             peer::PeerEvent::MlsCommitDeliveryUnknown { .. } => {}
+            peer::PeerEvent::MlsProposalDeliveryUnknown { .. } => {}
             peer::PeerEvent::MlsCommitRequested { .. } => {}
         }
     }

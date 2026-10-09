@@ -33,7 +33,7 @@ multiple bounded UTF-8 messages over one session stream, with sequence
 acknowledgements and relay mode disabled. This provides
 direct pairwise transport encryption and pinned endpoint authentication only;
 it does not create an MLS group or establish contact pairing. See the
-[direct peer transport v4 contract](../transport/lan-peer-v4.md).
+[direct peer transport v5 contract](../transport/lan-peer-v5.md).
 
 See [ADR 0003](adr-0003-native-client.md) and the
 [backend stack ficha](https://github.com/slouching-org/slouching-backend/blob/main/docs/fichas/architecture/tech-stack.md).

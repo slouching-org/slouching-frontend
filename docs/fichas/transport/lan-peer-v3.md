@@ -1,7 +1,7 @@
 # Direct peer transport v3
 
-> Historical contract for protocol v3. The active client uses v4; see
-> [lan-peer-v4.md](lan-peer-v4.md) for the current wire format and behavior.
+> Historical contract for protocol v3. The active client uses v5; see
+> [lan-peer-v5.md](lan-peer-v5.md) for the current wire format and behavior.
 
 This client-only protocol carries direct pairwise text and opaque OpenMLS
 application events between two Rust clients on a reachable LAN. The Iced chat

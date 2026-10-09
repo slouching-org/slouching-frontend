@@ -196,6 +196,8 @@ struct Slouching {
     mls_received_commit: String,
     mls_update_proposal: String,
     mls_received_update_proposal: String,
+    mls_update_proposal_epoch: Option<u64>,
+    mls_update_proposal_group: Option<Vec<u8>>,
     mls_welcome: String,
     mls_ratchet_tree: String,
     mls_status: String,
@@ -209,6 +211,7 @@ struct Slouching {
     mls_commit_recipients: Vec<storage::MlsCommitRecipientStatus>,
     mls_pending_events: std::collections::HashMap<u64, [u8; 16]>,
     mls_sending_commits: std::collections::HashMap<u64, [u8; 16]>,
+    mls_sending_proposals: std::collections::HashSet<u64>,
     mls_next_request_id: u64,
 }
 
@@ -327,6 +330,8 @@ impl Default for Slouching {
             mls_received_commit: String::new(),
             mls_update_proposal: String::new(),
             mls_received_update_proposal: String::new(),
+            mls_update_proposal_epoch: None,
+            mls_update_proposal_group: None,
             mls_welcome: String::new(),
             mls_ratchet_tree: String::new(),
             mls_status: "Crie uma identidade do dispositivo para começar.".to_owned(),
@@ -340,6 +345,7 @@ impl Default for Slouching {
             mls_commit_recipients: Vec::new(),
             mls_pending_events: std::collections::HashMap::new(),
             mls_sending_commits: std::collections::HashMap::new(),
+            mls_sending_proposals: std::collections::HashSet::new(),
             mls_next_request_id: 1,
         }
     }
@@ -404,6 +410,13 @@ enum Message {
     MlsReceivedUpdateProposalChanged(String),
     CreateMlsUpdateProposal,
     MlsUpdateProposalCreated(Result<storage::PreparedMlsUpdateProposal, String>),
+    SendMlsUpdateProposal,
+    MlsUpdateProposalPeerCommandSent(u64, Result<(), String>),
+    MlsUpdateProposalInboundProcessed(
+        u64,
+        peer::MlsProposalEnvelope,
+        Result<storage::ProcessedMlsProposal, String>,
+    ),
     ApplyMlsUpdateProposal,
     MlsUpdateProposalProcessed(Result<storage::ProcessedMlsProposal, String>),
     CommitMlsProposals,
@@ -893,6 +906,32 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                             },
                         );
                     }
+                    peer::PeerEvent::MlsProposalReceived {
+                        sequence,
+                        peer_id,
+                        proposal,
+                    } => {
+                        let pinned_peer = *peer_id.as_bytes();
+                        if proposal.author_device != pinned_peer {
+                            if let Some(commands) = state.peer_session_commands.as_ref() {
+                                let _ = commands.try_send(peer::PeerCommand::RejectInbound {
+                                    sequence,
+                                    reason: "MLS proposal author does not match pinned peer".into(),
+                                });
+                            }
+                            state.mls_status =
+                                "Proposta rejeitada: autor MLS diverge do peer fixado.".into();
+                            return Task::none();
+                        }
+                        return Task::perform(
+                            process_mls_proposal_from_peer_task(proposal.clone(), pinned_peer),
+                            move |result| {
+                                Message::MlsUpdateProposalInboundProcessed(
+                                    sequence, proposal, result,
+                                )
+                            },
+                        );
+                    }
                     peer::PeerEvent::MlsCommitRequested {
                         peer_id,
                         group_id,
@@ -935,6 +974,30 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         return Task::perform(
                             mark_mls_commit_delivered_task(event_id, peer_device),
                             move |result| Message::MlsCommitDelivered(request_id, result),
+                        );
+                    }
+                    peer::PeerEvent::MlsProposalAcknowledged { request_id } => {
+                        if !state.mls_sending_proposals.remove(&request_id) {
+                            state.mls_status =
+                                "ACK de proposta desconhecida; sessão encerrada.".into();
+                            if let Some(commands) = state.peer_session_commands.as_ref() {
+                                let _ = commands.try_send(peer::PeerCommand::Disconnect);
+                            }
+                            return Task::none();
+                        }
+                        state.mls_status = format!(
+                            "Proposta de atualização MLS {request_id} foi persistida pelo committer."
+                        );
+                    }
+                    peer::PeerEvent::MlsProposalRejected { request_id, reason } => {
+                        state.mls_sending_proposals.remove(&request_id);
+                        state.mls_status =
+                            format!("Proposta MLS {request_id} rejeitada pelo peer: {reason}");
+                    }
+                    peer::PeerEvent::MlsProposalDeliveryUnknown { request_id } => {
+                        state.mls_sending_proposals.remove(&request_id);
+                        state.mls_status = format!(
+                            "Entrega da proposta MLS {request_id} desconhecida; reenvie os mesmos bytes para evitar proposta duplicada."
                         );
                     }
                     peer::PeerEvent::MlsCommitRejected { request_id, reason } => {
@@ -1250,7 +1313,11 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         Message::MlsMessageDraftChanged(value) => state.mls_message_draft = value,
         Message::MlsCommitChanged(value) => state.mls_commit = value,
         Message::MlsReceivedCommitChanged(value) => state.mls_received_commit = value,
-        Message::MlsUpdateProposalChanged(value) => state.mls_update_proposal = value,
+        Message::MlsUpdateProposalChanged(value) => {
+            state.mls_update_proposal = value;
+            state.mls_update_proposal_epoch = None;
+            state.mls_update_proposal_group = None;
+        }
         Message::MlsReceivedUpdateProposalChanged(value) => {
             state.mls_received_update_proposal = value
         }
@@ -1277,6 +1344,8 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         Message::MlsUpdateProposalCreated(result) => match result {
             Ok(proposal) => {
                 state.mls_update_proposal = hex_encode_bytes(&proposal.proposal);
+                state.mls_update_proposal_epoch = Some(proposal.epoch);
+                state.mls_update_proposal_group = Some(proposal.group_id);
                 state.mls_status = format!(
                     "Proposta de atualização pronta para o committer designado (epoch {}). Compartilhe pelo canal confiável.",
                     proposal.epoch
@@ -1284,6 +1353,90 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             }
             Err(error) => state.mls_status = format!("Falha ao criar proposta MLS: {error}"),
         },
+        Message::SendMlsUpdateProposal => {
+            if state.mls_quarantine_reason.is_some() {
+                state.mls_status = "Grupo em quarentena; envio de proposta bloqueado.".into();
+                return Task::none();
+            }
+            let Some(commands) = state.peer_session_commands.clone() else {
+                state.mls_status =
+                    "Conecte-se ao committer pela sessão direta antes de enviar a proposta.".into();
+                return Task::none();
+            };
+            let group_id = match hex_decode_bytes(&state.mls_group_id) {
+                Ok(group_id) if group_id.len() == 16 => group_id,
+                _ => {
+                    state.mls_status =
+                        "Informe o ID do grupo MLS ingressado neste dispositivo.".into();
+                    return Task::none();
+                }
+            };
+            if state.mls_update_proposal_group.as_deref() != Some(group_id.as_slice()) {
+                state.mls_status = "Gere novamente a proposta para o grupo selecionado.".into();
+                return Task::none();
+            }
+            let Some(epoch) = state.mls_update_proposal_epoch else {
+                state.mls_status =
+                    "Gere uma proposta nesta sessão antes de enviá-la diretamente.".into();
+                return Task::none();
+            };
+            let proposal = match hex_decode_bytes(&state.mls_update_proposal) {
+                Ok(proposal) if !proposal.is_empty() => proposal,
+                Ok(_) => {
+                    state.mls_status = "A proposta MLS está vazia.".into();
+                    return Task::none();
+                }
+                Err(error) => {
+                    state.mls_status = format!("Proposta MLS inválida: {error}");
+                    return Task::none();
+                }
+            };
+            let author_device = match state.identity_status {
+                IdentityStatus::Ready(public_key) => public_key,
+                _ => {
+                    state.mls_status =
+                        "Carregue a identidade do dispositivo para enviar a proposta.".into();
+                    return Task::none();
+                }
+            };
+            let event_hash = blake3::hash(&proposal);
+            let mut event_id = [0; 16];
+            event_id.copy_from_slice(&event_hash.as_bytes()[..16]);
+            let envelope = peer::MlsProposalEnvelope {
+                event_id,
+                author_device,
+                group_id,
+                epoch,
+                proposal,
+            };
+            let request_id = state.mls_next_request_id;
+            state.mls_next_request_id = state.mls_next_request_id.saturating_add(1);
+            state.mls_sending_proposals.insert(request_id);
+            state.mls_status =
+                "Enviando proposta MLS pela sessão fixada; aguardando persistência do committer…"
+                    .into();
+            return Task::perform(
+                async move {
+                    commands
+                        .send(peer::PeerCommand::SendMlsProposal {
+                            request_id,
+                            proposal: envelope,
+                        })
+                        .await
+                        .map_err(|error| error.to_string())
+                },
+                move |result| Message::MlsUpdateProposalPeerCommandSent(request_id, result),
+            );
+        }
+        Message::MlsUpdateProposalPeerCommandSent(request_id, Ok(())) => {
+            state.mls_status = format!(
+                "Proposta MLS {request_id} enviada ao peer; aguardando validação e persistência."
+            );
+        }
+        Message::MlsUpdateProposalPeerCommandSent(request_id, Err(error)) => {
+            state.mls_sending_proposals.remove(&request_id);
+            state.mls_status = format!("Proposta permanece pronta para reenviar: {error}");
+        }
         Message::ApplyMlsUpdateProposal => {
             if state.mls_quarantine_reason.is_some() {
                 state.mls_status = "Grupo em quarentena; propostas MLS bloqueadas.".into();
@@ -1324,6 +1477,42 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 );
             }
             Err(error) => state.mls_status = format!("Proposta MLS rejeitada: {error}"),
+        },
+        Message::MlsUpdateProposalInboundProcessed(sequence, proposal, result) => match result {
+            Ok(processed) => {
+                if let Some(commands) = state.peer_session_commands.as_ref()
+                    && let Err(error) =
+                        commands.try_send(peer::PeerCommand::AcceptInbound { sequence })
+                {
+                    state.mls_status =
+                        format!("Proposta MLS foi salva, mas não foi possível enviar ACK: {error}");
+                    return Task::none();
+                }
+                state.mls_group_id = hex_encode_bytes(&proposal.group_id);
+                state.mls_status = match processed {
+                    storage::ProcessedMlsProposal::Accepted { epoch } => format!(
+                        "Proposta de self-update autenticada e salva no epoch {epoch}; ACK enviado ao membro."
+                    ),
+                    storage::ProcessedMlsProposal::Duplicate { epoch } => format!(
+                        "Proposta MLS já estava salva no epoch {epoch}; ACK de redelivery enviado."
+                    ),
+                };
+                return load_mls_history(state, proposal.group_id);
+            }
+            Err(error) => {
+                if let Some(commands) = state.peer_session_commands.as_ref()
+                    && let Err(send_error) = commands.try_send(peer::PeerCommand::RejectInbound {
+                        sequence,
+                        reason: error.clone(),
+                    })
+                {
+                    state.mls_status = format!(
+                        "Proposta rejeitada ({error}), mas a rejeição não pôde ser enviada: {send_error}"
+                    );
+                    return Task::none();
+                }
+                state.mls_status = format!("Proposta MLS rejeitada sem ACK: {error}");
+            }
         },
         Message::CommitMlsProposals => {
             if state.mls_quarantine_reason.is_some() {
@@ -2248,6 +2437,17 @@ async fn process_mls_update_proposal_task(
     .map_err(|error| format!("MLS proposal processing task failed: {error}"))?
 }
 
+async fn process_mls_proposal_from_peer_task(
+    proposal: peer::MlsProposalEnvelope,
+    pinned_peer_device: [u8; 32],
+) -> Result<storage::ProcessedMlsProposal, String> {
+    tokio::task::spawn_blocking(move || {
+        storage::process_mls_self_update_proposal_from_peer(&proposal, pinned_peer_device)
+    })
+    .await
+    .map_err(|error| format!("MLS peer proposal task failed: {error}"))?
+}
+
 async fn commit_mls_proposals_task(group_id: Vec<u8>) -> Result<storage::StoredMlsCommit, String> {
     tokio::task::spawn_blocking(move || storage::commit_pending_mls_proposals(&group_id))
         .await
@@ -2602,6 +2802,7 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
         }
         peer::PeerEvent::MlsEventReceived { .. } => {}
         peer::PeerEvent::MlsCommitReceived { .. } => {}
+        peer::PeerEvent::MlsProposalReceived { .. } => {}
         peer::PeerEvent::MlsCommitRequested { .. } => {}
         peer::PeerEvent::MlsEventAcknowledged { request_id } => {
             state.peer_send_status = PeerSendStatus::Failed(format!(
@@ -2619,7 +2820,10 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
         }
         peer::PeerEvent::MlsCommitAcknowledged { .. }
         | peer::PeerEvent::MlsCommitRejected { .. }
-        | peer::PeerEvent::MlsCommitDeliveryUnknown { .. } => {}
+        | peer::PeerEvent::MlsCommitDeliveryUnknown { .. }
+        | peer::PeerEvent::MlsProposalAcknowledged { .. }
+        | peer::PeerEvent::MlsProposalRejected { .. }
+        | peer::PeerEvent::MlsProposalDeliveryUnknown { .. } => {}
         peer::PeerEvent::Unauthorized { .. } => {
             state.peer_listen_status = PeerListenStatus::Unauthorized(
                 "peer não corresponde à chave pública fixada".to_owned(),
