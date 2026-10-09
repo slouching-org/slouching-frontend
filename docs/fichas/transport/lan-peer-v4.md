@@ -65,14 +65,16 @@ When adding later members, the MLS screen can send the pending Commit over the
 active pinned session to one device in the predecessor-epoch member snapshot.
 The Iroh peer key must match the snapshotted device key, so a newly invited
 member never receives the older Commit and a removed member can receive its
-removal Commit. The receiver
-validates the Commit signature, designated committer, group and next epoch,
-persists the state, then ACKs. The sender persists that ACK per recipient and
-the MLS screen shows which devices have adopted the Commit; redelivery is
-idempotent. The new member joins with the matching Welcome and
-ratchet tree. Automatic multi-member fan-out and helper delivery are not
-implemented. One click drains that member's eligible Commit chain in epoch
-order and waits for each persisted ACK before sending the next.
+removal Commit. On peer connection, the client checks whether that pinned
+device has eligible pending Commits and starts the chain automatically. The
+receiver validates the Commit signature, designated committer, group and next
+epoch, persists the state, then ACKs. The sender persists that ACK per recipient
+and the MLS screen shows which devices have adopted the Commit; redelivery is
+idempotent. Each next Commit waits for the previous persisted ACK. The same
+chain can also be started manually from the MLS screen. The new member joins
+with the matching Welcome and ratchet tree. Connecting to every member still
+requires a separate peer session; simultaneous multi-peer fan-out and helper
+delivery are not implemented.
 
 Allow the selected UDP port through each device's firewall. Wildcard addresses
 such as `0.0.0.0` cannot be shared. If no LAN address is announced, inspect the

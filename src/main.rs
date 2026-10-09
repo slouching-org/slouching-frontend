@@ -801,6 +801,18 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 PeerListenEvent::SessionCommands(commands) => {
                     state.peer_session_commands = Some(commands);
                 }
+                PeerListenEvent::Session(peer::PeerEvent::Connected { peer_id }) => {
+                    apply_peer_event(state, peer::PeerEvent::Connected { peer_id });
+                    let Some(group_id) = state.mls_history_group.clone() else {
+                        return Task::none();
+                    };
+                    state.mls_status = "Sessão conectada; verificando Commits pendentes autorizados para este dispositivo…".to_owned();
+                    let peer_device = *peer_id.as_bytes();
+                    return Task::perform(
+                        load_mls_commits_for_peer_task(group_id.clone(), peer_device),
+                        move |result| Message::MlsCommitsReadyToSend(group_id, result),
+                    );
+                }
                 PeerListenEvent::Session(event) => match event {
                     peer::PeerEvent::Received { sequence, text } => {
                         let Ok(peer_id) = parse_peer_id(&state.peer_public_key) else {
@@ -1227,6 +1239,11 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             );
         }
         Message::MlsCommitsReadyToSend(group_id, result) => {
+            if !state.mls_sending_commits.is_empty() {
+                state.mls_status =
+                    "Aguardando o ACK do Commit em trânsito antes de enviar o próximo.".to_owned();
+                return Task::none();
+            }
             return match result {
                 Ok(commits) => {
                     let Some(commands) = state.peer_session_commands.clone() else {

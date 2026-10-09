@@ -100,10 +100,11 @@ at the Commit's predecessor epoch; a newly invited device is not sent that
 older Commit, while a removed device can still receive its removal Commit.
 The recipient validates it and persists the new
 epoch before ACK, and the sender stores that ACK per recipient. Exact redelivery
-is harmless. One click drains that recipient's pending Commits in epoch order,
-waiting for each durable ACK before sending the next. Repeat after connecting
-to another member; automatic multi-member fan-out and offline delivery remain
-in progress. If a recipient is behind, it requests the missing predecessor over
+is harmless. When a pinned peer connects, the client checks for that device's
+eligible Commit chain and starts delivery automatically; each next Commit waits
+for the preceding durable ACK. The manual **Enviar Commits pendentes** control
+remains available. Connect to each member to deliver its eligible chain;
+offline delivery remains in progress. If a recipient is behind, it requests the missing predecessor over
 the pinned session; the committer serves it only when that device was in the
 Commit's predecessor snapshot, including Commits already marked delivered.
 The MLS screen
