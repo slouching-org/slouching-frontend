@@ -154,8 +154,9 @@ The MLS screen now detects authenticated committer equivocation. It verifies a
 conflicting historical Commit against a saved OpenMLS epoch snapshot, stores
 both Commit values in the encrypted database, and quarantines that group on
 the device. Its accepted epoch remains intact, and reopening the group restores
-the visible security alert. MLS message creation, event retries, and Commit
-delivery are blocked until a recovery or rekey flow is implemented.
+the visible security alert. MLS message creation, event retries, member admission,
+and Commit delivery or manual application are blocked until a recovery or rekey
+flow is implemented.
 
 The eleven design-board views and additional MLS screen are captured in [native-vhs](docs/design/runtime/native-vhs/).
 These are a first implementation of the visual direction, with comparison

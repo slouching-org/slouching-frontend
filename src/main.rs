@@ -1137,6 +1137,11 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             Err(error) => state.mls_status = format!("Falha ao preparar pacote: {error}"),
         },
         Message::AdmitMlsMember => {
+            if state.mls_quarantine_reason.is_some() {
+                state.mls_status =
+                    "Grupo em quarentena; não é possível admitir membros.".to_owned();
+                return Task::none();
+            }
             let group_id = match hex_decode_bytes(&state.mls_group_id) {
                 Ok(value) => value,
                 Err(error) => {
@@ -1205,6 +1210,11 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         Message::MlsCommitChanged(value) => state.mls_commit = value,
         Message::MlsReceivedCommitChanged(value) => state.mls_received_commit = value,
         Message::DistributeMlsCommit => {
+            if state.mls_quarantine_reason.is_some() {
+                state.mls_status =
+                    "Grupo em quarentena; distribuição de Commits bloqueada.".to_owned();
+                return Task::none();
+            }
             if !state.mls_sending_commits.is_empty() {
                 state.mls_status =
                     "Aguardando a confirmação do Commit atual antes de avançar a cadeia."
@@ -1461,6 +1471,11 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             }
         },
         Message::ApplyMlsCommit => {
+            if state.mls_quarantine_reason.is_some() {
+                state.mls_status =
+                    "Grupo em quarentena; aplicação manual de Commits bloqueada.".to_owned();
+                return Task::none();
+            }
             let group_id = match hex_decode_bytes(&state.mls_group_id) {
                 Ok(group_id) if group_id.len() == 16 => group_id,
                 _ => {

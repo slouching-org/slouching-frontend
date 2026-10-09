@@ -4037,6 +4037,11 @@ mod tests {
             .is_err(),
             "quarantined groups must not create outbound application messages"
         );
+        assert!(
+            list_queued_mls_commits_in(&invitee, &group.group_id, 10)
+                .expect_err("quarantined groups must not expose queued Commits")
+                .contains("quarantined")
+        );
         drop(invitee);
         let invitee = open_database(&invitee_path, &invitee_key)
             .expect("quarantined group database should reopen");

@@ -18,8 +18,10 @@ group, epoch, designated committer, and device binding. A second valid Commit
 from the same committer is recorded as equivocation and permanently quarantines
 that group on this device. The accepted epoch stays intact; MLS sends, retries,
 and Commit distribution are blocked, and the security alert returns when the
-group is reopened. Invalid or differently authored conflicts do not trigger
-quarantine. Recovery or rekey after quarantine is not implemented.
+group is reopened. The UI disables member admission, Commit distribution and
+manual application along with message sends and retries. Invalid or differently
+authored conflicts do not trigger quarantine. Recovery or rekey after
+quarantine is not implemented.
 
 `src/main.rs` owns application and transport state; `src/ui.rs` composes the
 native Iced views, original art, icons, embedded fonts, and texture effects.

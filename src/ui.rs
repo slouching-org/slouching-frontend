@@ -1265,7 +1265,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             "users",
             "Validar e admitir membro",
             Some(Message::AdmitMlsMember),
-            true
+            state.mls_quarantine_reason.is_none()
         ),
         l.label("COMMIT PÚBLICO · DISTRIBUA AOS MEMBROS ATUAIS", 10.0, GOLD),
         l.input(
@@ -1283,7 +1283,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             "arrow",
             "Enviar Commits pendentes ao membro conectado",
             Some(Message::DistributeMlsCommit),
-            true
+            state.mls_quarantine_reason.is_none()
         ),
         l.label("WELCOME · COPIE PARA O DISPOSITIVO CONVIDADO", 10.0, GOLD),
         l.input(
@@ -1322,7 +1322,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             "check",
             "Autenticar e aplicar Commit",
             Some(Message::ApplyMlsCommit),
-            true
+            state.mls_quarantine_reason.is_none()
         )
     ]
     .spacing(l.px(9.0));
