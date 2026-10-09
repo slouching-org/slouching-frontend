@@ -1,3 +1,4 @@
+use crate::identity::MlsSigningKeyBinding;
 use directories::ProjectDirs;
 use ed25519_dalek::SigningKey;
 use keyring::{Entry, Error as KeyringError};
@@ -545,6 +546,22 @@ pub fn create_or_load_identity_public_key() -> Result<[u8; 32], String> {
     }
 }
 
+/// Signs an MLS-key binding with the existing device identity held in the OS keyring.
+/// The private seed is never returned to callers.
+pub fn sign_mls_identity_binding(
+    signature_scheme: u16,
+    mls_signing_public_key: &[u8],
+) -> Result<MlsSigningKeyBinding, String> {
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let signing_key = signing_key_from_secret(secret)?;
+    MlsSigningKeyBinding::sign(&signing_key, signature_scheme, mls_signing_public_key).ok_or_else(
+        || "MLS signing public key must be non-empty and fit the binding format".to_owned(),
+    )
+}
+
 fn key_entry() -> Result<Entry, String> {
     Entry::new(SERVICE, KEY_NAME)
         .map_err(|error| format!("system credential store is unavailable: {error}"))
@@ -556,6 +573,10 @@ fn identity_key_entry() -> Result<Entry, String> {
 }
 
 fn public_key_from_seed(secret: Vec<u8>) -> Result<[u8; 32], String> {
+    Ok(signing_key_from_secret(secret)?.verifying_key().to_bytes())
+}
+
+fn signing_key_from_secret(secret: Vec<u8>) -> Result<SigningKey, String> {
     let mut secret = Zeroizing::new(secret);
     if secret.len() != 32 {
         return Err("saved Ed25519 device key has an invalid length".to_owned());
@@ -563,8 +584,7 @@ fn public_key_from_seed(secret: Vec<u8>) -> Result<[u8; 32], String> {
     let mut seed = Zeroizing::new([0_u8; 32]);
     seed.copy_from_slice(&secret);
     secret.zeroize();
-    let signing_key = SigningKey::from_bytes(&seed);
-    Ok(signing_key.verifying_key().to_bytes())
+    Ok(SigningKey::from_bytes(&seed))
 }
 
 fn secret_key(bytes: Vec<u8>) -> Result<Zeroizing<[u8; PROFILE_DB_KEY_LEN]>, String> {

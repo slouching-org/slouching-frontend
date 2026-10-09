@@ -1,6 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use iced::{Element, Task, Theme, task::Handle};
 
+pub mod identity;
 pub mod storage;
 mod ui;
 use prost::Message as ProstMessage;
