@@ -13,7 +13,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 2;
+const PROFILE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct EncryptedEvent {
@@ -30,6 +30,22 @@ pub struct EncryptedEvent {
 pub enum StoreEventResult {
     Stored,
     AlreadyStored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundDeliveryState {
+    Queued,
+    HeldByPeer,
+    ReceivedByDevice,
+    Expired,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredOutboundEvent {
+    pub sequence: i64,
+    pub event: EncryptedEvent,
+    pub state: OutboundDeliveryState,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +137,153 @@ pub fn store_inbound_event(event: &EncryptedEvent) -> Result<StoreEventResult, S
     store_encrypted_event(event, "inbound")
 }
 
+/// Loads a bounded page for a future delivery worker; this does not send it.
+pub fn list_outbound_events(
+    after_sequence: i64,
+    limit: usize,
+) -> Result<Vec<StoredOutboundEvent>, String> {
+    if after_sequence < 0 || !(1..=500).contains(&limit) {
+        return Err("outbound event batch size must be between 1 and 500".to_owned());
+    }
+    let connection = open_local_database()?;
+    let mut statement = connection
+        .prepare(
+            "SELECT rowid, event_id, author_device, group_id, epoch, checkpoint,
+                    expires_at_unix, ciphertext, delivery_state
+             FROM local_events WHERE direction = 'outbound' AND rowid > ?1
+             ORDER BY rowid LIMIT ?2",
+        )
+        .map_err(|error| format!("could not prepare local outbox query: {error}"))?;
+    let rows = statement
+        .query_map(params![after_sequence, limit as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Vec<u8>>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })
+        .map_err(|error| format!("could not query local outbox: {error}"))?;
+    let mut events = Vec::new();
+    for row in rows {
+        let (
+            sequence,
+            event_id,
+            author_device,
+            group_id,
+            epoch,
+            checkpoint,
+            expires_at_unix,
+            ciphertext,
+            state,
+        ) = row.map_err(|error| format!("could not read local outbox event: {error}"))?;
+        events.push(StoredOutboundEvent {
+            sequence,
+            event: EncryptedEvent {
+                event_id: fixed_bytes(event_id, "event id")?,
+                author_device: fixed_bytes(author_device, "author device key")?,
+                group_id,
+                epoch: u64::try_from(epoch)
+                    .map_err(|_| "saved event has an invalid MLS epoch".to_owned())?,
+                checkpoint,
+                expires_at_unix,
+                ciphertext,
+            },
+            state: OutboundDeliveryState::try_from(state.as_str())?,
+        });
+    }
+    Ok(events)
+}
+
+/// Records a state supplied by trusted local protocol code. A future transport
+/// must authenticate receipts before passing `ReceivedByDevice` here.
+pub fn update_outbound_delivery_state(
+    event_id: [u8; 16],
+    next: OutboundDeliveryState,
+) -> Result<(), String> {
+    let mut connection = open_local_database()?;
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("could not begin local outbox transaction: {error}"))?;
+    let current: Option<String> = transaction
+        .query_row(
+            "SELECT delivery_state FROM local_events
+             WHERE event_id = ?1 AND direction = 'outbound'",
+            [event_id.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("could not read local outbox state: {error}"))?;
+    let current = current.ok_or_else(|| "outbound event was not found".to_owned())?;
+    let current = OutboundDeliveryState::try_from(current.as_str())?;
+    if !current.can_transition_to(next) {
+        return Err(format!(
+            "invalid outbound delivery state transition: {current:?} -> {next:?}"
+        ));
+    }
+    transaction
+        .execute(
+            "UPDATE local_events SET delivery_state = ?1 WHERE event_id = ?2",
+            params![next.as_str(), event_id.as_slice()],
+        )
+        .map_err(|error| format!("could not update local outbox state: {error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("could not commit local outbox state: {error}"))
+}
+
+impl OutboundDeliveryState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::HeldByPeer => "held_by_peer",
+            Self::ReceivedByDevice => "received_by_device",
+            Self::Expired => "expired",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn can_transition_to(self, next: Self) -> bool {
+        self == next
+            || matches!(
+                (self, next),
+                (
+                    Self::Queued,
+                    Self::HeldByPeer | Self::ReceivedByDevice | Self::Expired | Self::Failed
+                ) | (
+                    Self::HeldByPeer,
+                    Self::Queued | Self::ReceivedByDevice | Self::Expired | Self::Failed
+                ) | (Self::Failed, Self::Queued)
+            )
+    }
+}
+
+impl TryFrom<&str> for OutboundDeliveryState {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "held_by_peer" => Ok(Self::HeldByPeer),
+            "received_by_device" => Ok(Self::ReceivedByDevice),
+            "expired" => Ok(Self::Expired),
+            "failed" => Ok(Self::Failed),
+            _ => Err("saved event has an invalid delivery state".to_owned()),
+        }
+    }
+}
+
+fn fixed_bytes<const N: usize>(bytes: Vec<u8>, label: &str) -> Result<[u8; N], String> {
+    bytes
+        .try_into()
+        .map_err(|_| format!("saved event has an invalid {label}"))
+}
+
 fn store_encrypted_event(
     event: &EncryptedEvent,
     direction: &'static str,
@@ -140,10 +303,18 @@ fn store_encrypted_event(
     let transaction = connection
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| format!("could not begin local event transaction: {error}"))?;
-    let existing: Option<(Vec<u8>, Vec<u8>, Vec<u8>, i64, Option<Vec<u8>>, i64)> = transaction
+    let existing: Option<(
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        i64,
+        Option<Vec<u8>>,
+        i64,
+    )> = transaction
         .query_row(
-            "SELECT ciphertext_digest, ciphertext, group_id, epoch, checkpoint,
-                    expires_at_unix
+            "SELECT ciphertext_digest, ciphertext, author_device, group_id, epoch,
+                    checkpoint, expires_at_unix
              FROM local_events WHERE event_id = ?1",
             [event.event_id.as_slice()],
             |row| {
@@ -154,25 +325,36 @@ fn store_encrypted_event(
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )
         .optional()
         .map_err(|error| format!("could not check local event deduplication: {error}"))?;
 
-    if let Some((saved_digest, saved_ciphertext, group_id, epoch, checkpoint, expires_at)) =
-        existing
+    if let Some((
+        saved_digest,
+        saved_ciphertext,
+        author_device,
+        group_id,
+        epoch,
+        checkpoint,
+        expires_at,
+    )) = existing
     {
         let saved_digest = blake3::Hash::from_slice(&saved_digest)
             .map_err(|_| "saved local event has an invalid digest".to_owned())?;
         if saved_digest != digest
             || saved_ciphertext != event.ciphertext
+            || author_device != event.author_device
             || group_id != event.group_id
             || epoch != event.epoch as i64
             || checkpoint != event.checkpoint
             || expires_at != event.expires_at_unix
         {
-            return Err("event id was reused with different ciphertext".to_owned());
+            return Err(
+                "event id was reused with different content or envelope metadata".to_owned(),
+            );
         }
         transaction
             .commit()
@@ -184,8 +366,8 @@ fn store_encrypted_event(
         .execute(
             "INSERT INTO local_events (
                  event_id, direction, author_device, group_id, epoch, checkpoint,
-                 ciphertext_digest, ciphertext, expires_at_unix
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 ciphertext_digest, ciphertext, expires_at_unix, delivery_state
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 event.event_id.as_slice(),
                 direction,
@@ -196,6 +378,11 @@ fn store_encrypted_event(
                 digest.as_bytes().as_slice(),
                 event.ciphertext,
                 event.expires_at_unix,
+                if direction == "outbound" {
+                    "queued"
+                } else {
+                    "received_by_device"
+                },
             ],
         )
         .map_err(|error| format!("could not persist local encrypted event: {error}"))?;
@@ -355,6 +542,20 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
                  PRAGMA user_version = 2;",
             )
             .map_err(|error| format!("could not create local event storage: {error}"))?;
+    }
+    if version < 3 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE local_events
+                    ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'queued'
+                    CHECK (delivery_state IN (
+                        'queued', 'held_by_peer', 'received_by_device', 'expired', 'failed'
+                    ));
+                 UPDATE local_events SET delivery_state = 'received_by_device'
+                    WHERE direction = 'inbound';
+                 PRAGMA user_version = 3;",
+            )
+            .map_err(|error| format!("could not migrate local outbox state: {error}"))?;
     }
     transaction
         .commit()

@@ -23,7 +23,10 @@ profile is distinct from identity.
 The encrypted SQLite schema now includes an event journal for opaque inbound
 and outbound ciphertext, with stable random IDs, envelope metadata, BLAKE3
 ciphertext digests, and duplicate/conflict handling. These storage primitives
-are not connected to the UI, MLS, or network, so they do not enable messaging.
+also retain queued, peer-held, received, expired, or failed outbox state and
+load bounded batches. They are not connected to the UI, MLS, or network; only
+trusted protocol code may record a real receipt, so they do not enable
+messaging.
 
 Every view is labeled as a visual preview. Character scenes and messages
 are examples. Camera/microphone actions explain their unavailable state;

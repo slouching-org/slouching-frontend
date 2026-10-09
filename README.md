@@ -62,8 +62,11 @@ vault must be installed and available in the user session.
 The encrypted local database now has an event journal schema and storage
 primitives for opaque, already-encrypted inbound and outbound events. It
 deduplicates identical event IDs and rejects reuse with different ciphertext
-or envelope metadata. MLS, inbox/outbox UI, delivery, and transport are not
-connected to these primitives yet; this does not enable chat.
+or envelope metadata. Outbound rows have local queued/held/received/expired/
+failed states and bounded cursor-paginated reads for a future delivery worker. No
+transport or authenticated receipt feeds those states yet. MLS, inbox/outbox
+UI, delivery, and transport are not connected to these primitives; this does
+not enable chat.
 
 ![Native familiar screen showing local profile and identity keyring status, with a retry action when the system keyring is unavailable](docs/design/runtime/native-vhs/01-familiar.png)
 

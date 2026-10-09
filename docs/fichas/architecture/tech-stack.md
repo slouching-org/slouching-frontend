@@ -8,7 +8,7 @@ Its Elixir server/backend core and Rust/Iced client direction are retained.
 | --- | --- | --- |
 | Desktop UI | Rust 2024 + pinned Iced 0.14.0 | Native state in `src/main.rs` and eleven screens in `src/ui.rs` |
 | Rendering | Iced/wgpu | Eleven visual-preview views with images, SVG icons, and canvas texture; live video unbuilt |
-| Local client core | Rust identity, cryptography, storage, transport, media | SQLCipher profile, explicit Ed25519 key storage, and initial opaque encrypted-event storage are implemented; authenticated messaging, verification, transport, media, and the remaining core are pending |
+| Local client core | Rust identity, cryptography, storage, transport, media | SQLCipher profile, explicit Ed25519 key storage, and initial opaque encrypted-event/outbox storage are implemented; authenticated messaging, verification, transport, media, and the remaining core are pending |
 | Server/backend | Elixir, separately versioned backend repo | Development status and protobuf handshake implemented |
 | State boundary | Versioned protocol | Asynchronous loopback HTTP status and binary protobuf WebSocket handshake v1 integrated; production boundary pending |
 | Browser UI | HTML/CSS/JavaScript | Historical visual prototype in `prototypes/web/`; not product runtime |
