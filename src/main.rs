@@ -1,6 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use iced::{Element, Task, Theme, task::Handle};
 
+mod storage;
 mod ui;
 use prost::Message as ProstMessage;
 use serde::Deserialize;
@@ -162,6 +163,17 @@ struct Slouching {
     note: Option<&'static str>,
     capture_dir: Option<std::path::PathBuf>,
     capture_index: usize,
+    capture_once: bool,
+    profile_status: ProfileStatus,
+}
+
+#[derive(Debug, Clone)]
+enum ProfileStatus {
+    Loading,
+    Empty,
+    Saved,
+    Saving,
+    Failed,
 }
 
 impl Default for Slouching {
@@ -184,6 +196,8 @@ impl Default for Slouching {
             note: None,
             capture_dir: None,
             capture_index: 0,
+            capture_once: false,
+            profile_status: ProfileStatus::Loading,
         }
     }
 }
@@ -207,6 +221,9 @@ enum Message {
     DismissNote,
     Capture,
     Captured(iced::window::Screenshot),
+    ProfileLoaded(Result<Option<storage::LocalProfile>, String>),
+    SaveProfile,
+    ProfileSaved(storage::LocalProfile, Result<(), String>),
 }
 
 fn update(state: &mut Slouching, message: Message) -> Task<Message> {
@@ -302,6 +319,9 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     screenshot.size.width,
                     screenshot.size.height
                 );
+                if state.capture_once {
+                    return iced::exit();
+                }
                 state.capture_index += 1;
                 if state.capture_index == Screen::ALL.len() {
                     return iced::exit();
@@ -310,6 +330,48 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 return capture_after(Duration::from_millis(600));
             }
         }
+        Message::ProfileLoaded(result) => match result {
+            Ok(Some(profile)) => {
+                state.name = profile.display_name;
+                state.familiar = storage::familiar_label(&profile.familiar);
+                state.profile_status = ProfileStatus::Saved;
+            }
+            Ok(None) => state.profile_status = ProfileStatus::Empty,
+            Err(_) => {
+                state.profile_status = ProfileStatus::Failed;
+            }
+        },
+        Message::SaveProfile => {
+            let display_name = state.name.trim().to_owned();
+            if display_name.is_empty() {
+                state.note = Some("Escolha um nome antes de salvar o perfil local.");
+                return Task::none();
+            }
+            if display_name.chars().count() > 40 {
+                state.note = Some("O nome do perfil pode ter até 40 caracteres.");
+                return Task::none();
+            }
+            let profile = storage::LocalProfile {
+                display_name,
+                familiar: storage::familiar_id(state.familiar).to_owned(),
+            };
+            state.profile_status = ProfileStatus::Saving;
+            return Task::perform(save_profile_task(profile.clone()), move |result| {
+                Message::ProfileSaved(profile, result)
+            });
+        }
+        Message::ProfileSaved(profile, result) => match result {
+            Ok(()) => {
+                state.name = profile.display_name;
+                state.familiar = storage::familiar_label(&profile.familiar);
+                state.profile_status = ProfileStatus::Saved;
+                state.note = Some("Perfil salvo no armazenamento local cifrado.");
+            }
+            Err(_) => {
+                state.profile_status = ProfileStatus::Failed;
+                state.note = Some("Não foi possível salvar o perfil local.");
+            }
+        },
     }
     Task::none()
 }
@@ -485,13 +547,22 @@ fn boot() -> (Slouching, Task<Message>) {
     {
         state.screen = screen;
     }
+    if let Some(pos) = args.iter().position(|s| s == "--capture-screen")
+        && let Some(name) = args.get(pos + 1)
+        && let Some(screen) = Screen::ALL.into_iter().find(|s| s.slug() == name)
+    {
+        state.screen = screen;
+        state.capture_once = true;
+    }
     if let Some(pos) = args.iter().position(|s| s == "--capture-dir")
         && let Some(path) = args.get(pos + 1)
     {
         let dir = std::path::PathBuf::from(path);
         std::fs::create_dir_all(&dir).expect("create screenshot directory");
         state.capture_dir = Some(dir);
-        state.screen = Screen::ALL[0];
+        if !state.capture_once {
+            state.screen = Screen::ALL[0];
+        }
     }
     let capture = if state.capture_dir.is_some() {
         capture_after(Duration::from_secs(6))
@@ -504,10 +575,23 @@ fn boot() -> (Slouching, Task<Message>) {
         state,
         Task::batch([
             Task::perform(fetch_backend_status(), Message::BackendFetched),
+            Task::perform(load_profile_task(), Message::ProfileLoaded),
             transport,
             capture,
         ]),
     )
+}
+
+async fn load_profile_task() -> Result<Option<storage::LocalProfile>, String> {
+    tokio::task::spawn_blocking(storage::load_profile)
+        .await
+        .map_err(|error| format!("local profile task failed: {error}"))?
+}
+
+async fn save_profile_task(profile: storage::LocalProfile) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || storage::save_profile(&profile))
+        .await
+        .map_err(|error| format!("local profile task failed: {error}"))?
 }
 
 fn view(state: &Slouching) -> Element<'_, Message> {

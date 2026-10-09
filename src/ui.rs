@@ -522,16 +522,34 @@ fn familiar(state: &Slouching, l: Layout) -> Element<'_, Message> {
         .style(|_, s| button_style(s, false, false)),
     );
     let progress = row![rule(GOLD, 3.0), rule(GOLD, 3.0), rule(LINE, 3.0)].spacing(l.px(6.0));
+    let (profile_title, profile_detail) = match &state.profile_status {
+        crate::ProfileStatus::Loading => (
+            "Carregando perfil local",
+            "A chave é consultada no cofre do sistema.",
+        ),
+        crate::ProfileStatus::Empty => (
+            "Perfil local ainda não salvo",
+            "O perfil fica em SQLite cifrado; a chave fica no cofre do sistema.",
+        ),
+        crate::ProfileStatus::Saved => (
+            "Perfil salvo localmente · cifrado",
+            "Nome e familiar não são uma identidade criptográfica.",
+        ),
+        crate::ProfileStatus::Saving => (
+            "Salvando perfil local...",
+            "A chave e os dados ficam neste dispositivo.",
+        ),
+        crate::ProfileStatus::Failed => (
+            "Cofre ou banco local indisponível",
+            "Ative o cofre de senhas do sistema e tente de novo. Não salvamos em texto puro.",
+        ),
+    };
     let key = container(
         row![
             l.icon("key", VIOLET, 24.0),
             column![
-                l.label("Chave de identidade ainda não criada", 13.0, PAPER),
-                l.label(
-                    "Nome e familiar ficam apenas na memória desta prévia",
-                    11.0,
-                    MUTED
-                )
+                l.label(profile_title, 13.0, PAPER),
+                l.label(profile_detail, 11.0, MUTED)
             ]
             .spacing(l.px(5.0))
         ]
@@ -577,9 +595,9 @@ fn familiar(state: &Slouching, l: Layout) -> Element<'_, Message> {
             ),
             space().width(Fill),
             l.control(
-                "arrow",
-                "Continuar na prévia",
-                Some(Message::Navigate(Screen::Home)),
+                "check",
+                "Salvar perfil local",
+                Some(Message::SaveProfile),
                 true
             )
         ]

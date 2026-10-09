@@ -15,6 +15,11 @@ tokio = { version = "1", features = ["net", "time"] }
 tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["connect"] }
 
 image_codec = { package = "image", version = "=0.25.10", default-features = false, features = ["png"] }
+directories = "=6.0.0"
+getrandom = "=0.3.4"
+keyring = "=4.2.0"
+rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
+zeroize = "=1.8.2"
 
 [build-dependencies]
 prost-build = "=0.14.4"
