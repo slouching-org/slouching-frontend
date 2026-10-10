@@ -563,6 +563,7 @@ enum Message {
     BackendFetched(Result<BackendStatus, FetchError>),
     TransportEvent(u64, TransportEvent),
     Navigate(Screen),
+    OpenNetworkSettings,
     InviteChanged(String),
     NameChanged(String),
     ChooseFamiliar(&'static str),
@@ -975,6 +976,13 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 state.screen_preview = None;
                 return Task::perform(enumerate_screens_task(), Message::ScreenSourcesLoaded);
             }
+        }
+        Message::OpenNetworkSettings => {
+            stop_audio_monitor(state);
+            state.settings_tab = 2;
+            state.screen = Screen::Settings;
+            state.show_gallery = false;
+            state.note = None;
         }
         Message::CreateCallMlsGroup => {
             if !matches!(state.identity_status, IdentityStatus::Ready(_)) {
@@ -7558,6 +7566,21 @@ fn hex_encode_key(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_screen_opens_network_settings_tab() {
+        let mut state = Slouching {
+            screen: Screen::Connecting,
+            settings_tab: 0,
+            ..Slouching::default()
+        };
+
+        let _ = update(&mut state, Message::OpenNetworkSettings);
+
+        assert_eq!(state.screen, Screen::Settings);
+        assert_eq!(state.settings_tab, 2);
+        assert!(!state.show_gallery);
+    }
 
     #[test]
     fn failed_attachment_stream_remains_retryable_until_success() {

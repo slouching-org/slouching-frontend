@@ -316,7 +316,7 @@ fn screen(state: &Slouching, l: Layout) -> Element<'_, Message> {
         Screen::Call => call(state, l),
         Screen::Components => components(l),
         Screen::Lobby => lobby(l),
-        Screen::Connecting => connecting(l),
+        Screen::Connecting => connecting(state, l),
         Screen::Share => sharing(state, l),
         Screen::Chat => chat(state, l),
         Screen::Mls => mls(state, l),
@@ -1413,44 +1413,91 @@ fn lobby(l: Layout) -> Element<'static, Message> {
     .height(Fill)
     .into()
 }
-fn connecting(l: Layout) -> Element<'static, Message> {
-    let gnome = image(assets().images["gnome-cutout"].clone())
-        .width(Fill)
-        .height(Fill)
-        .content_fit(ContentFit::Contain);
-    let steps = column![l.label("PRÉVIA · nenhuma tentativa P2P ativa",11.0,VIOLET),
-        l.label("[—] convite · nenhum grupo autenticado\n[—] descoberta · não implementada\n[—] ICE / QUIC · não implementado\n[—] MLS · nenhuma Welcome recebida\n[—] relay · nenhum helper autorizado",13.0,PAPER)].spacing(l.px(18.0));
-    let fallback = column![row![l.picture("mushroom",84.0,84.0),column![l.title("Pim cochilou do outro lado do pântano",25.0),
-        l.label("Exemplo de falha de rota. Esta prévia não detecta NAT ou peers.",12.0,PAPER)].spacing(l.px(12.0))].spacing(l.px(16.0)),
-        l.control("refresh","Usar relay TURN · indisponível",None,true),l.control("users","Mover para SFU · indisponível",None,false),
-        l.control("arrow","Voltar ao lobby",Some(Message::Navigate(Screen::Lobby)),false),
-        l.label("O helper só poderá encaminhar dados cifrados. Não recebe as chaves privadas dos membros.",12.0,MUTED)].spacing(l.px(18.0));
+fn connecting(state: &Slouching, l: Layout) -> Element<'static, Message> {
+    let identity = match &state.identity_status {
+        crate::IdentityStatus::Loading => "Carregando identidade do dispositivo…".to_owned(),
+        crate::IdentityStatus::Missing => {
+            "Identidade ainda não criada neste dispositivo.".to_owned()
+        }
+        crate::IdentityStatus::Creating => "Criando identidade local…".to_owned(),
+        crate::IdentityStatus::Ready(key) => format!(
+            "Identidade local pronta · {}…{}",
+            hex::encode(&key[..4]),
+            hex::encode(&key[28..])
+        ),
+        crate::IdentityStatus::Failed => "Não foi possível carregar a identidade local.".to_owned(),
+    };
+    let listener = match &state.peer_listen_status {
+        crate::PeerListenStatus::Idle => "Listener P2P parado.".to_owned(),
+        crate::PeerListenStatus::Starting { port } => {
+            format!("Abrindo listener UDP na porta {port}…")
+        }
+        crate::PeerListenStatus::Listening { port, addresses } => {
+            let routes = addresses
+                .iter()
+                .filter(|address| !address.ip().is_unspecified() && !address.ip().is_loopback())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            if routes.is_empty() {
+                format!("Listener UDP {port} ativo, mas nenhuma rota LAN/VPN foi anunciada.")
+            } else {
+                format!(
+                    "Listener UDP ativo · compartilhe uma rota alcançável: {}",
+                    routes.join(" · ")
+                )
+            }
+        }
+        crate::PeerListenStatus::Connected => {
+            "Sessão QUIC autenticada com o peer pinado.".to_owned()
+        }
+        crate::PeerListenStatus::Disconnected(reason) => format!("Sessão P2P encerrada: {reason}"),
+        crate::PeerListenStatus::Unauthorized(reason) => format!("Peer recusado: {reason}"),
+        crate::PeerListenStatus::Failed(reason) => format!("Listener P2P falhou: {reason}"),
+    };
+    let sending = match &state.peer_send_status {
+        crate::PeerSendStatus::Idle => "Nenhum envio P2P em andamento.".to_owned(),
+        crate::PeerSendStatus::Connecting => {
+            "Tentando abrir uma rota QUIC direta ou relay configurado…".to_owned()
+        }
+        crate::PeerSendStatus::AwaitingAck => {
+            "Conectado; aguardando ACK de persistência do peer.".to_owned()
+        }
+        crate::PeerSendStatus::Sent => {
+            "Mensagem aceita pelo peer e salva no histórico local.".to_owned()
+        }
+        crate::PeerSendStatus::Failed(reason) => format!("Envio não confirmado: {reason}"),
+    };
+    let call = match &state.call_rtc_session {
+        Some(session) => format!("WebRTC · {}", *session.connection_state().borrow()),
+        None => state.call_group_status.clone(),
+    };
+    let status = column![
+        l.label("ESTADO REAL DESTE DISPOSITIVO", 10.0, GOLD),
+        l.label(identity, 12.0, PAPER),
+        rule(LINE, l.px(1.0)),
+        l.label("P2P · QUIC", 10.0, GOLD),
+        l.label(listener, 12.0, PAPER),
+        l.label(sending, 12.0, MUTED),
+        rule(LINE, l.px(1.0)),
+        l.label("CHAMADA · WEBRTC", 10.0, GOLD),
+        l.label(call, 12.0, PAPER),
+        l.label("QUIC/relay de mensagens não é TURN. Chamadas usam candidatos ICE host; TURN e SFU ainda não estão configurados.", 11.0, MUTED),
+        rule(LINE, l.px(1.0)),
+        l.label("SERVIÇOS LOCAIS · ELIXIR", 10.0, GOLD),
+        boxed(diagnostics(state, l)),
+    ].spacing(l.px(12.0));
+    let actions = column![
+        l.label("ABRIR UM FLUXO FUNCIONAL", 10.0, GOLD),
+        l.control("chat", "Texto direto · LAN/VPN", Some(Message::Navigate(Screen::Chat)), true),
+        l.control("users", "Grupo MLS", Some(Message::Navigate(Screen::Mls)), false),
+        l.control("headphones", "Chamada", Some(Message::Navigate(Screen::Call)), false),
+        l.control("settings", "Rede & P2P", Some(Message::OpenNetworkSettings), false),
+        l.label("VPN entre máquinas e chamadas em redes diferentes ainda precisam de validação física. Sem rota alcançável, a mensagem não é enviada.", 11.0, MUTED),
+    ].spacing(l.px(14.0));
     stack![
-        l.place(gnome, 230.0, 70.0, 220.0, 252.0),
-        l.place(
-            l.title("Acendendo a fogueira…", 36.0),
-            115.0,
-            350.0,
-            490.0,
-            62.0
-        ),
-        l.place(rule(LINE, l.px(5.0)), 160.0, 415.0, 360.0, 5.0),
-        l.place(l.panel(steps), 115.0, 438.0, 490.0, 225.0),
-        l.place(
-            l.label("QUANDO O CAMINHO DIRETO FALHA", 11.0, MUTED),
-            660.0,
-            82.0,
-            555.0,
-            25.0
-        ),
-        l.place(l.panel(fallback), 660.0, 118.0, 555.0, 397.0),
-        l.place(
-            l.panel(l.label("Nenhuma rota configurada · sem conexão", 12.0, VIOLET)),
-            660.0,
-            540.0,
-            555.0,
-            68.0
-        )
+        l.place(l.title("Conexão & rotas", 32.0), 42.0, 30.0, 600.0, 52.0),
+        l.place(l.panel(status), 32.0, 94.0, 755.0, 654.0),
+        l.place(l.panel(actions), 810.0, 94.0, 438.0, 654.0),
     ]
     .width(Fill)
     .height(Fill)

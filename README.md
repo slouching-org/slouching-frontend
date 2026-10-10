@@ -109,6 +109,12 @@ permission on each preview or share. If the compositor portal does not offer
 window sources, the picker reports that limitation. Mixed X11/Wayland sessions
 currently enumerate X11/XWayland windows.
 
+The **Conexão & rotas** screen reads the current local identity, UDP listener,
+QUIC send result, WebRTC peer-connection state, and Elixir diagnostic status.
+Its actions open the direct-text, MLS, call, and Network & P2P screens. It does
+not claim automatic discovery, TURN, or SFU availability. Relay configuration
+for text is separate from TURN for WebRTC media.
+
 ## Direct peer messages
 
 The **chat** button in the Iced app opens a persistent direct-text screen. This
@@ -513,6 +519,7 @@ SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-capture
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 10-call --capture-call-negotiation
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 05-share --capture-share-camera
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 05-share --capture-share-window
+SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 04-connecting
 ```
 
 The capture command renders all twelve screens, saves screenshots through
@@ -547,6 +554,9 @@ The camera/window picker captures could not be refreshed in this headless
 environment: Iced/winit requires `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, or
 `DISPLAY`. Run the matching capture command in a graphical session to render
 the current screen.
+The updated `04-connecting` screen was also not captured here because this
+environment has no graphical display; capture it with the command above from
+the local frontend repository in a Wayland or X11 session.
 
 Assets and font license/provenance notes are in [assets/README.md](assets/README.md).
 
