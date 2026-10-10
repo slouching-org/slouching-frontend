@@ -17,6 +17,57 @@ pub struct CallAudioEncoder {
     protector: MediaFrameSender,
 }
 
+/// Incrementally converts CPAL mono chunks to the 48 kHz, 20 ms frames Opus
+/// expects. Linear interpolation is used to match the device's default rate.
+pub struct VoiceFrameAssembler {
+    input_rate: u32,
+    next_input_position: f64,
+    input: Vec<f32>,
+    pending: Vec<f32>,
+}
+
+impl VoiceFrameAssembler {
+    pub fn new(input_rate: u32) -> Result<Self, String> {
+        if input_rate == 0 {
+            return Err("microphone sample rate must be greater than zero".to_owned());
+        }
+        Ok(Self {
+            input_rate,
+            next_input_position: 0.0,
+            input: Vec::new(),
+            pending: Vec::with_capacity(FRAME_SAMPLES * 2),
+        })
+    }
+
+    pub fn push(&mut self, mono_samples: &[f32]) -> Result<Vec<Vec<f32>>, String> {
+        if mono_samples.iter().any(|sample| !sample.is_finite()) {
+            return Err("microphone chunk contains a non-finite sample".to_owned());
+        }
+        self.input.extend_from_slice(mono_samples);
+        let step = self.input_rate as f64 / SAMPLE_RATE_HZ as f64;
+        while self.next_input_position + 1.0 < self.input.len() as f64 {
+            let left_index = self.next_input_position.floor() as usize;
+            let fraction = (self.next_input_position - left_index as f64) as f32;
+            let left = self.input[left_index];
+            let right = self.input[left_index + 1];
+            self.pending.push(left + (right - left) * fraction);
+            self.next_input_position += step;
+        }
+        let consumed = self.next_input_position.floor() as usize;
+        if consumed > 0 {
+            self.input.drain(..consumed);
+            self.next_input_position -= consumed as f64;
+        }
+
+        let complete_frames = self.pending.len() / FRAME_SAMPLES;
+        let mut frames = Vec::with_capacity(complete_frames);
+        for _ in 0..complete_frames {
+            frames.push(self.pending.drain(..FRAME_SAMPLES).collect());
+        }
+        Ok(frames)
+    }
+}
+
 impl CallAudioEncoder {
     pub fn for_call_group(group_id: &[u8]) -> Result<Self, String> {
         Self::new(MediaFrameSender::from_call_group(group_id)?)
@@ -129,5 +180,28 @@ mod tests {
         let mut invalid = [0.0; FRAME_SAMPLES];
         invalid[0] = f32::NAN;
         assert!(encoder.encode_and_protect(&invalid).is_err());
+    }
+
+    #[test]
+    fn frame_assembler_resamples_and_handles_callback_boundaries() {
+        let mut assembler = VoiceFrameAssembler::new(44_100).unwrap();
+        let mut frames = Vec::new();
+        for _ in 0..3 {
+            frames.extend(assembler.push(&[0.25; 441]).unwrap());
+        }
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].len(), FRAME_SAMPLES);
+        assert!(
+            frames[0]
+                .iter()
+                .all(|sample| (*sample - 0.25).abs() < 0.001)
+        );
+    }
+
+    #[test]
+    fn frame_assembler_rejects_invalid_sample_rates_and_nan_audio() {
+        assert!(VoiceFrameAssembler::new(0).is_err());
+        let mut assembler = VoiceFrameAssembler::new(48_000).unwrap();
+        assert!(assembler.push(&[f32::NAN]).is_err());
     }
 }

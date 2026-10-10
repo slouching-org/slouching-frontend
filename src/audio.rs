@@ -46,6 +46,119 @@ pub struct InputMonitor {
     error: Arc<Mutex<Option<String>>>,
 }
 
+/// Live mono capture from a selected CPAL input. The bounded channel keeps
+/// audio callbacks non-blocking; slow consumers drop chunks rather than stall
+/// the device thread.
+pub struct AudioCapture {
+    _stream: cpal::Stream,
+    chunks: tokio::sync::mpsc::Receiver<Vec<f32>>,
+    sample_rate: u32,
+    error: tokio::sync::watch::Receiver<Option<String>>,
+}
+
+impl AudioCapture {
+    pub fn open(device_id: &str) -> Result<Self, String> {
+        let host = cpal::default_host();
+        let device = host
+            .input_devices()
+            .map_err(|error| format!("could not enumerate audio inputs: {error}"))?
+            .find(|device| device.id().is_ok_and(|id| id.to_string() == device_id))
+            .ok_or_else(|| "selected microphone is no longer available".to_owned())?;
+        let supported = device
+            .default_input_config()
+            .map_err(|error| format!("could not read microphone format: {error}"))?;
+        let sample_rate = supported.sample_rate();
+        let channels = usize::from(supported.channels());
+        let format = supported.sample_format();
+        let (chunk_tx, chunks) = tokio::sync::mpsc::channel(16);
+        let (error_tx, error) = tokio::sync::watch::channel(None);
+        let stream = device
+            .build_input_stream_raw(
+                supported.config(),
+                format,
+                move |data, _| {
+                    if let Some(mono) = mono_from_data(data, format, channels) {
+                        let _ = chunk_tx.try_send(mono);
+                    }
+                },
+                move |stream_error| {
+                    error_tx.send_replace(Some(stream_error.to_string()));
+                },
+                None,
+            )
+            .map_err(|error| format!("could not open microphone: {error}"))?;
+        stream
+            .play()
+            .map_err(|error| format!("could not start microphone: {error}"))?;
+        Ok(Self {
+            _stream: stream,
+            chunks,
+            sample_rate,
+            error,
+        })
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    pub async fn next_chunk(&mut self) -> Option<Vec<f32>> {
+        self.chunks.recv().await
+    }
+
+    pub fn error(&self) -> Option<String> {
+        self.error.borrow().clone()
+    }
+}
+
+fn mono_from_data(data: &cpal::Data, format: SampleFormat, channels: usize) -> Option<Vec<f32>> {
+    if channels == 0 {
+        return None;
+    }
+    macro_rules! convert {
+        ($sample:ty) => {
+            data.as_slice::<$sample>()
+                .map(|samples| downmix_samples(samples, channels))
+        };
+    }
+    match format {
+        SampleFormat::F32 => convert!(f32),
+        SampleFormat::F64 => convert!(f64),
+        SampleFormat::I8 => convert!(i8),
+        SampleFormat::I16 => convert!(i16),
+        SampleFormat::I24 => convert!(cpal::I24),
+        SampleFormat::I32 => convert!(i32),
+        SampleFormat::I64 => convert!(i64),
+        SampleFormat::U8 => convert!(u8),
+        SampleFormat::U16 => convert!(u16),
+        SampleFormat::U24 => convert!(cpal::U24),
+        SampleFormat::U32 => convert!(u32),
+        SampleFormat::U64 => convert!(u64),
+        SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32 => None,
+        _ => None,
+    }
+}
+
+fn downmix_samples<T>(samples: &[T], channels: usize) -> Vec<f32>
+where
+    T: Copy,
+    f32: FromSample<T>,
+{
+    if channels == 0 {
+        return Vec::new();
+    }
+    samples
+        .chunks_exact(channels)
+        .map(|frame| {
+            let sum = frame
+                .iter()
+                .map(|sample| f32::from_sample(*sample))
+                .sum::<f32>();
+            (sum / channels as f32).clamp(-1.0, 1.0)
+        })
+        .collect()
+}
+
 impl InputMonitor {
     pub fn open(device_id: &str) -> Result<Self, String> {
         let host = cpal::default_host();
@@ -205,5 +318,12 @@ mod tests {
         assert_eq!(rms_level(&[] as &[f32]), 0.0);
         assert_eq!(rms_level(&[0.5_f32, -0.5_f32]), 0.5);
         assert_eq!(rms_level(&[1.5_f32, -1.5_f32]), 1.0);
+    }
+
+    #[test]
+    fn capture_downmixes_interleaved_stereo_to_normalized_mono() {
+        let mono = downmix_samples(&[0.5_f32, 0.25, -0.5, -0.25], 2);
+        assert_eq!(mono, [0.375, -0.375]);
+        assert_eq!(downmix_samples(&[1.5_f32, 1.5], 2), [1.0]);
     }
 }
