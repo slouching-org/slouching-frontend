@@ -11,8 +11,10 @@ familiar using SQLCipher encrypted SQLite with a key in the system credential
 store. A missing credential store appears as an unavailable state; no
 plaintext fallback is used. A separate explicit action creates and stores an
 Ed25519 device signing seed in the credential store and displays its public
-key as unverified. Fingerprint derivation and contact pairing are not
-implemented. When the keyring cannot be read, the screen explains the failure
+key as unverified. Signed, expiring QR invitations carry the public key and
+optional listener addresses; PNG import verifies the signature but leaves
+human trust confirmation to the user. Account/contact discovery and live camera
+scanning are not implemented. When the keyring cannot be read, the screen explains the failure
 and offers a safe retry that does not replace an existing key. All scenes,
 messages, and comparison words are marked as illustrative. No peer route,
 media capture, messaging, or call is established by these images.
@@ -58,11 +60,13 @@ messages are blocked. It also races an exact redelivery against that conflict
 through independent database connections and verifies the same durable result.
 
 The familiar-screen capture was refreshed after adding the core's signed
-device-to-MLS key binding primitive. The chat capture now shows the per-peer
-SQLCipher history UI. The capture's Secret Service is unavailable, so the
-identity action is shown and sending/listening are gated; no conversation data
-is present. The UI also offers confirmed deletion of one peer's local history.
-The key binding primitive does not verify contacts or provide pairing.
+device-to-MLS key binding primitive. The chat capture shows per-peer SQLCipher
+history and LAN/VPN address guidance; the identity capture shows the signed QR
+invite modal with fixture keys and an example VPN address. Secret Service is
+unavailable in these captures, so no real identity, peer route, or conversation
+is used. The UI also offers confirmed deletion of one peer's local history. The
+key binding primitive does not verify contacts; QR invitations do not provide
+account linking or automatic trust.
 
 The home view keeps the supplied night scenery and call controls, with an
 icon-based feature strip. Its frog mage and gnome foreground cutouts have been

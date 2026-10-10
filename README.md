@@ -81,20 +81,23 @@ path sends real text over Iroh/QUIC between devices on a reachable UDP route; it
 separate from the Elixir diagnostics and has no hosted service in the data
 path.
 
-1. Start the app on both devices. Create a device identity if needed, open the
-   chat screen, and use **Copiar minha chave pública** to exchange the two 64-character
-   Ed25519 public keys out of band. On Linux, the system Secret Service must
-   be available to create or load this identity.
-2. On both devices, paste the other device's public key into **Chave pública do
-   peer · pin manual**. On the listening device, this is the key of the sender
-   that will connect; on the sending device, it is the key of the listener.
-3. Optionally configure the same participant-operated relay URL and shared
-   token in **Relay do grupo** on both devices, then save it before starting a
-   listener or sending. On the receiving device, choose a UDP port (for
-   example `45873`) and click **Aguardar peer**. Each announced socket address
-   has its own **Copiar este endereço** button. Pick an address reachable from
-   the sender's network; wildcard addresses such as `0.0.0.0` cannot be shared.
-4. On the sending device, enter the listener's address and port, type a
+1. Start the app on both devices and create a device identity if needed. On
+   Linux, the system Secret Service must be available to create or load it.
+2. On each device, open **Conferir identidade do peer → Mostrar convite QR**.
+   Capture the displayed QR as a PNG, transfer that image through a channel
+   you trust, and import it on the other device with **Importar convite QR de
+   PNG**. Repeat in the other direction. This exchanges public keys; importing
+   alone does not mark a contact verified. Live camera scanning is not part of
+   this version.
+3. On the intended listener, choose a UDP port (for example `45873`) and click
+   **Aguardar peer**. Open the verification screen again and show a fresh QR;
+   while listening, it includes the announced addresses and expires in 10
+   minutes. Capture and transfer that PNG to the initiator. On import, choose
+   the address that is reachable from the initiator's network; the app keeps
+   all addresses from the invite available as choices.
+4. Optionally configure the same participant-operated relay URL and shared
+   token in **Relay do grupo** on both devices, then save it before sending.
+   On the initiator, enter the listener's address if it was not imported, type a
    message, and click **Conectar e enviar**. After connection, either device
    can send multiple messages over the same session. Sent text appears only
    after an ACK; received text appears live after the pinned identity check.
@@ -107,6 +110,8 @@ port in the listener's firewall. The VPN must route UDP between both devices.
 If the app reports a timeout, the route is not established; this screen does
 not perform NAT traversal. The flow is implemented for reachable socket
 addresses, but a VPN connection between separate machines remains unverified.
+The invite format, signature, limits, and trust boundary are documented in the
+[project's v1 invite spec](https://github.com/slouching-org/slouching/blob/main/docs/fichas/identity/pairing-invite-v1.md).
 
 A successful connection saves the pinned device key and its direct socket or
 relay-only route in the encrypted local route book. The chat screen lists these
@@ -145,10 +150,13 @@ rejection, and verifies a pending send is reported as unknown on disconnect.
 
 Before trusting a peer's identity, open **Conferir identidade do peer** from
 the shield button, exchange the complete 64-character device keys through a
-separate channel, compare every character, and mark the key as verified on
-your device. That decision is local to this encrypted profile and to that exact
-key. It does not verify a display name, and a replacement key must be compared
-again. QR pairing and short verification codes are not available yet.
+separate channel and compare every character, or import a signed QR shown
+directly by the intended contact. The QR binds its addresses to the device
+key, but does not prove the person behind a transferred image. Import never
+marks trust automatically; press **Marcar como conferida** only after
+authenticating the QR source. That decision is local to this encrypted profile
+and exact key. It does not verify a display name, and a replacement key must be
+verified again. Camera scanning and short verification codes are not available.
 
 To operate a relay, run the Iroh Relay `1.3.0` server on a host the group
 controls, configure HTTPS and `access.shared_token`, and enter that HTTPS URL
@@ -307,11 +315,12 @@ The familiar screen saves the display name and familiar as a local profile in
 SQLCipher encrypted SQLite; the database key is stored in the operating system
 credential store. Saving fails closed when that store is unavailable. The
 screen can also explicitly create and retain an Ed25519 device signing key in
-the system credential store. The direct-text trust screen lets both people
-compare the complete 64-character public key over an independent channel and
-mark that exact key as locally verified in SQLCipher. A changed key has no
-inherited trust. QR pairing, short verification codes, and contact discovery
-are not implemented. OpenMLS credentials
+the system credential store. The direct-text trust screen creates a signed
+10-minute QR invitation containing the public key and optional listener
+addresses, then imports it from PNG and lets the user choose a route. The QR
+does not auto-verify human identity; a changed key has no inherited trust.
+Camera scanning, short verification codes, and contact discovery are not
+implemented. OpenMLS credentials
 include a versioned binding signed by the durable device key. One-use
 KeyPackages and private MLS state are stored in SQLCipher. The direct-chat
 screen separately pins device public keys. Character scenes and call views
@@ -332,7 +341,9 @@ be installed and available in the user session.
 
 ![Actual native Iced home with open scenery and icon-based feature strip, without the frog mage or gnome cutouts](docs/design/runtime/native-vhs/09-home.png)
 
-![Actual 934 × 1000 native Iced peer identity screen with full key comparison and a locally verified key; both keys are capture fixtures](docs/design/runtime/native-vhs/08-verify.png)
+![Actual 934 × 1000 native Iced identity screen with a signed device invitation QR; device keys and VPN address are capture fixtures](docs/design/runtime/native-vhs/08-verify.png)
+
+![Actual native Iced peer verification screen after importing a QR, with separate LAN and VPN address choices; all values are capture fixtures](docs/design/runtime/native-vhs/08-verify-invite-imported.png)
 
 ![Actual native Iced group-call preview; media and sample messages are illustrative](docs/design/runtime/native-vhs/10-call.png)
 
@@ -383,6 +394,8 @@ SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-capture
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 11-mls --capture-mls-attachment
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 02-settings --settings-tab 1
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-verification
+SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-invite
+SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-invite-imported
 ```
 
 The capture command renders all twelve screens, saves screenshots through
@@ -403,6 +416,10 @@ session; device names vary by machine, and selected devices are not yet used by
 live calls.
 `--capture-peer-verification` supplies sample local and peer keys for the trust
 screen capture; they are fixtures, not identities from the keyring.
+`--capture-peer-invite` supplies a signed sample invitation and renders its QR
+in the identity screen; its keys and address are fixtures.
+`--capture-peer-invite-imported` shows the selectable LAN and VPN addresses
+after QR import; all values are fixtures.
 
 Assets and font license/provenance notes are in [assets/README.md](assets/README.md).
 

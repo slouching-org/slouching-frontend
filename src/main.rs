@@ -6,6 +6,7 @@ pub mod blob_store;
 pub mod file_transfer;
 pub mod identity;
 mod peer;
+mod peer_invite;
 pub mod storage;
 mod ui;
 use prost::Message as ProstMessage;
@@ -216,6 +217,7 @@ struct Slouching {
     delegated_mls_storage: Option<storage::DelegatedMlsStorageStatus>,
     delegated_mls_storage_error: Option<String>,
     peer_public_key: String,
+    peer_invite_addresses: Vec<String>,
     peer_verification_loaded_for: Option<String>,
     peer_key_verified: bool,
     peer_verification_status: String,
@@ -247,6 +249,8 @@ struct Slouching {
     peer_pending_sends: std::collections::HashMap<u64, String>,
     peer_next_request_id: u64,
     identity_key_copied: bool,
+    peer_invite_qr: Option<iced::widget::image::Handle>,
+    peer_invite_status: String,
     mls_group_id: String,
     mls_key_package: String,
     mls_invite_key_package: String,
@@ -392,6 +396,7 @@ impl Default for Slouching {
             delegated_mls_storage: None,
             delegated_mls_storage_error: None,
             peer_public_key: String::new(),
+            peer_invite_addresses: Vec::new(),
             peer_verification_loaded_for: None,
             peer_key_verified: false,
             peer_verification_status: "Compare a chave completa por um canal independente."
@@ -424,6 +429,9 @@ impl Default for Slouching {
             peer_pending_sends: std::collections::HashMap::new(),
             peer_next_request_id: 1,
             identity_key_copied: false,
+            peer_invite_qr: None,
+            peer_invite_status: "Convite QR importa a chave; a confiança continua manual."
+                .to_owned(),
             mls_group_id: String::new(),
             mls_key_package: String::new(),
             mls_invite_key_package: String::new(),
@@ -514,6 +522,13 @@ enum Message {
     DelegatedCopyReceiptProcessed(u64, Result<storage::ProcessedMlsApplicationEvent, String>),
     DelegatedCopyAcknowledged(u64, Result<bool, String>),
     CopyDeviceKey,
+    OpenPeerInviteQr,
+    PeerInviteQrCreated(Result<iced::widget::image::Handle, String>),
+    ClosePeerInviteQr,
+    ImportPeerInviteQr,
+    PeerInviteQrPath(Option<std::path::PathBuf>),
+    PeerInviteImported(Result<peer_invite::PeerInvite, String>),
+    SelectPeerInviteAddress(String),
     CopyPeerListenAddress(String),
     PeerPublicKeyChanged(String),
     PeerVerificationLoaded(String, Result<bool, String>),
@@ -1054,12 +1069,105 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 return iced::clipboard::write(hex_encode_key(&public_key));
             }
         }
+        Message::OpenPeerInviteQr => {
+            if !matches!(state.identity_status, IdentityStatus::Ready(_)) {
+                state.peer_invite_status =
+                    "Crie ou carregue a identidade antes de gerar o convite QR.".to_owned();
+                return Task::none();
+            }
+            state.peer_invite_status =
+                "Gerando convite QR assinado para esta identidade…".to_owned();
+            if let IdentityStatus::Ready(public_key) = state.identity_status {
+                return Task::perform(
+                    create_peer_invite_qr_task(state.peer_listener_addresses.clone(), public_key),
+                    Message::PeerInviteQrCreated,
+                );
+            }
+        }
+        Message::PeerInviteQrCreated(Ok(qr)) => {
+            state.peer_invite_qr = Some(qr);
+            state.peer_invite_status = "Convite válido por 10 minutos. Ele contém apenas sua chave pública e endereços anunciados.".to_owned();
+        }
+        Message::PeerInviteQrCreated(Err(error)) => {
+            state.peer_invite_qr = None;
+            state.peer_invite_status = format!("Não foi possível gerar o convite: {error}");
+        }
+        Message::ClosePeerInviteQr => state.peer_invite_qr = None,
+        Message::ImportPeerInviteQr => {
+            if state.peer_listener_handle.is_some() {
+                state.peer_invite_status =
+                    "Pare o listener antes de importar outro peer.".to_owned();
+                return Task::none();
+            }
+            state.peer_invite_status =
+                "Selecione a imagem PNG que contém o QR do convite…".to_owned();
+            return Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .add_filter("Imagem PNG", &["png"])
+                        .pick_file()
+                        .await
+                        .map(|file| file.path().to_path_buf())
+                },
+                Message::PeerInviteQrPath,
+            );
+        }
+        Message::PeerInviteQrPath(Some(path)) => {
+            state.peer_invite_status =
+                "Validando QR, assinatura do dispositivo e validade…".to_owned();
+            return Task::perform(
+                import_peer_invite_qr_task(path),
+                Message::PeerInviteImported,
+            );
+        }
+        Message::PeerInviteQrPath(None) => {
+            state.peer_invite_status = "Importação do convite cancelada.".to_owned();
+        }
+        Message::PeerInviteImported(Ok(invite)) => {
+            let key = hex_encode_key(&invite.device_key);
+            if matches!(state.identity_status, IdentityStatus::Ready(local) if local == invite.device_key)
+            {
+                state.peer_invite_status =
+                    "Este convite contém a chave deste próprio dispositivo.".to_owned();
+                return Task::none();
+            }
+            let addresses = invite
+                .addresses
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            state.peer_address = addresses.first().cloned().unwrap_or_default();
+            let invite_status = if invite.addresses.is_empty() {
+                "Chave importada sem endereço de rede. Confirme que o convite veio do contato correto.".to_owned()
+            } else {
+                "Chave importada; escolha um endereço anunciado e confirme a origem do convite."
+                    .to_owned()
+            };
+            let task = update(state, Message::PeerPublicKeyChanged(key));
+            state.peer_invite_addresses = addresses;
+            state.peer_invite_status = invite_status;
+            return task;
+        }
+        Message::PeerInviteImported(Err(error)) => {
+            state.peer_invite_status = format!("Convite rejeitado: {error}");
+        }
+        Message::SelectPeerInviteAddress(address) => {
+            if state.peer_invite_addresses.contains(&address) {
+                state.peer_address = address.clone();
+                state.peer_invite_status = format!(
+                    "Endereço {address} selecionado. Confirme que o convite veio do contato correto."
+                );
+            }
+        }
         Message::CopyPeerListenAddress(address) => {
             return iced::clipboard::write(address);
         }
         Message::PeerPublicKeyChanged(value) => {
             if state.peer_public_key != value {
                 state.peer_public_key = value.clone();
+                state.peer_invite_addresses.clear();
+                state.peer_invite_status =
+                    "Chave manual alterada; endereços do convite anterior removidos.".to_owned();
                 state.peer_verification_loaded_for = None;
                 state.peer_key_verified = false;
                 state.peer_verification_status =
@@ -1263,7 +1371,10 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 }
             }
         }
-        Message::PeerListenPortChanged(value) => state.peer_listen_port = value,
+        Message::PeerListenPortChanged(value) => {
+            state.peer_listen_port = value;
+            state.peer_invite_qr = None;
+        }
         Message::PeerAddressChanged(value) => state.peer_address = value,
         Message::PeerRelayUrlChanged(value) => {
             state.peer_relay_url = value;
@@ -1352,6 +1463,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         },
         Message::PeerDraftChanged(value) => state.peer_draft = value,
         Message::StartPeerListener => {
+            state.peer_invite_qr = None;
             if state.peer_listener_handle.is_some() {
                 return Task::none();
             }
@@ -1425,6 +1537,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             return task;
         }
         Message::StopPeerListener => {
+            state.peer_invite_qr = None;
             if state.helper_listener_active {
                 if let Some(handle) = state.peer_listener_handle.take() {
                     handle.abort();
@@ -1973,6 +2086,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 },
                 PeerListenEvent::Failed(error) => {
                     state.peer_listener_handle = None;
+                    state.peer_invite_qr = None;
                     state.peer_session_commands = None;
                     if matches!(state.peer_send_status, PeerSendStatus::Connecting) {
                         state.peer_pending_sends.clear();
@@ -4119,6 +4233,43 @@ fn boot() -> (Slouching, Task<Message>) {
         state.peer_verification_status =
             "Chave conferida e marcada como verificada neste dispositivo.".to_owned();
     }
+    if args.iter().any(|arg| arg == "--capture-peer-invite") {
+        let own_key = [0x11; 32];
+        let secret = iroh::SecretKey::from_bytes(&own_key);
+        let address = "100.64.0.20:45873"
+            .parse()
+            .expect("valid VPN fixture address");
+        let now = peer_invite::unix_time_seconds().expect("capture clock is available");
+        let invite = peer_invite::create(&secret, &[address], now)
+            .expect("capture invite fixture should sign");
+        let (size, rgba) = peer_invite::qr_rgba(&invite).expect("capture QR should render");
+        state.screen = Screen::Verify;
+        state.identity_status = IdentityStatus::Ready(own_key);
+        state.peer_public_key = hex_encode_key(&[0x22; 32]);
+        state.peer_verification_loaded_for = Some(state.peer_public_key.clone());
+        state.peer_verification_status =
+            "Chave ainda não verificada por canal independente.".to_owned();
+        state.peer_invite_qr = Some(iced::widget::image::Handle::from_rgba(size, size, rgba));
+        state.peer_invite_status = "Convite de demonstração · expira em 10 minutos.".to_owned();
+    }
+    if args
+        .iter()
+        .any(|arg| arg == "--capture-peer-invite-imported")
+    {
+        let addresses = ["192.168.1.20:45873", "100.64.0.20:45873"]
+            .into_iter()
+            .map(|address| address.parse().expect("valid invite fixture address"))
+            .collect::<Vec<std::net::SocketAddr>>();
+        state.screen = Screen::Verify;
+        state.identity_status = IdentityStatus::Ready([0x11; 32]);
+        state.peer_public_key = hex_encode_key(&[0x22; 32]);
+        state.peer_invite_addresses = addresses.iter().map(ToString::to_string).collect();
+        state.peer_address = addresses[1].to_string();
+        state.peer_invite_status =
+            "Convite importado · escolha o endereço da VPN quando necessário.".to_owned();
+        state.peer_verification_status =
+            "Chave importada, ainda não confirmada por você.".to_owned();
+    }
     if let Some(pos) = args.iter().position(|s| s == "--capture-dir")
         && let Some(path) = args.get(pos + 1)
     {
@@ -4184,6 +4335,44 @@ async fn load_audio_devices_task() -> Result<audio::AudioDevices, String> {
     tokio::task::spawn_blocking(audio::enumerate_devices)
         .await
         .map_err(|error| format!("audio device task failed: {error}"))?
+}
+
+async fn create_peer_invite_qr_task(
+    addresses: Vec<std::net::SocketAddr>,
+    expected_public_key: [u8; 32],
+) -> Result<iced::widget::image::Handle, String> {
+    tokio::task::spawn_blocking(move || {
+        let secret = storage::load_device_peer_secret_key()?;
+        if secret.public().as_bytes() != &expected_public_key {
+            return Err(
+                "a identidade carregada mudou; carregue-a novamente antes de gerar o QR".to_owned(),
+            );
+        }
+        let now = peer_invite::unix_time_seconds()?;
+        let invite = peer_invite::create(&secret, &addresses, now)?;
+        let (size, rgba) = peer_invite::qr_rgba(&invite)?;
+        Ok(iced::widget::image::Handle::from_rgba(size, size, rgba))
+    })
+    .await
+    .map_err(|error| format!("QR generation task failed: {error}"))?
+}
+
+async fn import_peer_invite_qr_task(
+    path: std::path::PathBuf,
+) -> Result<peer_invite::PeerInvite, String> {
+    tokio::task::spawn_blocking(move || {
+        let metadata = std::fs::metadata(&path)
+            .map_err(|error| format!("could not inspect QR image: {error}"))?;
+        if metadata.len() > 8 * 1024 * 1024 {
+            return Err("Imagem acima do limite de 8 MiB".to_owned());
+        }
+        let bytes =
+            std::fs::read(path).map_err(|error| format!("could not read QR image: {error}"))?;
+        let now = peer_invite::unix_time_seconds()?;
+        peer_invite::decode_png(&bytes, now)
+    })
+    .await
+    .map_err(|error| format!("QR import task failed: {error}"))?
 }
 
 fn audio_monitor_task(device_id: String, generation: u64) -> (Task<Message>, Handle) {
@@ -5758,6 +5947,7 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
         }
         peer::PeerEvent::Disconnected { reason } => {
             state.peer_listen_status = PeerListenStatus::Disconnected(reason);
+            state.peer_invite_qr = None;
             state.peer_session_commands = None;
             state.peer_listener_handle = None;
             state.active_peer_device = None;

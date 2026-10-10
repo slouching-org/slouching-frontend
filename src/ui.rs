@@ -332,6 +332,50 @@ fn screen(state: &Slouching, l: Layout) -> Element<'_, Message> {
     if state.show_gallery {
         layers.push(widget::opaque(gallery(l)));
     }
+    if let Some(qr) = &state.peer_invite_qr {
+        layers.push(
+            container(space())
+                .width(Fill)
+                .height(Fill)
+                .style(|_| container::Style {
+                    background: Some(Color::from_rgba8(5, 4, 12, 0.82).into()),
+                    ..Default::default()
+                })
+                .into(),
+        );
+        layers.push(widget::opaque(l.place(
+            l.panel(
+                column![
+                    row![
+                        l.title("Convite do dispositivo", 24.0),
+                        space().width(Fill),
+                        l.icon_button("close", Message::ClosePeerInviteQr)
+                    ]
+                    .align_y(iced::Center),
+                    l.label(
+                        "Capture esta tela e importe o PNG no outro dispositivo. Este convite assinado expira em 10 minutos.",
+                        11.0,
+                        PAPER
+                    ),
+                    container(image(qr.clone()).content_fit(ContentFit::Contain))
+                        .width(Fill)
+                        .height(l.px(320.0))
+                        .center(Fill),
+                    l.label(
+                        "O QR contém sua chave pública e, se o listener estiver ativo, os endereços anunciados. Nunca contém chaves privadas ou token de relay.",
+                        10.0,
+                        MUTED
+                    ),
+                    l.control("close", "Fechar convite", Some(Message::ClosePeerInviteQr), false)
+                ]
+                .spacing(l.px(12.0)),
+            ),
+            390.0,
+            108.0,
+            500.0,
+            584.0,
+        )));
+    }
     if let Some(note) = state.note {
         layers.push(
             l.place(
@@ -2559,6 +2603,13 @@ fn verification(state: &Slouching, l: Layout) -> Element<'_, Message> {
             l.label("SUA CHAVE PÚBLICA DO DISPOSITIVO", 10.0, GOLD),
             l.label(own_key, 11.0, PAPER),
             l.control("key", "Copiar minha chave", Some(Message::CopyDeviceKey), false),
+            l.control(
+                "key",
+                "Mostrar convite QR (10 min)",
+                matches!(state.identity_status, crate::IdentityStatus::Ready(_))
+                    .then_some(Message::OpenPeerInviteQr),
+                false
+            ),
             l.label(
                 "Esta chave identifica este dispositivo; nome e familiar são apenas perfil local.",
                 10.0,
@@ -2567,6 +2618,32 @@ fn verification(state: &Slouching, l: Layout) -> Element<'_, Message> {
         ]
             .spacing(l.px(12.0)),
         );
+    let mut address_choices = column![].spacing(l.px(4.0));
+    for address in &state.peer_invite_addresses {
+        let selected = state.peer_address == *address;
+        address_choices = address_choices.push(
+            button(l.label(
+                format!("{} {address}", if selected { "✓" } else { "Usar" }),
+                10.0,
+                if selected { GOLD } else { PAPER },
+            ))
+            .on_press(Message::SelectPeerInviteAddress(address.clone()))
+            .padding([l.px(5.0), l.px(8.0)])
+            .width(Fill)
+            .style(|_, status| button_style(status, false, false)),
+        );
+    }
+    let invite_addresses: Element<'_, Message> = if state.peer_invite_addresses.is_empty() {
+        l.label("Nenhum endereço importado do QR.", 10.0, MUTED)
+            .into()
+    } else {
+        column![
+            l.label("ENDEREÇOS DO CONVITE · ESCOLHA UM", 9.0, GOLD),
+            scrollable(address_choices).height(l.px(100.0))
+        ]
+        .spacing(l.px(4.0))
+        .into()
+    };
     let peer = l.panel(
         column![
             l.label("CHAVE PÚBLICA DO PEER", 10.0, GOLD),
@@ -2576,6 +2653,14 @@ fn verification(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 (!listener_active)
                     .then_some(Message::PeerPublicKeyChanged as fn(String) -> Message)
             ),
+            l.control(
+                "key",
+                "Importar convite QR de PNG",
+                (!listener_active).then_some(Message::ImportPeerInviteQr),
+                false
+            ),
+            l.label(state.peer_invite_status.clone(), 10.0, MUTED),
+            invite_addresses,
             l.label(
                 state.peer_verification_status.clone(),
                 11.0,
@@ -2602,12 +2687,12 @@ fn verification(state: &Slouching, l: Layout) -> Element<'_, Message> {
         column![
             l.label("COMO CONFERIR", 10.0, GOLD),
             l.label(
-                "Troque a chave completa por um canal independente (por exemplo, pessoalmente ou em uma chamada confiável). Compare todos os 64 caracteres nos dois dispositivos antes de marcar como conferida.",
+                "Marque como conferida somente depois de autenticar o contato: compare a chave completa por um canal independente ou importe o QR assinado exibido diretamente no dispositivo dele.",
                 11.0,
                 PAPER
             ),
             l.label(
-                "A marcação fica somente neste perfil cifrado e se aplica apenas a esta chave. Uma chave diferente nunca herda a confiança. QR e códigos curtos ainda não estão implementados.",
+                "A assinatura vincula os endereços à chave do dispositivo, mas não prova quem enviou uma imagem. Não confie em QR recebido por canal não autenticado. A decisão fica neste perfil e outra chave não herda confiança.",
                 10.0,
                 MUTED
             ),
