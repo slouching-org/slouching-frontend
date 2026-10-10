@@ -6154,23 +6154,31 @@ async fn fetch_delivery_mailbox_task(
     helper_url: String,
     recipient_device: [u8; 32],
 ) -> Result<(usize, usize), String> {
-    let page = delivery_client::list_copies(&helper_url, 0, 16).await?;
+    let mut after_id = 0;
     let mut received = 0;
     let mut duplicates = 0;
-    for copy in page.copies {
-        let (grant, event) = delivery_client::decode_copy(&copy.payload)?;
-        if copy.event_id != grant.event_id
-            || event.event_id != grant.event_id
-            || copy.expires_at_unix != grant.expires_at_unix
-        {
-            return Err("mailbox entry ID does not match its signed MLS envelope".into());
+    loop {
+        let page = delivery_client::list_copies(&helper_url, after_id, 16).await?;
+        for copy in page.copies {
+            let (grant, event) = delivery_client::decode_copy(&copy.payload)?;
+            if copy.event_id != grant.event_id
+                || event.event_id != grant.event_id
+                || copy.expires_at_unix != grant.expires_at_unix
+            {
+                return Err("mailbox entry ID does not match its signed MLS envelope".into());
+            }
+            let event_id = grant.event_id;
+            match process_delegated_copy_for_recipient_task(grant, event, recipient_device).await? {
+                storage::ProcessedMlsApplicationEvent::Received(_) => received += 1,
+                storage::ProcessedMlsApplicationEvent::Duplicate => duplicates += 1,
+            }
+            delivery_client::acknowledge_copy(&helper_url, &event_id).await?;
         }
-        let event_id = grant.event_id;
-        match process_delegated_copy_for_recipient_task(grant, event, recipient_device).await? {
-            storage::ProcessedMlsApplicationEvent::Received(_) => received += 1,
-            storage::ProcessedMlsApplicationEvent::Duplicate => duplicates += 1,
+        match page.next_after_id {
+            Some(next_after_id) if next_after_id > after_id => after_id = next_after_id,
+            Some(_) => return Err("mailbox returned a non-advancing page cursor".into()),
+            None => break,
         }
-        delivery_client::acknowledge_copy(&helper_url, &event_id).await?;
     }
     Ok((received, duplicates))
 }

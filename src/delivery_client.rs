@@ -359,37 +359,50 @@ mod tests {
             .expect("system time should be after Unix epoch")
             .as_secs() as i64
             + 3_600;
-        let event = crate::storage::EncryptedEvent {
-            event_id: [0x63; 16],
-            author_device: author.verifying_key().to_bytes(),
-            group_id: vec![0x64; 16],
-            epoch: 7,
-            checkpoint: Some(vec![0x65; 8]),
-            expires_at_unix,
-            ciphertext: b"mailbox cross-repository ciphertext".to_vec(),
-        };
-        let grant = crate::storage::sign_delegated_mls_copy_grant_with_identity(
-            &event,
-            recipient.verifying_key().to_bytes(),
-            &author,
-        )
-        .expect("the author should sign the recipient-bound event copy");
-        let payload = encode_copy(&grant, &event).expect("copy envelope should encode");
+        let mut copies = Vec::new();
+        for index in 1..=18u8 {
+            let mut event_id = [0x63; 16];
+            event_id[15] = index;
+            let event = crate::storage::EncryptedEvent {
+                event_id,
+                author_device: author.verifying_key().to_bytes(),
+                group_id: vec![0x64; 16],
+                epoch: 7,
+                checkpoint: Some(vec![0x65; 8]),
+                expires_at_unix,
+                ciphertext: format!("mailbox cross-repository ciphertext {index}").into_bytes(),
+            };
+            let grant = crate::storage::sign_delegated_mls_copy_grant_with_identity(
+                &event,
+                recipient.verifying_key().to_bytes(),
+                &author,
+            )
+            .expect("the author should sign the recipient-bound event copy");
+            let payload = encode_copy(&grant, &event).expect("copy envelope should encode");
+            copies.push((grant, event, payload));
+        }
 
-        let mut tampered = payload.clone();
+        let mut tampered = copies[0].2.clone();
         let signature_offset = 154;
         tampered[signature_offset] ^= 1;
         assert!(upload_copy(&helper_url, &tampered).await.is_err());
         assert!(
-            !upload_copy(&helper_url, &payload)
+            !upload_copy(&helper_url, &copies[0].2)
                 .await
                 .expect("Elixir should accept the signed copy")
         );
         assert!(
-            upload_copy(&helper_url, &payload)
+            upload_copy(&helper_url, &copies[0].2)
                 .await
                 .expect("identical upload should be idempotent")
         );
+        for (_, _, payload) in copies.iter().skip(1) {
+            assert!(
+                !upload_copy(&helper_url, payload)
+                    .await
+                    .expect("Elixir should accept each signed copy")
+            );
+        }
 
         let recipient_seed = [0x62; 32];
         let page = list_copies_with_signer(
@@ -405,19 +418,15 @@ mod tests {
         )
         .await
         .expect("the helper should authenticate and return a recipient page");
-        assert_eq!(page.copies.len(), 1);
-        assert_eq!(page.next_after_id, None);
-        assert_eq!(page.copies[0].event_id, grant.event_id);
-        assert_eq!(page.copies[0].expires_at_unix, grant.expires_at_unix);
-        assert_eq!(
-            decode_copy(&page.copies[0].payload).unwrap(),
-            (grant.clone(), event)
-        );
-
+        assert_eq!(page.copies.len(), 16);
+        let next_after_id = page
+            .next_after_id
+            .expect("the helper should provide a cursor for another page");
         let recipient_seed = [0x62; 32];
-        acknowledge_copy_with_signer(
+        let second_page = list_copies_with_signer(
             &helper_url,
-            &grant.event_id,
+            next_after_id,
+            16,
             move |method, path, timestamp, nonce, body| {
                 let identity = SigningKey::from_bytes(&recipient_seed);
                 crate::storage::sign_delivery_http_request_with_identity(
@@ -426,7 +435,37 @@ mod tests {
             },
         )
         .await
-        .expect("the authenticated helper ACK should remove the retained copy");
+        .expect("the helper should return the next signed page");
+        assert_eq!(second_page.copies.len(), 2);
+        assert_eq!(second_page.next_after_id, None);
+
+        for received_copy in page.copies.into_iter().chain(second_page.copies) {
+            let (grant, event) = decode_copy(&received_copy.payload).unwrap();
+            let original = copies
+                .iter()
+                .find(|(expected, _, _)| expected.event_id == grant.event_id)
+                .expect("listed copy should match an uploaded event");
+            assert_eq!(received_copy.event_id, grant.event_id);
+            assert_eq!(received_copy.expires_at_unix, grant.expires_at_unix);
+            assert_eq!(
+                (grant.clone(), event),
+                (original.0.clone(), original.1.clone())
+            );
+
+            let recipient_seed = [0x62; 32];
+            acknowledge_copy_with_signer(
+                &helper_url,
+                &grant.event_id,
+                move |method, path, timestamp, nonce, body| {
+                    let identity = SigningKey::from_bytes(&recipient_seed);
+                    crate::storage::sign_delivery_http_request_with_identity(
+                        &identity, method, path, timestamp, nonce, body,
+                    )
+                },
+            )
+            .await
+            .expect("the authenticated helper ACK should remove the retained copy");
+        }
 
         let recipient_seed = [0x62; 32];
         let empty = list_copies_with_signer(
