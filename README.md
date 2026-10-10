@@ -102,12 +102,12 @@ API returns. During a call, **Compartilhar janela na chamada** sends its H.264
 frames over the same bounded, SFrame-protected video channel. If a window is
 closed or its capture permission is revoked, the picker reports the failure;
 **Parar compartilhamento** stops the stream. Source names and dimensions come
-from the OS at enumeration time, and a refresh updates the list.
-On Linux, window enumeration uses the X11/Xorg backend; the current capture
-library does not enumerate windows in a pure Wayland session. The picker can
-list XWayland windows when the app has a working X11 display connection; native
-Wayland windows and portal-based selection are not implemented yet. A pure
-Wayland session now shows this limitation directly in the picker.
+from the OS at enumeration time, and a refresh updates the list. On Linux,
+X11/Xorg uses the native window list. A pure Wayland session asks the desktop
+portal to select one window and stream it through PipeWire; the portal asks for
+permission on each preview or share. If the compositor portal does not offer
+window sources, the picker reports that limitation. Mixed X11/Wayland sessions
+currently enumerate X11/XWayland windows.
 
 ## Direct peer messages
 
@@ -541,8 +541,8 @@ after QR import; all values are fixtures.
 group values; they do not represent a live MLS group or WebRTC session.
 `--capture-share-camera` shows the camera tab with real enumerated device names;
 it does not open a camera or display a live image. `--capture-share-window`
-shows windows enumerated from the current desktop session; it does not capture
-or transmit a window.
+shows two illustrative window rows; it does not enumerate live windows, open the
+portal, capture, or transmit content.
 The camera/window picker captures could not be refreshed in this headless
 environment: Iced/winit requires `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, or
 `DISPLAY`. Run the matching capture command in a graphical session to render

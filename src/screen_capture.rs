@@ -63,11 +63,7 @@ pub fn capture(id: u32) -> Result<CapturedScreen, String> {
 }
 
 pub fn enumerate_windows() -> Result<Vec<WindowSource>, String> {
-    #[cfg(target_os = "linux")]
-    if wayland_window_capture_unavailable(
-        std::env::var_os("WAYLAND_DISPLAY").is_some(),
-        std::env::var_os("DISPLAY").is_some(),
-    ) {
+    if uses_wayland_window_portal() {
         return Err(
             "captura de janelas nativas não está disponível em Wayland puro; use uma sessão X11/Xorg ou uma janela executada por XWayland".to_owned(),
         );
@@ -104,6 +100,20 @@ pub fn enumerate_windows() -> Result<Vec<WindowSource>, String> {
     Ok(windows)
 }
 
+pub fn uses_wayland_window_portal() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        wayland_window_capture_unavailable(
+            std::env::var_os("WAYLAND_DISPLAY").is_some(),
+            std::env::var_os("DISPLAY").is_some(),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 pub fn capture_video_source(source: VideoSource) -> Result<CapturedScreen, String> {
     match source {
         VideoSource::Monitor(id) => capture(id),
@@ -131,7 +141,7 @@ fn capture_image(
     })
 }
 
-fn validate_dimensions(width: u32, height: u32) -> Result<(), String> {
+pub(crate) fn validate_dimensions(width: u32, height: u32) -> Result<(), String> {
     let pixels = (width as usize)
         .checked_mul(height as usize)
         .ok_or_else(|| "dimensões da captura excedem o limite".to_owned())?;

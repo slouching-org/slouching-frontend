@@ -17,6 +17,8 @@ pub mod screen_capture;
 pub mod storage;
 mod ui;
 pub mod video_transport;
+#[cfg(target_os = "linux")]
+mod wayland_capture;
 use prost::Message as ProstMessage;
 use serde::Deserialize;
 use std::time::Duration;
@@ -594,6 +596,8 @@ enum Message {
     ),
     CaptureWindow(u32),
     WindowCaptured(u32, Result<screen_capture::CapturedScreen, String>),
+    CapturePortalWindowPreview,
+    PortalWindowPreview(Result<screen_capture::CapturedScreen, String>),
     StartScreenShare,
     StartWindowShare,
     StartCameraShare,
@@ -1092,7 +1096,11 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     "Inicie ou aceite uma chamada antes de compartilhar uma janela.".into();
                 return Task::none();
             };
-            let Some(window_id) = state.selected_window else {
+            let window_id = if screen_capture::uses_wayland_window_portal() {
+                0
+            } else if let Some(window_id) = state.selected_window {
+                window_id
+            } else {
                 state.screen_share_status =
                     "Selecione uma janela antes de iniciar o compartilhamento.".into();
                 return Task::none();
@@ -1735,6 +1743,30 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 }
             }
         }
+        Message::CapturePortalWindowPreview => {
+            state.screen_capture_status =
+                "Escolha uma janela no diálogo de compartilhamento do desktop…".to_owned();
+            return Task::perform(
+                capture_portal_window_preview_task(),
+                Message::PortalWindowPreview,
+            );
+        }
+        Message::PortalWindowPreview(result) => match result {
+            Ok(frame) => {
+                state.window_preview = Some(iced::widget::image::Handle::from_rgba(
+                    frame.width,
+                    frame.height,
+                    frame.rgba,
+                ));
+                state.screen_capture_status =
+                    "Prévia da janela capturada localmente pelo portal; não enviada ao peer."
+                        .to_owned();
+            }
+            Err(error) => {
+                state.window_preview = None;
+                state.screen_capture_status = error;
+            }
+        },
         Message::CaptureCamera(id) => {
             state.screen_capture_status = "Abrindo a câmera para prévia local…".to_owned();
             return Task::perform(capture_camera_task(id.clone()), move |result| {
@@ -5132,6 +5164,23 @@ fn boot() -> (Slouching, Task<Message>) {
     }
     if capture_share_window {
         state.share_tab = 1;
+        state.window_sources = vec![
+            screen_capture::WindowSource {
+                id: 10_001,
+                name: "Firefox — Slouching design review".to_owned(),
+                width: 1440,
+                height: 900,
+            },
+            screen_capture::WindowSource {
+                id: 10_002,
+                name: "Terminal — cargo test".to_owned(),
+                width: 1100,
+                height: 720,
+            },
+        ];
+        state.selected_window = Some(10_001);
+        state.screen_capture_status =
+            "Janelas ilustrativas da captura; nenhum conteúdo foi capturado.".to_owned();
     }
     if let Some(pos) = args.iter().position(|s| s == "--settings-tab")
         && let Some(value) = args.get(pos + 1).and_then(|value| value.parse::<u8>().ok())
@@ -5311,11 +5360,7 @@ fn boot() -> (Slouching, Task<Message>) {
             } else {
                 Task::none()
             },
-            if capture_share_window {
-                Task::perform(enumerate_windows_task(), Message::WindowSourcesLoaded)
-            } else {
-                Task::none()
-            },
+            Task::none(),
             transport,
             capture,
         ]),
@@ -7249,6 +7294,23 @@ async fn capture_window_task(id: u32) -> Result<screen_capture::CapturedScreen, 
     })
     .await
     .map_err(|error| format!("tarefa de captura da janela falhou: {error}"))?
+}
+
+#[cfg(target_os = "linux")]
+async fn capture_portal_window_preview_task() -> Result<screen_capture::CapturedScreen, String> {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut capture = wayland_capture::WaylandWindowCapture::start(stop).await?;
+    let result = tokio::time::timeout(Duration::from_secs(5), capture.recv())
+        .await
+        .map_err(|_| "o portal não forneceu um quadro de prévia em 5 segundos".to_owned())?
+        .ok_or_else(|| "o portal encerrou antes de fornecer uma prévia".to_owned())?;
+    capture.stop().await;
+    result
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn capture_portal_window_preview_task() -> Result<screen_capture::CapturedScreen, String> {
+    Err("captura via portal de desktop está disponível apenas no Linux".to_owned())
 }
 
 async fn load_peer_secret_key_task() -> Result<iroh::SecretKey, String> {

@@ -136,10 +136,11 @@ permissions, and VPN delivery still need validation. The camera tab enumerates
 native devices and supports an explicit local preview or in-call H.264/SFrame
 stream over the same video channel; only one source can be active. The window
 tab enumerates visible windows and supports explicit local preview or in-call
-H.264/SFrame sharing through that channel. Linux window enumeration uses
-X11/Xorg; pure Wayland enumeration is not supported by the current capture
-library and the picker reports that requirement. Native Wayland windows need
-desktop-portal capture support. A two-frame
+H.264/SFrame sharing through that channel. Linux X11/Xorg uses xcap; a pure
+Wayland session opens the desktop ScreenCast portal, selects one window, and
+receives bounded RGBA frames through PipeWire until sharing stops. The portal
+must advertise window sources; XDG backend behavior still needs runtime
+validation on Hyprland and GNOME. A two-frame
 queue and 1920 × 1080 capture bound limit camera buffering. Device enumeration
 works on this host, but opening a camera and remote playback still need physical
 validation. The call's room chat sends

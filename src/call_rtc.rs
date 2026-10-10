@@ -130,6 +130,7 @@ pub struct CallRtcSession {
     screen_video_encoder: AsyncMutex<Option<crate::call_video::CallVideoEncoder>>,
     screen_video_decoder: Arc<AsyncMutex<Option<crate::call_video::CallVideoDecoder>>>,
     screen_share_active: Arc<AtomicBool>,
+    wayland_capture_stop: Arc<AtomicBool>,
     camera_capture_stop: Arc<AtomicBool>,
     screen_share_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     remote_screen_frame: watch::Sender<Option<Arc<crate::call_video::DecodedVideoFrame>>>,
@@ -194,6 +195,7 @@ impl CallRtcSession {
             screen_video_encoder: AsyncMutex::new(None),
             screen_video_decoder: Arc::new(AsyncMutex::new(None)),
             screen_share_active: Arc::new(AtomicBool::new(false)),
+            wayland_capture_stop: Arc::new(AtomicBool::new(true)),
             camera_capture_stop: Arc::new(AtomicBool::new(true)),
             screen_share_task: Mutex::new(None),
             remote_screen_frame,
@@ -466,11 +468,123 @@ impl CallRtcSession {
     }
 
     pub async fn start_window_sharing(self: &Arc<Self>, window_id: u32) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        if crate::screen_capture::uses_wayland_window_portal() {
+            return self.start_wayland_window_sharing().await;
+        }
         self.start_desktop_video_sharing(
             crate::screen_capture::VideoSource::Window(window_id),
             "janela",
         )
         .await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn start_wayland_window_sharing(self: &Arc<Self>) -> Result<(), String> {
+        if self.screen_video_encoder.lock().await.is_none() {
+            return Err("esta chamada não tem um codec de vídeo associado ao grupo MLS".to_owned());
+        }
+        let channel = self
+            .screen_data_channel
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| "o canal de vídeo ainda não foi negociado com o peer".to_owned())?;
+        if channel
+            .ready_state()
+            .await
+            .map_err(|error| error.to_string())?
+            != RTCDataChannelState::Open
+        {
+            return Err("aguarde WebRTC antes de escolher uma janela".to_owned());
+        }
+        if self.screen_share_active.swap(true, Ordering::AcqRel) {
+            return Err("já existe um compartilhamento de vídeo nesta chamada".to_owned());
+        }
+        self.screen_share_status
+            .send_replace("Aguardando a seleção da janela pelo portal do desktop…".to_owned());
+        let capture_stop = Arc::clone(&self.wayland_capture_stop);
+        capture_stop.store(false, Ordering::Release);
+        let mut capture =
+            match crate::wayland_capture::WaylandWindowCapture::start(capture_stop).await {
+                Ok(capture) => capture,
+                Err(error) => {
+                    self.screen_share_active.store(false, Ordering::Release);
+                    self.screen_share_status.send_replace(error.clone());
+                    return Err(error);
+                }
+            };
+        self.screen_share_status
+            .send_replace("Janela selecionada; transmissão protegida iniciada.".to_owned());
+        let session = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            let mut frame_id = 0_u32;
+            let mut interval = tokio::time::interval(Duration::from_millis(200));
+            loop {
+                interval.tick().await;
+                let captured =
+                    match tokio::time::timeout(Duration::from_millis(200), capture.recv()).await {
+                        Ok(Some(Ok(frame))) => frame,
+                        Ok(Some(Err(error))) => {
+                            session
+                                .screen_share_status
+                                .send_replace(format!("Captura Wayland da janela falhou: {error}"));
+                            session.send_video_stop_signal().await;
+                            break;
+                        }
+                        Ok(None) => {
+                            session
+                                .screen_share_status
+                                .send_replace("O portal encerrou a captura da janela.".to_owned());
+                            session.send_video_stop_signal().await;
+                            break;
+                        }
+                        Err(_) => continue,
+                    };
+                let protected = {
+                    let mut encoder = session.screen_video_encoder.lock().await;
+                    let Some(encoder) = encoder.as_mut() else {
+                        break;
+                    };
+                    encoder.encode_and_protect(captured.width, captured.height, captured.rgba)
+                };
+                let protected = match protected {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        session.screen_share_status.send_replace(format!(
+                            "Quadro Wayland H.264/SFrame não enviado: {error}"
+                        ));
+                        continue;
+                    }
+                };
+                match session
+                    .send_protected_video_frame(frame_id, &protected)
+                    .await
+                {
+                    Ok(()) => {
+                        session.screen_share_status.send_replace(format!(
+                            "Janela Wayland compartilhada · quadro {frame_id} · H.264/SFrame."
+                        ));
+                        frame_id = frame_id.wrapping_add(1);
+                    }
+                    Err(error) if error.contains("peer is behind") => {
+                        frame_id = frame_id.wrapping_add(1);
+                    }
+                    Err(error) => {
+                        session
+                            .screen_share_status
+                            .send_replace(format!("Compartilhamento interrompido: {error}"));
+                        break;
+                    }
+                }
+            }
+            capture.stop().await;
+            session.screen_share_active.store(false, Ordering::Release);
+        });
+        if let Ok(mut active_task) = self.screen_share_task.lock() {
+            *active_task = Some(task);
+        }
+        Ok(())
     }
 
     async fn start_desktop_video_sharing(
@@ -676,6 +790,7 @@ impl CallRtcSession {
     }
 
     pub async fn stop_video_sharing(&self) {
+        self.wayland_capture_stop.store(true, Ordering::Release);
         self.camera_capture_stop.store(true, Ordering::Release);
         if let Ok(mut task) = self.screen_share_task.lock()
             && let Some(task) = task.take()

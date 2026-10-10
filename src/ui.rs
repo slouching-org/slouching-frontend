@@ -1592,12 +1592,21 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
         }
     } else if state.share_tab == 1 {
         if state.window_sources.is_empty() {
-            l.label(
-                "Nenhuma janela capturável foi encontrada. Confira o ambiente gráfico e as permissões.",
-                12.0,
-                MUTED,
-            )
-            .into()
+            if crate::screen_capture::uses_wayland_window_portal() {
+                l.label(
+                    "Wayland: o seletor do desktop escolhe a janela e solicita permissão quando você captura a prévia ou compartilha.",
+                    12.0,
+                    MUTED,
+                )
+                .into()
+            } else {
+                l.label(
+                    "Nenhuma janela capturável foi encontrada. Confira o ambiente gráfico e as permissões.",
+                    12.0,
+                    MUTED,
+                )
+                .into()
+            }
         } else {
             windows.into()
         }
@@ -1624,7 +1633,7 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
         Some(Message::StartScreenShare)
     } else if state.call_rtc_session.is_some()
         && state.share_tab == 1
-        && state.selected_window.is_some()
+        && (state.selected_window.is_some() || crate::screen_capture::uses_wayland_window_portal())
     {
         Some(Message::StartWindowShare)
     } else if state.call_rtc_session.is_some()
@@ -1640,6 +1649,8 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
         "Parar compartilhamento"
     } else if state.share_tab == 2 {
         "Compartilhar câmera na chamada"
+    } else if state.share_tab == 1 && crate::screen_capture::uses_wayland_window_portal() {
+        "Escolher janela e compartilhar"
     } else if state.share_tab == 1 {
         "Compartilhar janela na chamada"
     } else {
@@ -1651,6 +1662,12 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
         _ => ("Atualizar telas", Message::RefreshScreens),
     };
     let (preview_icon, preview_label, preview_message, preview_disabled) = match state.share_tab {
+        1 if crate::screen_capture::uses_wayland_window_portal() => (
+            "window",
+            "Escolher janela para prévia",
+            Some(Message::CapturePortalWindowPreview),
+            false,
+        ),
         1 => (
             "window",
             "Capturar prévia local",
