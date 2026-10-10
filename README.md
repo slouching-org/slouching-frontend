@@ -38,7 +38,9 @@ format. Encrypted blobs can be stored persistently and fetched over Iroh QUIC;
 the provider handler requires explicit peer authorization. The SQLCipher
 profile now stores and reloads each group-bound offer, content key, sender key,
 and ciphertext digest, rejecting quarantined groups and conflicting transfer
-IDs. The receive core stages plaintext in a temporary file and publishes it
+IDs. A 200 MiB per-profile attachment quota is enforced before storing an
+offer, and the schema migration backfills sizes from existing offers. The
+receive core stages plaintext in a temporary file and publishes it
 only after digest validation, without replacing an existing destination. Local
 two-endpoint tests cover authorized retrieval and rejection of an unauthorized
 peer. The app does not yet wire blob serving to MLS membership authorization,

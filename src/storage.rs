@@ -1,4 +1,4 @@
-use crate::file_transfer::FileOffer;
+use crate::file_transfer::{FileOffer, MAX_FILE_BYTES};
 use crate::identity::MlsSigningKeyBinding;
 use directories::ProjectDirs;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -26,7 +26,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 21;
+const PROFILE_SCHEMA_VERSION: u32 = 22;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 const MAX_DELEGATED_COPY_BYTES: usize = 32 * 1024;
@@ -34,6 +34,7 @@ const MAX_DELEGATED_STORAGE_BYTES: i64 = 64 * 1024 * 1024;
 const MAX_DELEGATED_STORAGE_EVENTS: i64 = 4096;
 const MAX_DELEGATED_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
 const MAX_DELEGATED_CHECKPOINT_BYTES: usize = 16 * 1024;
+const MAX_LOCAL_ATTACHMENT_BYTES: i64 = 200 * 1024 * 1024;
 type StoredEventEnvelope = (
     Vec<u8>,
     Vec<u8>,
@@ -397,17 +398,30 @@ fn save_file_attachment_in(
         }
         return Err("file transfer ID is already bound to another attachment".to_owned());
     }
+    let stored_bytes: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(SUM(total_bytes), 0) FROM local_file_attachments",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("could not check local attachment quota: {error}"))?;
+    let incoming_bytes = i64::try_from(offer.total_bytes)
+        .map_err(|_| "file size does not fit the local attachment quota".to_owned())?;
+    if stored_bytes.saturating_add(incoming_bytes) > MAX_LOCAL_ATTACHMENT_BYTES {
+        return Err("local encrypted attachment quota of 200 MiB is full".to_owned());
+    }
     transaction
         .execute(
             "INSERT INTO local_file_attachments
-                 (transfer_id, group_id, author_device, ciphertext_hash, offer, created_at_unix)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (transfer_id, group_id, author_device, ciphertext_hash, offer, total_bytes, created_at_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 offer.transfer_id.as_slice(),
                 group_id.as_slice(),
                 author_device.as_slice(),
                 ciphertext_hash.as_slice(),
                 encoded_offer,
+                incoming_bytes,
                 unix_time_now()?
             ],
         )
@@ -423,7 +437,7 @@ fn list_file_attachments_in(
 ) -> Result<Vec<StoredFileAttachment>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT author_device, ciphertext_hash, offer, created_at_unix
+            "SELECT author_device, ciphertext_hash, offer, total_bytes, created_at_unix
              FROM local_file_attachments WHERE group_id = ?1 ORDER BY created_at_unix, transfer_id",
         )
         .map_err(|error| format!("could not prepare local attachment list: {error}"))?;
@@ -434,13 +448,18 @@ fn list_file_attachments_in(
                 row.get::<_, Vec<u8>>(1)?,
                 row.get::<_, Vec<u8>>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })
         .map_err(|error| format!("could not query local attachments: {error}"))?;
     let mut attachments = Vec::new();
     for row in rows {
-        let (author, hash, encoded_offer, created_at_unix) =
+        let (author, hash, encoded_offer, total_bytes, created_at_unix) =
             row.map_err(|error| format!("could not read local attachment: {error}"))?;
+        let offer = FileOffer::decode(&encoded_offer)?;
+        if i64::try_from(offer.total_bytes).ok() != Some(total_bytes) {
+            return Err("stored attachment size does not match its offer".to_owned());
+        }
         attachments.push(StoredFileAttachment {
             group_id,
             author_device: author
@@ -450,7 +469,7 @@ fn list_file_attachments_in(
                 .try_into()
                 .map_err(|_| "stored attachment digest has invalid length".to_owned())?,
             created_at_unix,
-            offer: FileOffer::decode(&encoded_offer)?,
+            offer,
         });
     }
     Ok(attachments)
@@ -5388,6 +5407,45 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
                 format!("could not create encrypted file attachment storage: {error}")
             })?;
     }
+    if version < 22 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE local_file_attachments
+                     ADD COLUMN total_bytes INTEGER NOT NULL DEFAULT 0
+                         CHECK (total_bytes BETWEEN 0 AND 104857600);",
+            )
+            .map_err(|error| {
+                format!("could not add attachment sizes to encrypted profile: {error}")
+            })?;
+        let stored_offers = {
+            let mut statement = transaction
+                .prepare("SELECT transfer_id, offer FROM local_file_attachments")
+                .map_err(|error| format!("could not read attachment migration rows: {error}"))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(|error| format!("could not query attachment migration rows: {error}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("could not collect attachment migration rows: {error}"))?
+        };
+        for (transfer_id, encoded_offer) in stored_offers {
+            let offer = FileOffer::decode(&encoded_offer)
+                .map_err(|error| format!("could not migrate stored file offer: {error}"))?;
+            if offer.total_bytes > MAX_FILE_BYTES {
+                return Err("stored file offer exceeds the supported transfer limit".to_owned());
+            }
+            transaction
+                .execute(
+                    "UPDATE local_file_attachments SET total_bytes = ?1 WHERE transfer_id = ?2",
+                    params![offer.total_bytes as i64, transfer_id],
+                )
+                .map_err(|error| format!("could not migrate stored attachment size: {error}"))?;
+        }
+        transaction
+            .execute_batch("PRAGMA user_version = 22;")
+            .map_err(|error| format!("could not finish attachment quota migration: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -7430,7 +7488,7 @@ mod tests {
         drop(listed);
         drop(connection);
 
-        let reopened = open_database(&path, &key).expect("encrypted profile should reopen");
+        let mut reopened = open_database(&path, &key).expect("encrypted profile should reopen");
         let persisted = list_file_attachments_in(&reopened, group_id)
             .expect("manifest and key should survive reopening");
         assert_eq!(persisted.len(), 1);
@@ -7441,8 +7499,98 @@ mod tests {
                 .expect("other groups should have independent manifests")
                 .is_empty()
         );
+        reopened
+            .execute("DELETE FROM local_file_attachments", [])
+            .expect("test should reset its local attachment quota");
+        for transfer_id in [[0x86; 16], [0x87; 16]] {
+            let large_secrets = FileTransferSecrets::from_parts(transfer_id, [0xa5; 32]);
+            let large_offer = FileOffer::from_secrets(
+                &large_secrets,
+                crate::file_transfer::MAX_FILE_BYTES,
+                "large.bin".to_owned(),
+            )
+            .expect("maximum-sized file offer should be valid");
+            save_file_attachment_in(&mut reopened, group_id, author, [0x66; 32], &large_offer)
+                .expect("two maximum-sized files should fit the 200 MiB quota");
+        }
+        let excess_secrets = FileTransferSecrets::from_parts([0x88; 16], [0xb6; 32]);
+        let excess_offer = FileOffer::from_secrets(&excess_secrets, 1, "one-byte.bin".to_owned())
+            .expect("small excess offer should be valid");
+        assert!(
+            save_file_attachment_in(&mut reopened, group_id, author, [0x67; 32], &excess_offer)
+                .expect_err("the 200 MiB local quota should prevent unbounded storage")
+                .contains("200 MiB")
+        );
         drop(persisted);
         drop(reopened);
         fs::remove_dir_all(directory).expect("temporary attachment directory should be removed");
+    }
+
+    #[test]
+    fn version_21_attachment_migration_backfills_offer_sizes() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-attachment-migration-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary migration directory should exist");
+        let path = directory.join("profile.sqlite3");
+        let key = [0x6c; PROFILE_DB_KEY_LEN];
+        let group_id = [0x31_u8; 16];
+        let author = [0x52_u8; 32];
+        let secrets = FileTransferSecrets::from_parts([0x73_u8; 16], [0x94_u8; 32]);
+        let offer = FileOffer::from_secrets(&secrets, 123_456, "legacy.bin".to_owned())
+            .expect("migration offer should be valid");
+        let encoded_offer = offer.encode().expect("offer should encode");
+
+        let connection = open_database(&path, &key).expect("profile should initialize");
+        connection
+            .execute_batch(
+                "CREATE TABLE local_file_attachments_v21 (
+                     transfer_id BLOB PRIMARY KEY NOT NULL CHECK (length(transfer_id) = 16),
+                     group_id BLOB NOT NULL CHECK (length(group_id) = 16),
+                     author_device BLOB NOT NULL CHECK (length(author_device) = 32),
+                     ciphertext_hash BLOB NOT NULL CHECK (length(ciphertext_hash) = 32),
+                     offer BLOB NOT NULL CHECK (length(offer) BETWEEN 69 AND 323),
+                     created_at_unix INTEGER NOT NULL CHECK (created_at_unix > 0)
+                 );
+                 DROP TABLE local_file_attachments;
+                 ALTER TABLE local_file_attachments_v21 RENAME TO local_file_attachments;
+                 CREATE INDEX local_file_attachments_by_group
+                     ON local_file_attachments (group_id, created_at_unix, transfer_id);",
+            )
+            .expect("test should recreate the version 21 attachment table");
+        connection
+            .execute(
+                "INSERT INTO local_file_attachments
+                     (transfer_id, group_id, author_device, ciphertext_hash, offer, created_at_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    offer.transfer_id.as_slice(),
+                    group_id.as_slice(),
+                    author.as_slice(),
+                    [0xa5_u8; 32].as_slice(),
+                    encoded_offer,
+                    unix_time_now().unwrap()
+                ],
+            )
+            .expect("legacy attachment should be inserted");
+        connection
+            .pragma_update(None, "user_version", 21)
+            .expect("test should set version 21");
+        drop(connection);
+
+        let migrated = open_database(&path, &key).expect("v21 attachment rows should migrate");
+        let attachments = list_file_attachments_in(&migrated, group_id)
+            .expect("migrated offer should remain readable");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].offer.total_bytes, 123_456);
+        assert_eq!(attachments[0].offer.content_key, [0x94; 32]);
+        drop(attachments);
+        drop(migrated);
+        fs::remove_dir_all(directory).expect("temporary migration directory should be removed");
     }
 }
