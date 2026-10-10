@@ -25,7 +25,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 19;
+const PROFILE_SCHEMA_VERSION: u32 = 20;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 const MAX_DELEGATED_COPY_BYTES: usize = 32 * 1024;
@@ -375,6 +375,56 @@ pub fn ensure_peer_relay_route(peer_device: [u8; 32]) -> Result<(), String> {
 pub fn list_peer_routes() -> Result<Vec<StoredPeerRoute>, String> {
     let connection = open_local_database()?;
     list_peer_routes_in(&connection)
+}
+
+/// Returns whether this exact device public key was manually verified locally.
+pub fn peer_key_is_verified(device_public_key: [u8; 32]) -> Result<bool, String> {
+    let connection = open_local_database()?;
+    peer_key_is_verified_in(&connection, device_public_key)
+}
+
+fn peer_key_is_verified_in(
+    connection: &Connection,
+    device_public_key: [u8; 32],
+) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_verified_peers WHERE device_public_key = ?1)",
+            [device_public_key.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("could not query peer verification: {error}"))
+}
+
+/// Stores or removes the user's out-of-band verification of an exact device key.
+pub fn set_peer_key_verified(device_public_key: [u8; 32], verified: bool) -> Result<(), String> {
+    let connection = open_local_database()?;
+    set_peer_key_verified_in(&connection, device_public_key, verified)
+}
+
+fn set_peer_key_verified_in(
+    connection: &Connection,
+    device_public_key: [u8; 32],
+    verified: bool,
+) -> Result<(), String> {
+    if verified {
+        connection
+            .execute(
+                "INSERT INTO local_verified_peers (device_public_key, verified_at_unix)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(device_public_key) DO UPDATE SET verified_at_unix = excluded.verified_at_unix",
+                params![device_public_key.as_slice(), unix_time_now()?],
+            )
+            .map_err(|error| format!("could not save verified peer identity: {error}"))?;
+    } else {
+        connection
+            .execute(
+                "DELETE FROM local_verified_peers WHERE device_public_key = ?1",
+                [device_public_key.as_slice()],
+            )
+            .map_err(|error| format!("could not remove verified peer identity: {error}"))?;
+    }
+    Ok(())
 }
 
 /// Removes only this peer's local direct-message history.
@@ -5160,6 +5210,18 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
             )
             .map_err(|error| format!("could not add MLS proposal review decisions: {error}"))?;
     }
+    if version < 20 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE local_verified_peers (
+                     device_public_key BLOB PRIMARY KEY NOT NULL
+                         CHECK (length(device_public_key) = 32),
+                     verified_at_unix INTEGER NOT NULL CHECK (verified_at_unix > 0)
+                 );
+                 PRAGMA user_version = 20;",
+            )
+            .map_err(|error| format!("could not add local verified peer storage: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -5278,6 +5340,43 @@ mod tests {
         }));
         drop(connection);
         fs::remove_dir_all(directory).expect("temporary peer route database should be removed");
+    }
+
+    #[test]
+    fn out_of_band_peer_verification_is_key_scoped_and_persists() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-peer-verification-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary database directory should be created");
+        let path = directory.join("profile.sqlite3");
+        let mut connection = open_database(&path, &[0x76; 32])
+            .expect("encrypted profile database should initialize");
+        let verified_key = [0x77; 32];
+        let changed_key = [0x78; 32];
+        assert!(!peer_key_is_verified_in(&connection, verified_key).unwrap());
+        set_peer_key_verified_in(&connection, verified_key, true).unwrap();
+        assert!(peer_key_is_verified_in(&connection, verified_key).unwrap());
+        assert!(!peer_key_is_verified_in(&connection, changed_key).unwrap());
+        drop(connection);
+
+        connection = open_database(&path, &[0x76; 32]).expect("profile should reopen");
+        assert!(peer_key_is_verified_in(&connection, verified_key).unwrap());
+        set_peer_key_verified_in(&connection, verified_key, false).unwrap();
+        assert!(!peer_key_is_verified_in(&connection, verified_key).unwrap());
+        connection
+            .execute_batch("DROP TABLE local_verified_peers; PRAGMA user_version = 19;")
+            .expect("test should restore the previous schema version");
+        drop(connection);
+        connection = open_database(&path, &[0x76; 32])
+            .expect("schema 19 should migrate to peer verification storage");
+        assert!(!peer_key_is_verified_in(&connection, verified_key).unwrap());
+        drop(connection);
+        fs::remove_dir_all(directory).expect("temporary database files should be removed");
     }
 
     #[test]

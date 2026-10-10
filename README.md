@@ -79,7 +79,7 @@ acceptance into the receiver's local transcript, not that the user read it.
 History stays on each device and is scoped to the pinned peer key; it is not
 synchronized. **Apagar histórico local deste peer** removes only that peer's
 rows after an explicit confirmation. This is pairwise QUIC channel encryption
-and pinned device identity, not MLS messaging or contact verification. Direct
+and the pinned device key, not MLS messaging or human identity verification. Direct
 addresses are still exchanged manually; there is no automatic discovery,
 hole-punching, offline delivery, or media. With a saved relay, a blank peer
 address uses that relay, while a supplied address lets Iroh try the direct
@@ -99,6 +99,13 @@ been tested between physical machines. The automated
 `cargo test --test peer_process` launches separate OS processes, exchanges
 multiple messages in both directions over one connection, checks wrong-pin
 rejection, and verifies a pending send is reported as unknown on disconnect.
+
+Before trusting a peer's identity, open **Conferir identidade do peer** from
+the shield button, exchange the complete 64-character device keys through a
+separate channel, compare every character, and mark the key as verified on
+your device. That decision is local to this encrypted profile and to that exact
+key. It does not verify a display name, and a replacement key must be compared
+again. QR pairing and short verification codes are not available yet.
 
 To operate a relay, run the Iroh Relay `1.3.0` server on a host the group
 controls, configure HTTPS and `access.shared_token`, and enter that HTTPS URL
@@ -257,8 +264,11 @@ The familiar screen saves the display name and familiar as a local profile in
 SQLCipher encrypted SQLite; the database key is stored in the operating system
 credential store. Saving fails closed when that store is unavailable. The
 screen can also explicitly create and retain an Ed25519 device signing key in
-the system credential store. It displays the public key as unverified; no
-fingerprint format or contact pairing is implemented. OpenMLS credentials
+the system credential store. The direct-text trust screen lets both people
+compare the complete 64-character public key over an independent channel and
+mark that exact key as locally verified in SQLCipher. A changed key has no
+inherited trust. QR pairing, short verification codes, and contact discovery
+are not implemented. OpenMLS credentials
 include a versioned binding signed by the durable device key. One-use
 KeyPackages and private MLS state are stored in SQLCipher. The direct-chat
 screen separately pins device public keys. Character scenes and call views
@@ -272,6 +282,8 @@ be installed and available in the user session.
 ![Native Iced direct chat with relay settings and separate copy controls for sample LAN and VPN socket addresses; addresses are illustrative and Secret Service is unavailable.](docs/design/runtime/native-vhs/06-chat.png)
 
 ![Actual native Iced home with open scenery and icon-based feature strip, without the frog mage or gnome cutouts](docs/design/runtime/native-vhs/09-home.png)
+
+![Actual 934 × 1000 native Iced peer identity screen with full key comparison and a locally verified key; both keys are capture fixtures](docs/design/runtime/native-vhs/08-verify.png)
 
 ![Actual native Iced group-call preview; media and sample messages are illustrative](docs/design/runtime/native-vhs/10-call.png)
 
@@ -315,6 +327,7 @@ SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-capture
 SLOUCHING_WINDOW_SIZE=960x640 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 01-familiar
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 06-chat --capture-peer-addresses
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 11-mls --capture-mls-review
+SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-verification
 ```
 
 The capture command renders all twelve screens, saves screenshots through
@@ -328,6 +341,8 @@ addresses for the direct-chat capture; they are fixtures, not live interfaces.
 default is a compact 1100 × 720 window.
 `--capture-mls-review` adds sample pending, approved, and rejected proposals to
 illustrate the review controls; they are fixtures, not live MLS state.
+`--capture-peer-verification` supplies sample local and peer keys for the trust
+screen capture; they are fixtures, not identities from the keyring.
 
 Assets and font license/provenance notes are in [assets/README.md](assets/README.md).
 

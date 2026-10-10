@@ -81,9 +81,9 @@ the active pinned session, or exchange their bytes through a separately
 trusted channel. The committer checks the MLS author against the pinned peer,
 authenticates and stores the proposal before ACK, and deduplicates exact
 redelivery. The committer UI lists each current-epoch proposal's member key
-prefix and proposal ID before enabling Commit creation. The button commits all
-proposals shown in the review list; selecting or rejecting proposals
-individually and handling other proposal types are not implemented.
+prefix, proposal ID, and decision. The committer can approve or reject each
+proposal; the OpenMLS builder includes only approved references. Decisions are
+stored in SQLCipher. Other proposal types are not implemented.
 
 The direct-text screen manually pins the peer's Ed25519 device key. One side
 listens and shares a reachable interface address; the other connects to that
@@ -101,15 +101,19 @@ acceptance by the other client, not that a person read the message.
 
 The familiar screen stores the display name and familiar in encrypted SQLite;
 the database key and Ed25519 device seed use the operating system credential
-store. The public device key is shown as unverified. A device-signed binding
-connects that identity to the MLS signing key and is carried in KeyPackages.
-This does not establish contact trust or pairing. Linux needs Secret Service
-available in the user session. The settings **Rede & P2P** screen separately
-shows local Elixir HTTP/WebSocket diagnostics; it does not carry chat traffic.
+store. The **Conferir identidade do peer** screen lets the user compare the full
+64-character key over an independent channel and mark that exact key as locally
+verified in SQLCipher. A changed key does not inherit trust. QR pairing,
+short-code verification, and contact discovery remain open. A device-signed
+binding connects the device identity to its MLS signing key and is carried in
+KeyPackages; that binding alone does not verify a person. Linux needs Secret
+Service available in the user session. The settings **Rede & P2P** screen
+separately shows local Elixir HTTP/WebSocket diagnostics; it does not carry
+chat traffic.
 
 Character scenes and call views remain visual previews. Camera, microphone,
-screen capture, contact discovery, verified pairing, and guaranteed offline
-delivery are not implemented. The older web UI under
+screen capture, contact discovery, QR pairing, and guaranteed offline delivery
+are not implemented. The older web UI under
 `prototypes/web/` is a design benchmark, not the product runtime.
 
 See [direct peer transport v8](../transport/lan-peer-v8.md) for the direct session

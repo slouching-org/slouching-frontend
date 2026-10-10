@@ -200,6 +200,9 @@ struct Slouching {
     delegated_mls_storage: Option<storage::DelegatedMlsStorageStatus>,
     delegated_mls_storage_error: Option<String>,
     peer_public_key: String,
+    peer_verification_loaded_for: Option<String>,
+    peer_key_verified: bool,
+    peer_verification_status: String,
     active_peer_device: Option<[u8; 32]>,
     helper_listener_active: bool,
     peer_listener_port: Option<u16>,
@@ -356,6 +359,10 @@ impl Default for Slouching {
             delegated_mls_storage: None,
             delegated_mls_storage_error: None,
             peer_public_key: String::new(),
+            peer_verification_loaded_for: None,
+            peer_key_verified: false,
+            peer_verification_status: "Compare a chave completa por um canal independente."
+                .to_owned(),
             active_peer_device: None,
             helper_listener_active: false,
             peer_listener_port: None,
@@ -459,6 +466,9 @@ enum Message {
     CopyDeviceKey,
     CopyPeerListenAddress(String),
     PeerPublicKeyChanged(String),
+    PeerVerificationLoaded(String, Result<bool, String>),
+    TogglePeerVerification,
+    PeerVerificationSaved(String, bool, Result<(), String>),
     PeerHistoryLoaded(
         u64,
         String,
@@ -875,12 +885,111 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         Message::PeerPublicKeyChanged(value) => {
             if state.peer_public_key != value {
                 state.peer_public_key = value.clone();
+                state.peer_verification_loaded_for = None;
+                state.peer_key_verified = false;
+                state.peer_verification_status =
+                    "Compare a chave completa por um canal independente.".to_owned();
                 state.peer_transcript.clear();
                 state.peer_history_loaded_for = None;
                 state.peer_history_generation = state.peer_history_generation.saturating_add(1);
                 state.peer_history_clear_confirmation = false;
             }
-            return request_peer_history(state);
+            let history = request_peer_history(state);
+            if let Ok(peer_id) = parse_peer_id(&value) {
+                let key = hex_encode_key(peer_id.as_bytes());
+                return Task::batch([
+                    history,
+                    Task::perform(
+                        load_peer_verification_task(*peer_id.as_bytes()),
+                        move |result| Message::PeerVerificationLoaded(key, result),
+                    ),
+                ]);
+            }
+            return history;
+        }
+        Message::PeerVerificationLoaded(peer_key, result) => {
+            let current_key = parse_peer_id(&state.peer_public_key)
+                .ok()
+                .map(|peer| hex_encode_key(peer.as_bytes()));
+            if current_key.as_deref() == Some(peer_key.as_str()) {
+                match result {
+                    Ok(verified) => {
+                        state.peer_verification_loaded_for = Some(peer_key);
+                        state.peer_key_verified = verified;
+                        state.peer_verification_status = if verified {
+                            "Chave conferida e marcada como verificada neste dispositivo."
+                        } else {
+                            "Ainda não verificada por um canal independente."
+                        }
+                        .to_owned();
+                    }
+                    Err(error) => {
+                        state.peer_key_verified = false;
+                        state.peer_verification_status =
+                            format!("Não foi possível carregar a verificação: {error}");
+                    }
+                }
+            }
+        }
+        Message::TogglePeerVerification => {
+            let local_key = match &state.identity_status {
+                IdentityStatus::Ready(local_key) => local_key,
+                _ => {
+                    state.peer_verification_status =
+                        "Carregue a identidade local antes de verificar um peer.".to_owned();
+                    return Task::none();
+                }
+            };
+            let peer_id = match parse_peer_id(&state.peer_public_key) {
+                Ok(peer_id) => peer_id,
+                Err(error) => {
+                    state.peer_verification_status = error;
+                    return Task::none();
+                }
+            };
+            let key = hex_encode_key(peer_id.as_bytes());
+            if state.peer_verification_loaded_for.as_deref() != Some(key.as_str()) {
+                state.peer_verification_status = "Aguarde a consulta da chave pinada.".to_owned();
+                return Task::none();
+            }
+            if peer_is_local(&peer_id, local_key) {
+                state.peer_verification_status =
+                    "Não é possível verificar a própria chave como peer.".to_owned();
+                return Task::none();
+            }
+            let verified = !state.peer_key_verified;
+            state.peer_verification_status = if verified {
+                "Salvando verificação local…".to_owned()
+            } else {
+                "Removendo verificação local…".to_owned()
+            };
+            return Task::perform(
+                set_peer_verification_task(*peer_id.as_bytes(), verified),
+                move |result| Message::PeerVerificationSaved(key, verified, result),
+            );
+        }
+        Message::PeerVerificationSaved(peer_key, verified, result) => {
+            let current_key = parse_peer_id(&state.peer_public_key)
+                .ok()
+                .map(|peer| hex_encode_key(peer.as_bytes()));
+            if current_key.as_deref() == Some(peer_key.as_str()) {
+                match result {
+                    Ok(()) => {
+                        state.peer_verification_loaded_for = Some(peer_key);
+                        state.peer_key_verified = verified;
+                        state.peer_verification_status = if verified {
+                            "Chave conferida e marcada como verificada neste dispositivo."
+                        } else {
+                            "Verificação local removida para esta chave."
+                        }
+                        .to_owned();
+                    }
+                    Err(error) => {
+                        state.peer_verification_status =
+                            format!("Não foi possível salvar a verificação: {error}");
+                    }
+                }
+            }
         }
         Message::PeerHistoryLoaded(generation, peer_key, result) => {
             if generation == state.peer_history_generation
@@ -3501,6 +3610,7 @@ fn decode_server_hello(bytes: &[u8]) -> Result<protocol::ServerHello, HandshakeE
 fn boot() -> (Slouching, Task<Message>) {
     let mut state = Slouching::default();
     let args: Vec<String> = std::env::args().collect();
+    let capture_peer_verification = args.iter().any(|arg| arg == "--capture-peer-verification");
     if let Some(pos) = args.iter().position(|s| s == "--screen")
         && let Some(name) = args.get(pos + 1)
         && let Some(screen) = Screen::ALL.into_iter().find(|s| s.slug() == name)
@@ -3561,6 +3671,16 @@ fn boot() -> (Slouching, Task<Message>) {
             },
         ];
     }
+    if capture_peer_verification {
+        let peer_key = [0x22; 32];
+        state.screen = Screen::Verify;
+        state.identity_status = IdentityStatus::Ready([0x11; 32]);
+        state.peer_public_key = hex_encode_key(&peer_key);
+        state.peer_verification_loaded_for = Some(state.peer_public_key.clone());
+        state.peer_key_verified = true;
+        state.peer_verification_status =
+            "Chave conferida e marcada como verificada neste dispositivo.".to_owned();
+    }
     if let Some(pos) = args.iter().position(|s| s == "--capture-dir")
         && let Some(path) = args.get(pos + 1)
     {
@@ -3588,7 +3708,11 @@ fn boot() -> (Slouching, Task<Message>) {
         Task::batch([
             Task::perform(fetch_backend_status(), Message::BackendFetched),
             Task::perform(load_profile_task(), Message::ProfileLoaded),
-            Task::perform(load_identity_task(), Message::IdentityLoaded),
+            if capture_peer_verification {
+                Task::none()
+            } else {
+                Task::perform(load_identity_task(), Message::IdentityLoaded)
+            },
             Task::perform(
                 load_peer_relay_config_task(),
                 Message::PeerRelayConfigLoaded,
@@ -3760,6 +3884,21 @@ async fn load_direct_history_task(
     tokio::task::spawn_blocking(move || storage::list_direct_messages(peer_device, 200))
         .await
         .map_err(|error| format!("direct history task failed: {error}"))?
+}
+
+async fn load_peer_verification_task(device_public_key: [u8; 32]) -> Result<bool, String> {
+    tokio::task::spawn_blocking(move || storage::peer_key_is_verified(device_public_key))
+        .await
+        .map_err(|error| format!("peer verification query task failed: {error}"))?
+}
+
+async fn set_peer_verification_task(
+    device_public_key: [u8; 32],
+    verified: bool,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || storage::set_peer_key_verified(device_public_key, verified))
+        .await
+        .map_err(|error| format!("peer verification save task failed: {error}"))?
 }
 
 async fn clear_direct_history_task(peer_device: [u8; 32]) -> Result<usize, String> {

@@ -319,7 +319,7 @@ fn screen(state: &Slouching, l: Layout) -> Element<'_, Message> {
         Screen::Chat => chat(state, l),
         Screen::Mls => mls(state, l),
         Screen::Incoming => incoming(l),
-        Screen::Verify => verification(l),
+        Screen::Verify => verification(state, l),
     };
     layers.push(content);
     layers.push(header(state, l));
@@ -1830,8 +1830,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
             "Tentar carregar identidade",
         ),
     };
-    let identity =
-        column![
+    let identity = column![
         l.label("SUA IDENTIDADE DO DISPOSITIVO", 10.0, GOLD),
         l.label(identity_detail, 10.0, PAPER),
         l.control("key", copy_label, copy_message, !identity_ready),
@@ -1846,6 +1845,23 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
             "A mesma chave esperada é usada ao enviar e ao receber.",
             10.0,
             MUTED
+        ),
+        l.label(
+            if state.peer_public_key.is_empty() {
+                "NENHUMA CHAVE DE PEER SELECIONADA"
+            } else if state.peer_key_verified {
+                "IDENTIDADE VERIFICADA LOCALMENTE"
+            } else {
+                "IDENTIDADE AINDA NÃO VERIFICADA"
+            },
+            9.0,
+            if state.peer_key_verified { GREEN } else { GOLD }
+        ),
+        l.control(
+            "shield",
+            "Conferir identidade do peer",
+            Some(Message::Navigate(Screen::Verify)),
+            false
         ),
         l.label("RELAY DO GRUPO · OPCIONAL", 10.0, GOLD),
         l.label(
@@ -1874,10 +1890,13 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
             l.control(
                 "close",
                 "Descartar",
-                state.peer_relay_config_dirty.then_some(Message::DiscardPeerRelayConfig),
+                state
+                    .peer_relay_config_dirty
+                    .then_some(Message::DiscardPeerRelayConfig),
                 false
             )
-        ].spacing(l.px(6.0)),
+        ]
+        .spacing(l.px(6.0)),
         l.label(state.peer_relay_config_status.clone(), 10.0, MUTED),
         l.label("PORTA UDP PARA RECEBER", 10.0, GOLD),
         l.input_maybe(
@@ -1886,7 +1905,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
             (!listener_active).then_some(Message::PeerListenPortChanged as fn(String) -> Message)
         )
     ]
-        .spacing(l.px(10.0));
+    .spacing(l.px(10.0));
     let listener_status: Element<'_, Message> = match &state.peer_listen_status {
         crate::PeerListenStatus::Idle => l
             .label(
@@ -2383,91 +2402,115 @@ fn incoming(l: Layout) -> Element<'static, Message> {
     .into()
 }
 
-fn verification(l: Layout) -> Element<'static, Message> {
-    let heading = column![
-        l.title("Selar o pacto com Mara", 40.0),
-        l.label(
-            "PRÉVIA DE SEGURANÇA · nenhuma identidade, palavra ou QR autenticado",
-            12.0,
-            VIOLET
-        )
-    ]
-    .spacing(l.px(12.0));
-    let actions = column![
-        l.control("check", "Verificação indisponível", None, true),
-        l.control(
-            "close",
-            "Voltar à conversa",
-            Some(Message::Navigate(Screen::Chat)),
-            false
-        ),
-        l.label("QR não disponível", 12.0, MUTED)
-    ]
-    .spacing(l.px(12.0));
-    let mls = column![
-        l.label("G R U P O  M L S", 11.0, GOLD),
-        l.label("epoch · nenhum grupo criado", 12.0, MUTED),
-        l.label("suíte · ainda não selecionada", 12.0, MUTED),
-        l.label("mídia · SFrame não implementado", 12.0, MUTED)
-    ]
-    .spacing(l.px(12.0));
-    let devices = column![
-        l.label("DISPOSITIVOS DA MARA", 11.0, GOLD),
-        l.label("Nenhum dispositivo autenticado ou verificado", 12.0, MUTED),
-        l.label(
-            "A comparação exige chaves reais e um canal independente.",
-            12.0,
-            PAPER
-        )
-    ]
-    .spacing(l.px(14.0));
-    stack![
-        l.place(heading, 48.0, 90.0, 1150.0, 92.0),
-        l.place(
-            seal_card(l, "wizard", "Você · Odo"),
-            48.0,
-            228.0,
-            438.0,
-            280.0
-        ),
-        l.place(
-            image(assets().images["wizards-cutout"].clone())
-                .width(Fill)
-                .height(Fill)
-                .content_fit(ContentFit::Contain),
-            536.0,
-            172.0,
-            208.0,
-            214.0
-        ),
-        l.place(actions, 510.0, 408.0, 260.0, 153.0),
-        l.place(seal_card(l, "frog", "Mara"), 794.0, 228.0, 438.0, 280.0),
-        l.place(l.panel(mls), 48.0, 590.0, 580.0, 151.0),
-        l.place(l.panel(devices), 652.0, 590.0, 580.0, 151.0)
-    ]
-    .width(Fill)
-    .height(Fill)
-    .into()
-}
-
-fn seal_card(l: Layout, art: &'static str, name: &str) -> Element<'static, Message> {
-    let mut words = column![].spacing(l.px(8.0));
-    for group in [["sapo", "lua", "musgo"], ["cajado", "vela", "runa"]] {
-        words = words.push(
-            row![field(l, group[0]), field(l, group[1]), field(l, group[2])].spacing(l.px(8.0)),
-        );
-    }
-    l.panel(
-        column![
-            row![l.picture(art, 36.0, 36.0), l.label(name, 14.0, PAPER)]
-                .spacing(l.px(14.0))
-                .align_y(iced::Center),
-            l.label("PALAVRAS ILUSTRATIVAS", 10.0, VIOLET),
-            words,
-            l.label("Fingerprint não disponível · sem chave", 10.0, MUTED)
+fn verification(state: &Slouching, l: Layout) -> Element<'_, Message> {
+    let listener_active = matches!(
+        state.peer_listen_status,
+        crate::PeerListenStatus::Starting { .. }
+            | crate::PeerListenStatus::Listening { .. }
+            | crate::PeerListenStatus::Connected
+            | crate::PeerListenStatus::Unauthorized(_)
+    );
+    let own_key = match &state.identity_status {
+        crate::IdentityStatus::Ready(key) => crate::hex_encode_bytes(key),
+        crate::IdentityStatus::Missing => "Identidade ainda não criada".to_owned(),
+        crate::IdentityStatus::Loading => "Carregando identidade do cofre…".to_owned(),
+        crate::IdentityStatus::Creating => "Criando identidade…".to_owned(),
+        crate::IdentityStatus::Failed => "Secret Service indisponível".to_owned(),
+    };
+    let peer_id = crate::parse_peer_id(&state.peer_public_key).ok();
+    let current_peer_key = peer_id.map(|peer| crate::hex_encode_bytes(peer.as_bytes()));
+    let peer_is_local = matches!(
+        (&state.identity_status, peer_id),
+        (crate::IdentityStatus::Ready(local), Some(peer)) if peer.as_bytes() == local
+    );
+    let can_toggle = current_peer_key.as_deref().is_some_and(|key| {
+        state.peer_verification_loaded_for.as_deref() == Some(key)
+            && matches!(state.identity_status, crate::IdentityStatus::Ready(_))
+            && !peer_is_local
+            && !listener_active
+    });
+    let own =
+        l.panel(
+            column![
+            l.label("SUA CHAVE PÚBLICA DO DISPOSITIVO", 10.0, GOLD),
+            l.label(own_key, 11.0, PAPER),
+            l.control("key", "Copiar minha chave", Some(Message::CopyDeviceKey), false),
+            l.label(
+                "Esta chave identifica este dispositivo; nome e familiar são apenas perfil local.",
+                10.0,
+                MUTED
+            )
         ]
-        .spacing(l.px(14.0)),
-    )
+            .spacing(l.px(12.0)),
+        );
+    let peer = l.panel(
+        column![
+            l.label("CHAVE PÚBLICA DO PEER", 10.0, GOLD),
+            l.input_maybe(
+                "Cole os 64 caracteres hexadecimais",
+                &state.peer_public_key,
+                (!listener_active)
+                    .then_some(Message::PeerPublicKeyChanged as fn(String) -> Message)
+            ),
+            l.label(
+                state.peer_verification_status.clone(),
+                11.0,
+                if state.peer_key_verified { GREEN } else { GOLD }
+            ),
+            l.control(
+                if state.peer_key_verified {
+                    "close"
+                } else {
+                    "check"
+                },
+                if state.peer_key_verified {
+                    "Remover verificação local"
+                } else {
+                    "Marcar como conferida"
+                },
+                can_toggle.then_some(Message::TogglePeerVerification),
+                state.peer_key_verified
+            ),
+        ]
+        .spacing(l.px(12.0)),
+    );
+    let instructions = l.panel(
+        column![
+            l.label("COMO CONFERIR", 10.0, GOLD),
+            l.label(
+                "Troque a chave completa por um canal independente (por exemplo, pessoalmente ou em uma chamada confiável). Compare todos os 64 caracteres nos dois dispositivos antes de marcar como conferida.",
+                11.0,
+                PAPER
+            ),
+            l.label(
+                "A marcação fica somente neste perfil cifrado e se aplica apenas a esta chave. Uma chave diferente nunca herda a confiança. QR e códigos curtos ainda não estão implementados.",
+                10.0,
+                MUTED
+            ),
+            l.control(
+                "chat",
+                "Voltar ao texto direto",
+                Some(Message::Navigate(Screen::Chat)),
+                false
+            )
+        ]
+        .spacing(l.px(12.0)),
+    );
+    let body = column![
+        column![
+            l.title("Conferir identidade do peer", 32.0),
+            l.label(
+                "VERIFICAÇÃO MANUAL · CHAVE DO DISPOSITIVO · ARMAZENAMENTO LOCAL",
+                10.0,
+                VIOLET
+            )
+        ]
+        .spacing(l.px(8.0)),
+        row![own, peer].spacing(l.px(16.0)),
+        instructions
+    ]
+    .spacing(l.px(16.0));
+    l.place(l.panel(body), 24.0, 80.0, 1232.0, 676.0)
 }
 
 fn components(l: Layout) -> Element<'static, Message> {
