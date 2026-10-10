@@ -237,14 +237,19 @@ be installed and available in the user session.
 
 ![Actual native Iced group-call preview; media and sample messages are illustrative](docs/design/runtime/native-vhs/10-call.png)
 
-![Actual 1884 × 1000 native Iced MLS screen describing the direct KeyPackage and Welcome session flow](docs/design/runtime/native-vhs/11-mls.png)
+![Actual 1884 × 1000 native Iced MLS group screen; this capture has no Secret Service, so no local identity or group is available](docs/design/runtime/native-vhs/11-mls.png)
 
 ![Actual native Iced Network and P2P settings with the delegated MLS copy consent control; Secret Service is unavailable in this capture, so the local policy cannot load](docs/design/runtime/native-vhs/02-settings.png)
 
-The Network and P2P settings now expose persisted opt-in for delegated
-encrypted MLS copies, with the local quota and expiry policy beside the
-control. Transport and recipient fetch are still pending, so this consent
-setting alone does not provide offline delivery.
+The Network and P2P settings expose persisted opt-in for delegated encrypted
+MLS copies, with the local quota and expiry policy beside the control. QUIC v8
+transports signed author grants and lets a reconnecting recipient fetch up to
+16 authorized copies per connection. When direct delivery fails, the MLS
+fan-out action tries a reachable routed group member that opted in. The helper
+ACK stays separate from recipient delivery; the author's outbox remains
+queued until the target device accepts the event. Helper retention is
+best-effort within the configured quota and expiry.
+Turning off consent erases every queued ciphertext copy from that device.
 
 The MLS screen now detects authenticated committer equivocation. It verifies a
 conflicting historical Commit against a saved OpenMLS epoch snapshot, stores
@@ -260,8 +265,9 @@ The eleven design-board views and additional MLS screen are captured in [native-
 These are a first implementation of the visual direction, with comparison
 at 1280 × 800 and a compact 960 × 640 window. Exact visual parity,
 accessibility, and live media integration remain to be completed.
-The current direct transport and MLS recovery frames are specified in the
-[v7 peer protocol](docs/fichas/transport/lan-peer-v7.md).
+The current direct transport and delegated-copy frames are specified in the
+[v8 peer protocol](docs/fichas/transport/lan-peer-v8.md). Version 7 remains as
+the prior compatibility contract.
 
 ## Reproduce native captures
 

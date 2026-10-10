@@ -24,11 +24,20 @@ store. It accepts ciphertext only with an Ed25519 grant from the authenticated
 author device, bound to one recipient and one event digest. It enforces a 64
 MiB / 4,096-event holder quota, a 32 KiB item limit, and a 30-day maximum TTL;
 it retains bounded deduplication receipts and removes ciphertext after ACK or
-expiry. Network & P2P settings expose the persisted opt-in and bounded policy.
+expiry. Disabling consent erases all queued ciphertext immediately and retains
+only bounded deduplication tombstones. Network & P2P settings expose the
+persisted opt-in and bounded policy.
 The control is unavailable while the OS credential store cannot unlock the
-local encrypted profile. Peer transport, recipient fetch and multi-holder
-replication are still pending, so consent alone does not provide offline
-delivery.
+local encrypted profile. Peer transport and recipient fetch are now present in
+QUIC v8. On connect, the client requests up to 16
+copies addressed to its device; the holder requires its opt-in and ACKs only
+after durable storage, while the recipient verifies the author's grant and
+persists the MLS event before ACK. The helper deletes its copy after that ACK.
+The MLS fan-out action tries a reachable routed group peer to retain copies
+when a recipient route cannot be reached. Helper ACKs remain separate from
+recipient delivery; the author's outbox stays queued until the target device
+accepts the event. Fetch is limited to 16 copies per connection, and helper
+retention is best-effort rather than an availability guarantee.
 
 Before applying a next-epoch Commit, the client stores the prior OpenMLS group
 state in the encrypted profile database. If a different Commit later arrives
@@ -84,5 +93,5 @@ screen capture, contact discovery, verified pairing, relay, and offline delivery
 are not implemented. The older web UI under
 `prototypes/web/` is a design benchmark, not the product runtime.
 
-See [direct peer transport v7](../transport/lan-peer-v7.md) for the direct session
+See [direct peer transport v8](../transport/lan-peer-v8.md) for the direct session
 contract and [the Iced design plan](iced-design.md) for visual references.

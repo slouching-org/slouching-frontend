@@ -189,13 +189,36 @@ pub enum DelegatedCopyStoreResult {
 }
 
 pub fn set_delegated_mls_storage_policy(enabled: bool, quota_bytes: i64) -> Result<(), String> {
+    let mut connection = open_local_database()?;
+    set_delegated_mls_storage_policy_in(&mut connection, enabled, quota_bytes, unix_time_now()?)
+}
+
+fn set_delegated_mls_storage_policy_in(
+    connection: &mut Connection,
+    enabled: bool,
+    quota_bytes: i64,
+    now: i64,
+) -> Result<(), String> {
     if !(0..=MAX_DELEGATED_STORAGE_BYTES).contains(&quota_bytes) {
         return Err(format!(
             "delegated storage quota must be between 0 and {MAX_DELEGATED_STORAGE_BYTES} bytes"
         ));
     }
-    let connection = open_local_database()?;
-    let used_bytes: i64 = connection
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("could not begin delegated storage policy update: {error}"))?;
+    if !enabled {
+        transaction
+            .execute(
+                "UPDATE local_delegated_mls_copies
+                 SET delivery_state = 'expired', ciphertext = NULL
+                 WHERE delivery_state = 'queued'",
+                [],
+            )
+            .map_err(|error| format!("could not erase opted-out delegated copies: {error}"))?;
+        cleanup_delegated_mls_tombstones(&transaction, now)?;
+    }
+    let used_bytes: i64 = transaction
         .query_row(
             "SELECT COALESCE(SUM(length(ciphertext)), 0)
              FROM local_delegated_mls_copies WHERE delivery_state = 'queued'",
@@ -203,16 +226,18 @@ pub fn set_delegated_mls_storage_policy(enabled: bool, quota_bytes: i64) -> Resu
             |row| row.get(0),
         )
         .map_err(|error| format!("could not read delegated storage usage: {error}"))?;
-    if quota_bytes < used_bytes {
+    if enabled && quota_bytes < used_bytes {
         return Err("delegated storage quota cannot be lower than current usage".to_owned());
     }
-    connection
+    transaction
         .execute(
             "UPDATE local_delegation_policy SET enabled = ?1, quota_bytes = ?2 WHERE id = 1",
             params![enabled, quota_bytes],
         )
         .map_err(|error| format!("could not save delegated storage policy: {error}"))?;
-    Ok(())
+    transaction
+        .commit()
+        .map_err(|error| format!("could not commit delegated storage policy: {error}"))
 }
 
 pub fn load_delegated_mls_storage_status() -> Result<DelegatedMlsStorageStatus, String> {
@@ -2925,6 +2950,19 @@ pub fn store_delegated_mls_copy(
     )
 }
 
+/// Verifies an author's signed copy grant and exact ciphertext envelope.
+/// The recipient device key must be the current local device identity.
+pub fn verify_delegated_mls_copy(
+    grant: &DelegatedMlsCopyGrant,
+    event: &EncryptedEvent,
+    recipient_device: [u8; 32],
+) -> Result<(), String> {
+    if grant.recipient_device != recipient_device {
+        return Err("delegated MLS copy targets another device".to_owned());
+    }
+    validate_delegated_copy_grant(grant, event, grant.author_device, unix_time_now()?)
+}
+
 fn store_delegated_mls_copy_in(
     connection: &mut Connection,
     grant: &DelegatedMlsCopyGrant,
@@ -2967,7 +3005,7 @@ fn store_delegated_mls_copy_in(
         )
         .optional()
         .map_err(|error| format!("could not check delegated MLS copy deduplication: {error}"))?;
-    if let Some((digest, author, group, epoch, checkpoint, expires, signature, _state)) = existing {
+    if let Some((digest, author, group, epoch, checkpoint, expires, signature, state)) = existing {
         if digest != grant.ciphertext_digest
             || author != grant.author_device
             || group != grant.group_id
@@ -2979,6 +3017,9 @@ fn store_delegated_mls_copy_in(
             return Err(
                 "delegated event ID was reused with different content or authorization".to_owned(),
             );
+        }
+        if state == "expired" {
+            return Err("delegated copy is no longer retained by this device".to_owned());
         }
         transaction.commit().map_err(|error| {
             format!("could not finish delegated MLS copy deduplication: {error}")
@@ -6577,7 +6618,7 @@ mod tests {
             .expect("helper database should initialize");
         let author = SigningKey::from_bytes(&[0xa2; 32]);
         let recipient = [0xa3; 32];
-        let now = 2_000_000_000;
+        let now = unix_time_now().expect("system clock should be valid");
         let event = EncryptedEvent {
             event_id: [0xa4; 16],
             author_device: author.verifying_key().to_bytes(),
@@ -6652,6 +6693,11 @@ mod tests {
         assert_eq!(copies.len(), 1);
         assert_eq!(copies[0].grant, grant);
         assert_eq!(copies[0].ciphertext, event.ciphertext);
+        assert!(verify_delegated_mls_copy(&grant, &event, recipient).is_ok());
+        assert!(verify_delegated_mls_copy(&grant, &event, [0xa7; 32]).is_err());
+        let mut altered_grant = grant.clone();
+        altered_grant.signature[0] ^= 1;
+        assert!(verify_delegated_mls_copy(&altered_grant, &event, recipient).is_err());
         assert!(
             !acknowledge_delegated_mls_copy_in(&connection, event.event_id, [0xa7; 32], now)
                 .expect("wrong recipient should not acknowledge another device's copy")
@@ -6731,6 +6777,47 @@ mod tests {
             )
             .expect("expired receipt tombstone should persist");
         assert_eq!(expired_state, ("expired".to_owned(), None));
+        let opt_out_event = EncryptedEvent {
+            event_id: [0xaa; 16],
+            expires_at_unix: now + 40,
+            ciphertext: b"retain?".to_vec(),
+            ..event.clone()
+        };
+        let opt_out_grant =
+            sign_delegated_mls_copy_grant_with_identity(&opt_out_event, recipient, &author)
+                .expect("author should sign the opt-out test copy");
+        assert_eq!(
+            store_delegated_mls_copy_in(
+                &mut connection,
+                &opt_out_grant,
+                &opt_out_event,
+                event.author_device,
+                now,
+            )
+            .expect("enabled helper should store the copy before opt-out"),
+            DelegatedCopyStoreResult::Stored
+        );
+        set_delegated_mls_storage_policy_in(&mut connection, false, 0, now)
+            .expect("opting out should erase retained ciphertext even when lowering quota");
+        let opted_out_state: (String, Option<Vec<u8>>) = connection
+            .query_row(
+                "SELECT delivery_state, ciphertext FROM local_delegated_mls_copies
+                 WHERE event_id = ?1 AND recipient_device = ?2",
+                params![opt_out_event.event_id.as_slice(), recipient.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("opt-out tombstone should remain for deduplication");
+        assert_eq!(opted_out_state, ("expired".to_owned(), None));
+        assert!(
+            store_delegated_mls_copy_in(
+                &mut connection,
+                &opt_out_grant,
+                &opt_out_event,
+                event.author_device,
+                now,
+            )
+            .is_err()
+        );
         drop(connection);
         fs::remove_dir_all(directory).expect("temporary helper database should be removed");
     }

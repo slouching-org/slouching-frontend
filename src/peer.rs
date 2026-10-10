@@ -10,9 +10,9 @@ use tokio::{
 };
 
 /// Direct-only protocol version used for persistent paired-device text sessions.
-pub const PEER_ALPN: &[u8] = b"org.slouching.peer/7";
+pub const PEER_ALPN: &[u8] = b"org.slouching.peer/8";
 const FRAME_MAGIC: &[u8; 4] = b"SLCH";
-const FRAME_VERSION: u16 = 7;
+const FRAME_VERSION: u16 = 8;
 const FRAME_DATA: u8 = 1;
 const FRAME_ACK: u8 = 2;
 const FRAME_CLOSE: u8 = 3;
@@ -24,6 +24,8 @@ const FRAME_MLS_COMMIT_REQUEST: u8 = 8;
 const FRAME_MLS_PROPOSAL: u8 = 9;
 const FRAME_MLS_KEY_PACKAGE: u8 = 10;
 const FRAME_MLS_WELCOME: u8 = 11;
+const FRAME_MLS_DELEGATED_COPY: u8 = 12;
+const FRAME_MLS_COPY_FETCH: u8 = 13;
 const MLS_EVENT_MAGIC: &[u8; 4] = b"SLME";
 const MLS_EVENT_VERSION: u16 = 1;
 const MLS_COMMIT_MAGIC: &[u8; 4] = b"SLMC";
@@ -34,12 +36,15 @@ const MLS_KEY_PACKAGE_MAGIC: &[u8; 4] = b"SLKP";
 const MLS_KEY_PACKAGE_VERSION: u16 = 1;
 const MLS_WELCOME_MAGIC: &[u8; 4] = b"SLMW";
 const MLS_WELCOME_VERSION: u16 = 1;
+const MLS_DELEGATED_COPY_MAGIC: &[u8; 4] = b"SLDG";
+const MLS_DELEGATED_COPY_VERSION: u16 = 1;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
 const MAX_MLS_EVENT_BYTES: usize = 64 * 1024;
 const MAX_MLS_COMMIT_BYTES: usize = 64 * 1024;
 const MAX_MLS_PROPOSAL_BYTES: usize = 64 * 1024;
 const MAX_MLS_KEY_PACKAGE_BYTES: usize = 64 * 1024;
 const MAX_MLS_WELCOME_BYTES: usize = 256 * 1024;
+const MAX_MLS_DELEGATED_COPY_BYTES: usize = 96 * 1024;
 const MAX_CHECKPOINT_BYTES: usize = 16 * 1024;
 pub const MAX_PENDING_MESSAGES: usize = 16;
 const MAX_MLS_COMMIT_REQUESTS_PER_SESSION: u8 = 16;
@@ -100,6 +105,19 @@ pub struct MlsWelcomeEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegatedMlsCopyGrant {
+    pub event_id: [u8; 16],
+    pub author_device: [u8; 32],
+    pub recipient_device: [u8; 32],
+    pub group_id: [u8; 16],
+    pub epoch: u64,
+    pub expires_at_unix: i64,
+    pub checkpoint: Option<Vec<u8>>,
+    pub ciphertext_digest: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerAcceptError {
     Unauthorized(EndpointId),
     Failed(String),
@@ -131,6 +149,16 @@ pub enum PeerCommand {
         request_id: u64,
         welcome: MlsWelcomeEnvelope,
     },
+    #[allow(dead_code)]
+    SendDelegatedMlsCopy {
+        request_id: u64,
+        #[allow(dead_code)]
+        grant: Box<DelegatedMlsCopyGrant>,
+        #[allow(dead_code)]
+        event: Box<MlsEventEnvelope>,
+    },
+    #[allow(dead_code)]
+    RequestDelegatedMlsCopies,
     RequestMlsCommit {
         group_id: Vec<u8>,
         predecessor_epoch: u64,
@@ -182,6 +210,15 @@ pub enum PeerEvent {
         peer_id: EndpointId,
         welcome: MlsWelcomeEnvelope,
     },
+    DelegatedMlsCopyReceived {
+        sequence: u64,
+        peer_id: EndpointId,
+        grant: Box<DelegatedMlsCopyGrant>,
+        event: Box<MlsEventEnvelope>,
+    },
+    DelegatedMlsCopiesRequested {
+        peer_id: EndpointId,
+    },
     MlsCommitRequested {
         peer_id: EndpointId,
         group_id: Vec<u8>,
@@ -202,6 +239,9 @@ pub enum PeerEvent {
     MlsWelcomeAcknowledged {
         request_id: u64,
     },
+    DelegatedMlsCopyAcknowledged {
+        request_id: u64,
+    },
     MlsEventRejected {
         request_id: u64,
         reason: String,
@@ -219,6 +259,10 @@ pub enum PeerEvent {
         reason: String,
     },
     MlsWelcomeRejected {
+        request_id: u64,
+        reason: String,
+    },
+    DelegatedMlsCopyRejected {
         request_id: u64,
         reason: String,
     },
@@ -245,6 +289,9 @@ pub enum PeerEvent {
     MlsWelcomeDeliveryUnknown {
         request_id: u64,
     },
+    DelegatedMlsCopyDeliveryUnknown {
+        request_id: u64,
+    },
     #[allow(dead_code)]
     Unauthorized {
         peer_id: EndpointId,
@@ -266,6 +313,7 @@ enum PendingOutbound {
     MlsProposal { request_id: u64 },
     MlsKeyPackage { request_id: u64 },
     MlsWelcome { request_id: u64 },
+    DelegatedMlsCopy { request_id: u64 },
 }
 
 pub struct DirectPeerSession {
@@ -302,6 +350,12 @@ enum Frame {
         sequence: u64,
         welcome: MlsWelcomeEnvelope,
     },
+    DelegatedMlsCopy {
+        sequence: u64,
+        grant: Box<DelegatedMlsCopyGrant>,
+        event: Box<MlsEventEnvelope>,
+    },
+    MlsCopyFetch,
     MlsCommitRequest {
         group_id: Vec<u8>,
         predecessor_epoch: u64,
@@ -395,24 +449,29 @@ impl DirectPeerListener {
                 | PeerEvent::MlsProposalReceived { .. }
                 | PeerEvent::MlsKeyPackageReceived { .. }
                 | PeerEvent::MlsWelcomeReceived { .. }
+                | PeerEvent::DelegatedMlsCopyReceived { .. }
+                | PeerEvent::DelegatedMlsCopiesRequested { .. }
                 | PeerEvent::MlsCommitRequested { .. }
                 | PeerEvent::MlsEventAcknowledged { .. }
                 | PeerEvent::MlsCommitAcknowledged { .. }
                 | PeerEvent::MlsProposalAcknowledged { .. }
                 | PeerEvent::MlsKeyPackageAcknowledged { .. }
                 | PeerEvent::MlsWelcomeAcknowledged { .. }
+                | PeerEvent::DelegatedMlsCopyAcknowledged { .. }
                 | PeerEvent::MlsEventRejected { .. }
                 | PeerEvent::MlsCommitRejected { .. }
                 | PeerEvent::MlsProposalRejected { .. }
                 | PeerEvent::MlsKeyPackageRejected { .. }
                 | PeerEvent::MlsWelcomeRejected { .. }
+                | PeerEvent::DelegatedMlsCopyRejected { .. }
                 | PeerEvent::Rejected { .. }
                 | PeerEvent::DeliveryUnknown { .. }
                 | PeerEvent::MlsEventDeliveryUnknown { .. }
                 | PeerEvent::MlsCommitDeliveryUnknown { .. }
                 | PeerEvent::MlsProposalDeliveryUnknown { .. }
                 | PeerEvent::MlsKeyPackageDeliveryUnknown { .. }
-                | PeerEvent::MlsWelcomeDeliveryUnknown { .. } => {}
+                | PeerEvent::MlsWelcomeDeliveryUnknown { .. }
+                | PeerEvent::DelegatedMlsCopyDeliveryUnknown { .. } => {}
             }
         }
         received.ok_or_else(|| "peer session ended before receiving text".to_owned())
@@ -439,6 +498,7 @@ impl DirectPeerSession {
             let mut next_out_sequence = 1_u64;
             let mut next_in_sequence = 1_u64;
             let mut received_commit_requests = 0_u8;
+            let mut received_copy_fetch = false;
             let mut seen_commit_requests = std::collections::HashSet::new();
             let mut closing = false;
             let mut close_deadline = Box::pin(tokio::time::sleep(CLOSE_TIMEOUT));
@@ -510,6 +570,24 @@ impl DirectPeerSession {
                                 next_in_sequence = next;
                                 pending_inbound.insert(sequence);
                                 yield PeerEvent::MlsCommitReceived { sequence, commit };
+                            }
+                            Some(Ok(Frame::DelegatedMlsCopy { sequence, grant, event })) => {
+                                if closing || sequence != next_in_sequence || pending_inbound.len() >= MAX_PENDING_MESSAGES {
+                                    break 'session "invalid or excessive delegated-copy sequence".to_owned();
+                                }
+                                let Some(next) = next_in_sequence.checked_add(1) else {
+                                    break 'session "inbound message sequence exhausted".to_owned();
+                                };
+                                next_in_sequence = next;
+                                pending_inbound.insert(sequence);
+                                yield PeerEvent::DelegatedMlsCopyReceived { sequence, peer_id: self.peer_id, grant, event };
+                            }
+                            Some(Ok(Frame::MlsCopyFetch)) => {
+                                if received_copy_fetch {
+                                    break 'session "peer requested delegated copies more than once".to_owned();
+                                }
+                                received_copy_fetch = true;
+                                yield PeerEvent::DelegatedMlsCopiesRequested { peer_id: self.peer_id };
                             }
                             Some(Ok(Frame::MlsProposal { sequence, proposal })) => {
                                 if closing {
@@ -612,6 +690,9 @@ impl DirectPeerSession {
                                     PendingOutbound::MlsWelcome { request_id } => {
                                         yield PeerEvent::MlsWelcomeAcknowledged { request_id };
                                     }
+                                    PendingOutbound::DelegatedMlsCopy { request_id } => {
+                                        yield PeerEvent::DelegatedMlsCopyAcknowledged { request_id };
+                                    }
                                 }
                             }
                             Some(Ok(Frame::Reject { sequence, reason })) => {
@@ -625,6 +706,7 @@ impl DirectPeerSession {
                                     PendingOutbound::MlsProposal { request_id } => yield PeerEvent::MlsProposalRejected { request_id, reason },
                                     PendingOutbound::MlsKeyPackage { request_id } => yield PeerEvent::MlsKeyPackageRejected { request_id, reason },
                                     PendingOutbound::MlsWelcome { request_id } => yield PeerEvent::MlsWelcomeRejected { request_id, reason },
+                                    PendingOutbound::DelegatedMlsCopy { request_id } => yield PeerEvent::DelegatedMlsCopyRejected { request_id, reason },
                                 }
                             }
                             Some(Ok(Frame::Close)) => {
@@ -799,6 +881,33 @@ impl DirectPeerSession {
                                 }
                                 next_out_sequence = next;
                             }
+                            Some(PeerCommand::SendDelegatedMlsCopy { request_id, grant, event }) => {
+                                let payload = match encode_delegated_mls_copy(&grant, &event) {
+                                    Ok(payload) => payload,
+                                    Err(reason) => {
+                                        yield PeerEvent::DelegatedMlsCopyRejected { request_id, reason };
+                                        continue;
+                                    }
+                                };
+                                if pending_sends.len() >= MAX_PENDING_MESSAGES {
+                                    yield PeerEvent::DelegatedMlsCopyRejected { request_id, reason: "too many pending peer messages".into() };
+                                    continue;
+                                }
+                                let sequence = next_out_sequence;
+                                let Some(next) = next_out_sequence.checked_add(1) else {
+                                    break 'session "outbound message sequence exhausted".to_owned();
+                                };
+                                pending_sends.insert(sequence, PendingOutbound::DelegatedMlsCopy { request_id });
+                                if let Err(error) = write_frame(&mut self.send, FRAME_MLS_DELEGATED_COPY, sequence, &payload).await {
+                                    break 'session format!("could not send delegated MLS copy: {error}");
+                                }
+                                next_out_sequence = next;
+                            }
+                            Some(PeerCommand::RequestDelegatedMlsCopies) => {
+                                if let Err(error) = write_frame(&mut self.send, FRAME_MLS_COPY_FETCH, 0, &[]).await {
+                                    break 'session format!("could not request delegated MLS copies: {error}");
+                                }
+                            }
                             Some(PeerCommand::RequestMlsCommit { group_id, predecessor_epoch }) => {
                                 if group_id.len() != 16 || predecessor_epoch > i64::MAX as u64 {
                                     continue;
@@ -871,6 +980,9 @@ impl DirectPeerSession {
                     }
                     PendingOutbound::MlsWelcome { request_id } => {
                         yield PeerEvent::MlsWelcomeDeliveryUnknown { request_id };
+                    }
+                    PendingOutbound::DelegatedMlsCopy { request_id } => {
+                        yield PeerEvent::DelegatedMlsCopyDeliveryUnknown { request_id };
                     }
                 }
             }
@@ -981,17 +1093,21 @@ pub async fn send_once(
             | PeerEvent::MlsProposalReceived { .. }
             | PeerEvent::MlsKeyPackageReceived { .. }
             | PeerEvent::MlsWelcomeReceived { .. }
+            | PeerEvent::DelegatedMlsCopyReceived { .. }
+            | PeerEvent::DelegatedMlsCopiesRequested { .. }
             | PeerEvent::MlsCommitRequested { .. }
             | PeerEvent::MlsEventAcknowledged { .. }
             | PeerEvent::MlsCommitAcknowledged { .. }
             | PeerEvent::MlsProposalAcknowledged { .. }
             | PeerEvent::MlsKeyPackageAcknowledged { .. }
             | PeerEvent::MlsWelcomeAcknowledged { .. }
+            | PeerEvent::DelegatedMlsCopyAcknowledged { .. }
             | PeerEvent::MlsEventRejected { .. }
             | PeerEvent::MlsCommitRejected { .. }
             | PeerEvent::MlsProposalRejected { .. }
             | PeerEvent::MlsKeyPackageRejected { .. }
             | PeerEvent::MlsWelcomeRejected { .. }
+            | PeerEvent::DelegatedMlsCopyRejected { .. }
             | PeerEvent::Unauthorized { .. } => {}
             PeerEvent::MlsEventDeliveryUnknown { .. } => {
                 return Err("MLS event delivery could not be confirmed".to_owned());
@@ -1007,6 +1123,9 @@ pub async fn send_once(
             }
             PeerEvent::MlsWelcomeDeliveryUnknown { .. } => {
                 return Err("MLS Welcome delivery could not be confirmed".to_owned());
+            }
+            PeerEvent::DelegatedMlsCopyDeliveryUnknown { .. } => {
+                return Err("delegated MLS copy delivery could not be confirmed".to_owned());
             }
         }
     }
@@ -1143,6 +1262,24 @@ where
                 welcome: decode_mls_welcome(&bytes)?,
             })
         }
+        FRAME_MLS_DELEGATED_COPY
+            if (1..=MAX_MLS_DELEGATED_COPY_BYTES).contains(&length) && sequence != 0 =>
+        {
+            let mut bytes = vec![0_u8; length];
+            reader
+                .read_exact(&mut bytes)
+                .await
+                .map_err(|error| format!("could not read delegated MLS copy: {error}"))?;
+            let (grant, event) = decode_delegated_mls_copy(&bytes)?;
+            Ok(Frame::DelegatedMlsCopy {
+                sequence,
+                grant: Box::new(grant),
+                event: Box::new(event),
+            })
+        }
+        FRAME_MLS_DELEGATED_COPY => Err("peer sent an invalid delegated MLS copy frame".to_owned()),
+        FRAME_MLS_COPY_FETCH if length == 0 && sequence == 0 => Ok(Frame::MlsCopyFetch),
+        FRAME_MLS_COPY_FETCH => Err("peer sent an invalid delegated MLS copy request".to_owned()),
         FRAME_MLS_COMMIT_REQUEST if length == 24 && sequence == 0 => {
             let mut group_id = vec![0; 16];
             reader
@@ -1499,6 +1636,117 @@ fn decode_mls_commit(bytes: &[u8]) -> Result<MlsCommitEnvelope, String> {
         epoch,
         commit: bytes[cursor..].to_vec(),
     })
+}
+
+fn encode_delegated_mls_copy(
+    grant: &DelegatedMlsCopyGrant,
+    event: &MlsEventEnvelope,
+) -> Result<Vec<u8>, String> {
+    let event_bytes = encode_mls_event(event)?;
+    let checkpoint = grant.checkpoint.as_deref().unwrap_or_default();
+    if checkpoint.len() > MAX_CHECKPOINT_BYTES
+        || event_bytes.len().saturating_add(checkpoint.len()) > MAX_MLS_DELEGATED_COPY_BYTES
+        || grant.event_id != event.event_id
+        || grant.author_device != event.author_device
+        || grant.group_id.as_slice() != event.group_id.as_slice()
+        || grant.epoch != event.epoch
+        || grant.expires_at_unix != event.expires_at_unix
+        || grant.checkpoint != event.checkpoint
+        || blake3::hash(&event.ciphertext).as_bytes() != &grant.ciphertext_digest
+    {
+        return Err("delegated MLS grant does not match its event envelope".to_owned());
+    }
+    let mut output = Vec::with_capacity(224 + checkpoint.len() + event_bytes.len());
+    output.extend_from_slice(MLS_DELEGATED_COPY_MAGIC);
+    output.extend_from_slice(&MLS_DELEGATED_COPY_VERSION.to_be_bytes());
+    output.extend_from_slice(&grant.event_id);
+    output.extend_from_slice(&grant.author_device);
+    output.extend_from_slice(&grant.recipient_device);
+    output.extend_from_slice(&grant.group_id);
+    output.extend_from_slice(&grant.epoch.to_be_bytes());
+    output.extend_from_slice(&grant.expires_at_unix.to_be_bytes());
+    output.extend_from_slice(&(checkpoint.len() as u32).to_be_bytes());
+    output.extend_from_slice(checkpoint);
+    output.extend_from_slice(&grant.ciphertext_digest);
+    output.extend_from_slice(&grant.signature);
+    output.extend_from_slice(&(event_bytes.len() as u32).to_be_bytes());
+    output.extend_from_slice(&event_bytes);
+    if output.len() > MAX_MLS_DELEGATED_COPY_BYTES {
+        return Err("delegated MLS copy exceeds the transport limit".to_owned());
+    }
+    Ok(output)
+}
+
+fn decode_delegated_mls_copy(
+    bytes: &[u8],
+) -> Result<(DelegatedMlsCopyGrant, MlsEventEnvelope), String> {
+    const FIXED: usize = 4 + 2 + 16 + 32 + 32 + 16 + 8 + 8 + 4 + 32 + 64 + 4;
+    if bytes.len() < FIXED
+        || bytes.len() > MAX_MLS_DELEGATED_COPY_BYTES
+        || &bytes[..4] != MLS_DELEGATED_COPY_MAGIC
+    {
+        return Err("invalid or oversized delegated MLS copy".to_owned());
+    }
+    let version = u16::from_be_bytes(bytes[4..6].try_into().unwrap());
+    if version != MLS_DELEGATED_COPY_VERSION {
+        return Err(format!("unsupported delegated MLS copy version: {version}"));
+    }
+    let mut cursor = 6;
+    let event_id = bytes[cursor..cursor + 16].try_into().unwrap();
+    cursor += 16;
+    let author_device = bytes[cursor..cursor + 32].try_into().unwrap();
+    cursor += 32;
+    let recipient_device = bytes[cursor..cursor + 32].try_into().unwrap();
+    cursor += 32;
+    let group_id = bytes[cursor..cursor + 16].try_into().unwrap();
+    cursor += 16;
+    let epoch = u64::from_be_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+    cursor += 8;
+    let expires_at_unix = i64::from_be_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+    cursor += 8;
+    let checkpoint_len = u32::from_be_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+    cursor += 4;
+    if checkpoint_len > MAX_CHECKPOINT_BYTES
+        || cursor
+            .checked_add(checkpoint_len + 32 + 64 + 4)
+            .is_none_or(|end| end > bytes.len())
+    {
+        return Err("delegated MLS checkpoint length is invalid".to_owned());
+    }
+    let checkpoint = (checkpoint_len > 0).then(|| bytes[cursor..cursor + checkpoint_len].to_vec());
+    cursor += checkpoint_len;
+    let ciphertext_digest = bytes[cursor..cursor + 32].try_into().unwrap();
+    cursor += 32;
+    let signature = bytes[cursor..cursor + 64].try_into().unwrap();
+    cursor += 64;
+    let event_len = u32::from_be_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+    cursor += 4;
+    if event_len == 0 || cursor.checked_add(event_len) != Some(bytes.len()) {
+        return Err("delegated MLS event length is invalid".to_owned());
+    }
+    let grant = DelegatedMlsCopyGrant {
+        event_id,
+        author_device,
+        recipient_device,
+        group_id,
+        epoch,
+        expires_at_unix,
+        checkpoint,
+        ciphertext_digest,
+        signature,
+    };
+    let event = decode_mls_event(&bytes[cursor..])?;
+    if grant.event_id != event.event_id
+        || grant.author_device != event.author_device
+        || grant.group_id.as_slice() != event.group_id.as_slice()
+        || grant.epoch != event.epoch
+        || grant.expires_at_unix != event.expires_at_unix
+        || grant.checkpoint != event.checkpoint
+        || blake3::hash(&event.ciphertext).as_bytes() != &grant.ciphertext_digest
+    {
+        return Err("delegated MLS grant metadata or ciphertext digest does not match".to_owned());
+    }
+    Ok((grant, event))
 }
 
 fn encode_mls_event(event: &MlsEventEnvelope) -> Result<Vec<u8>, String> {
@@ -2043,6 +2291,176 @@ mod tests {
                 welcome,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn delegated_mls_copy_frame_round_trips_and_binds_ciphertext() {
+        let ciphertext = vec![0x91; 96];
+        let event = MlsEventEnvelope {
+            event_id: [0x92; 16],
+            author_device: [0x93; 32],
+            group_id: [0x94; 16].to_vec(),
+            epoch: 7,
+            checkpoint: Some(vec![0x95; 8]),
+            expires_at_unix: 1_900_000_000,
+            ciphertext,
+        };
+        let grant = DelegatedMlsCopyGrant {
+            event_id: event.event_id,
+            author_device: event.author_device,
+            recipient_device: [0x96; 32],
+            group_id: [0x94; 16],
+            epoch: event.epoch,
+            expires_at_unix: event.expires_at_unix,
+            checkpoint: event.checkpoint.clone(),
+            ciphertext_digest: *blake3::hash(&event.ciphertext).as_bytes(),
+            signature: [0x97; 64],
+        };
+        let payload = encode_delegated_mls_copy(&grant, &event).unwrap();
+        assert_eq!(
+            decode_delegated_mls_copy(&payload).unwrap(),
+            (grant.clone(), event.clone())
+        );
+        let (mut writer, mut reader) = duplex(2048);
+        write_frame(&mut writer, FRAME_MLS_DELEGATED_COPY, 6, &payload)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_frame(&mut reader).await.unwrap(),
+            Frame::DelegatedMlsCopy {
+                sequence: 6,
+                grant: Box::new(grant),
+                event: Box::new(event)
+            }
+        );
+
+        let mut tampered = payload;
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(decode_delegated_mls_copy(&tampered).is_err());
+    }
+
+    #[tokio::test]
+    async fn delegated_mls_copy_fetch_is_a_zero_sequence_control_frame() {
+        let (mut writer, mut reader) = duplex(64);
+        write_frame(&mut writer, FRAME_MLS_COPY_FETCH, 0, &[])
+            .await
+            .unwrap();
+        assert_eq!(read_frame(&mut reader).await.unwrap(), Frame::MlsCopyFetch);
+    }
+
+    #[tokio::test]
+    async fn direct_session_fetches_delegated_copy_and_acks_recipient_delivery() {
+        let holder_key = SecretKey::from_bytes(&[0x61; 32]);
+        let recipient_key = SecretKey::from_bytes(&[0x62; 32]);
+        let recipient_device = *recipient_key.public().as_bytes();
+        let listener = bind_listener(
+            holder_key.clone(),
+            "127.0.0.1:0".parse().unwrap(),
+            recipient_key.public(),
+        )
+        .await
+        .unwrap();
+        let holder_id = listener.id();
+        let address = listener
+            .direct_addresses()
+            .into_iter()
+            .find(|address| address.ip().is_loopback())
+            .unwrap();
+        let event = MlsEventEnvelope {
+            event_id: [0x63; 16],
+            author_device: [0x64; 32],
+            group_id: [0x65; 16].to_vec(),
+            epoch: 3,
+            checkpoint: None,
+            expires_at_unix: 1_900_000_000,
+            ciphertext: vec![0x66; 64],
+        };
+        let grant = DelegatedMlsCopyGrant {
+            event_id: event.event_id,
+            author_device: event.author_device,
+            recipient_device,
+            group_id: [0x65; 16],
+            epoch: event.epoch,
+            expires_at_unix: event.expires_at_unix,
+            checkpoint: None,
+            ciphertext_digest: *blake3::hash(&event.ciphertext).as_bytes(),
+            signature: [0x67; 64],
+        };
+        let copy_event = event.clone();
+        let expected_grant = grant.clone();
+        let holder_task = tokio::spawn(async move {
+            let session = listener.accept_session().await.unwrap();
+            let (commands, receiver) = mpsc::channel(4);
+            let mut events = Box::pin(session.run(receiver));
+            while let Some(event) = events.next().await {
+                match event {
+                    PeerEvent::Connected { .. } => {}
+                    PeerEvent::DelegatedMlsCopiesRequested { peer_id } => {
+                        assert_eq!(*peer_id.as_bytes(), recipient_device);
+                        commands
+                            .send(PeerCommand::SendDelegatedMlsCopy {
+                                request_id: 77,
+                                grant: Box::new(grant.clone()),
+                                event: Box::new(copy_event.clone()),
+                            })
+                            .await
+                            .unwrap();
+                    }
+                    PeerEvent::DelegatedMlsCopyAcknowledged { request_id } => {
+                        assert_eq!(request_id, 77);
+                        commands.send(PeerCommand::Disconnect).await.unwrap();
+                    }
+                    PeerEvent::Disconnected { .. } => return true,
+                    other => panic!("unexpected helper-side event: {other:?}"),
+                }
+            }
+            false
+        });
+        let session = connect_peer(recipient_key, holder_id, address)
+            .await
+            .unwrap();
+        let (commands, receiver) = mpsc::channel(4);
+        let mut events = Box::pin(session.run(receiver));
+        assert!(matches!(
+            events.next().await,
+            Some(PeerEvent::Connected { .. })
+        ));
+        commands
+            .send(PeerCommand::RequestDelegatedMlsCopies)
+            .await
+            .unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(8), events.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let sequence = match received {
+            PeerEvent::DelegatedMlsCopyReceived {
+                sequence,
+                peer_id,
+                grant: received_grant,
+                event: received_event,
+            } => {
+                assert_eq!(peer_id, holder_id);
+                assert_eq!(*received_grant, expected_grant);
+                assert_eq!(*received_event, event);
+                sequence
+            }
+            other => panic!("unexpected recipient-side event: {other:?}"),
+        };
+        commands
+            .send(PeerCommand::AcceptInbound { sequence })
+            .await
+            .unwrap();
+        commands.send(PeerCommand::Disconnect).await.unwrap();
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(8), events.next())
+            .await
+            .unwrap()
+        {
+            if matches!(event, PeerEvent::Disconnected { .. }) {
+                break;
+            }
+        }
+        assert!(holder_task.await.unwrap());
     }
 
     #[tokio::test]

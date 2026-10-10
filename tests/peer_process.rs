@@ -358,6 +358,11 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 assert!(!welcome_acknowledged, "duplicate MLS Welcome ACK");
                 welcome_acknowledged = true;
             }
+            peer::PeerEvent::DelegatedMlsCopyAcknowledged { .. }
+            | peer::PeerEvent::DelegatedMlsCopyRejected { .. }
+            | peer::PeerEvent::DelegatedMlsCopyDeliveryUnknown { .. }
+            | peer::PeerEvent::DelegatedMlsCopyReceived { .. }
+            | peer::PeerEvent::DelegatedMlsCopiesRequested { .. } => {}
             peer::PeerEvent::Received { sequence, text } => {
                 let expected_role = if role == "listener" {
                     "sender"
@@ -600,7 +605,12 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 | peer::PeerEvent::MlsWelcomeReceived { .. }
                 | peer::PeerEvent::MlsWelcomeAcknowledged { .. }
                 | peer::PeerEvent::MlsWelcomeRejected { .. }
-                | peer::PeerEvent::MlsWelcomeDeliveryUnknown { .. } => {}
+                | peer::PeerEvent::MlsWelcomeDeliveryUnknown { .. }
+                | peer::PeerEvent::DelegatedMlsCopyAcknowledged { .. }
+                | peer::PeerEvent::DelegatedMlsCopyRejected { .. }
+                | peer::PeerEvent::DelegatedMlsCopyDeliveryUnknown { .. }
+                | peer::PeerEvent::DelegatedMlsCopyReceived { .. }
+                | peer::PeerEvent::DelegatedMlsCopiesRequested { .. } => {}
                 peer::PeerEvent::Rejected { reason, .. } => {
                     panic!("unexpected rejection: {reason}")
                 }
@@ -633,7 +643,12 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 | peer::PeerEvent::MlsWelcomeReceived { .. }
                 | peer::PeerEvent::MlsWelcomeAcknowledged { .. }
                 | peer::PeerEvent::MlsWelcomeRejected { .. }
-                | peer::PeerEvent::MlsWelcomeDeliveryUnknown { .. } => {}
+                | peer::PeerEvent::MlsWelcomeDeliveryUnknown { .. }
+                | peer::PeerEvent::DelegatedMlsCopyAcknowledged { .. }
+                | peer::PeerEvent::DelegatedMlsCopyRejected { .. }
+                | peer::PeerEvent::DelegatedMlsCopyDeliveryUnknown { .. }
+                | peer::PeerEvent::DelegatedMlsCopyReceived { .. }
+                | peer::PeerEvent::DelegatedMlsCopiesRequested { .. } => {}
                 peer::PeerEvent::MlsEventReceived { event, .. } if event.event_id[0] == 0xfe => {
                     got_unacknowledged = true;
                 }
@@ -813,6 +828,13 @@ async fn assert_no_application_session(session: peer::DirectPeerSession) {
             | peer::PeerEvent::MlsWelcomeReceived { .. }
             | peer::PeerEvent::MlsWelcomeAcknowledged { .. } => {
                 panic!("wrong pinned device exchanged an MLS event")
+            }
+            peer::PeerEvent::DelegatedMlsCopyReceived { .. }
+            | peer::PeerEvent::DelegatedMlsCopiesRequested { .. }
+            | peer::PeerEvent::DelegatedMlsCopyAcknowledged { .. }
+            | peer::PeerEvent::DelegatedMlsCopyRejected { .. }
+            | peer::PeerEvent::DelegatedMlsCopyDeliveryUnknown { .. } => {
+                panic!("wrong pinned device exchanged a delegated MLS copy")
             }
             peer::PeerEvent::MlsEventRejected { .. }
             | peer::PeerEvent::MlsCommitRejected { .. }

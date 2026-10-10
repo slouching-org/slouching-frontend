@@ -171,6 +171,7 @@ struct MlsCommitFanoutPeerOutcome {
 struct MlsEventFanoutReport {
     recipients: usize,
     events_acked: usize,
+    copies_held: usize,
     events_expired: usize,
     failures: Vec<String>,
 }
@@ -243,6 +244,7 @@ struct Slouching {
     mls_fanout_running: bool,
     mls_event_fanout_running: bool,
     mls_pending_events: std::collections::HashMap<u64, ([u8; 16], [u8; 32])>,
+    delegated_copy_sends: std::collections::HashMap<u64, [u8; 16]>,
     mls_sending_commits: std::collections::HashMap<u64, [u8; 16]>,
     mls_sending_proposals: std::collections::HashSet<u64>,
     mls_sending_key_packages: std::collections::HashSet<u64>,
@@ -388,6 +390,7 @@ impl Default for Slouching {
             mls_fanout_running: false,
             mls_event_fanout_running: false,
             mls_pending_events: std::collections::HashMap::new(),
+            delegated_copy_sends: std::collections::HashMap::new(),
             mls_sending_commits: std::collections::HashMap::new(),
             mls_sending_proposals: std::collections::HashSet::new(),
             mls_sending_key_packages: std::collections::HashSet::new(),
@@ -425,6 +428,14 @@ enum Message {
     DelegatedMlsStorageLoaded(Result<storage::DelegatedMlsStorageStatus, String>),
     SetDelegatedMlsStorage(bool),
     DelegatedMlsStorageSaved(bool, Result<storage::DelegatedMlsStorageStatus, String>),
+    DelegatedCopyStored(
+        u64,
+        [u8; 16],
+        Result<storage::DelegatedCopyStoreResult, String>,
+    ),
+    DelegatedCopiesLoaded(Result<Vec<storage::StoredDelegatedMlsCopy>, String>),
+    DelegatedCopyReceiptProcessed(u64, Result<storage::ProcessedMlsApplicationEvent, String>),
+    DelegatedCopyAcknowledged(u64, Result<bool, String>),
     CopyDeviceKey,
     CopyPeerListenAddress(String),
     PeerPublicKeyChanged(String),
@@ -624,6 +635,88 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 }
             }
         },
+        Message::DelegatedCopyStored(sequence, event_id, result) => match result {
+            Ok(_) => {
+                if let Some(commands) = state.peer_session_commands.as_ref() {
+                    let _ = commands.try_send(peer::PeerCommand::AcceptInbound { sequence });
+                }
+                state.mls_status = format!(
+                    "Cópia MLS {} guardada neste peer até o destinatário buscar ou o prazo vencer.",
+                    hex_encode_bytes(&event_id[..4])
+                );
+            }
+            Err(error) => {
+                state.mls_status = format!("Cópia MLS não retida; ACK não enviado: {error}");
+                if let Some(commands) = state.peer_session_commands.as_ref() {
+                    let _ = commands.try_send(peer::PeerCommand::RejectInbound {
+                        sequence,
+                        reason: error,
+                    });
+                }
+            }
+        },
+        Message::DelegatedCopiesLoaded(result) => match result {
+            Ok(copies) => {
+                let Some(commands) = state.peer_session_commands.as_ref() else {
+                    return Task::none();
+                };
+                let commands = commands.clone();
+                let mut sends = Vec::new();
+                for copy in copies {
+                    let request_id = state.mls_next_request_id;
+                    state.mls_next_request_id = state.mls_next_request_id.saturating_add(1);
+                    let grant = copy.grant;
+                    let event_id = grant.event_id;
+                    let event = encrypted_event_to_peer(&grant, copy.ciphertext);
+                    state.delegated_copy_sends.insert(request_id, event_id);
+                    sends.push(peer::PeerCommand::SendDelegatedMlsCopy {
+                        request_id,
+                        grant: Box::new(delegated_copy_grant_to_peer(grant)),
+                        event: Box::new(event),
+                    });
+                }
+                return Task::perform(
+                    async move {
+                        for command in sends {
+                            commands
+                                .send(command)
+                                .await
+                                .map_err(|error| error.to_string())?;
+                        }
+                        Ok::<(), String>(())
+                    },
+                    |result| match result {
+                        Ok(()) => Message::PeerCommandSent(Ok(())),
+                        Err(error) => Message::PeerCommandSent(Err(error)),
+                    },
+                );
+            }
+            Err(error) => state.mls_status = format!("Falha ao buscar cópias MLS: {error}"),
+        },
+        Message::DelegatedCopyReceiptProcessed(sequence, result) => match result {
+            Ok(_) => {
+                if let Some(commands) = state.peer_session_commands.as_ref() {
+                    let _ = commands.try_send(peer::PeerCommand::AcceptInbound { sequence });
+                }
+                state.mls_status =
+                    "Cópia MLS delegada entregue e persistida no grupo local.".into();
+            }
+            Err(error) => {
+                state.mls_status = format!("Cópia delegada não aplicada; ACK não enviado: {error}");
+                if let Some(commands) = state.peer_session_commands.as_ref() {
+                    let _ = commands.try_send(peer::PeerCommand::RejectInbound {
+                        sequence,
+                        reason: error,
+                    });
+                }
+            }
+        },
+        Message::DelegatedCopyAcknowledged(request_id, result) => {
+            state.delegated_copy_sends.remove(&request_id);
+            if let Err(error) = result {
+                state.mls_status = format!("Falha ao remover cópia já entregue: {error}");
+            }
+        }
         Message::Navigate(screen) => {
             state.screen = screen;
             state.show_gallery = false;
@@ -953,6 +1046,9 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     state.peer_session_commands = Some(commands);
                 }
                 PeerListenEvent::Session(peer::PeerEvent::Connected { peer_id }) => {
+                    if let Some(commands) = state.peer_session_commands.as_ref() {
+                        let _ = commands.try_send(peer::PeerCommand::RequestDelegatedMlsCopies);
+                    }
                     let remember_route =
                         matches!(state.peer_send_status, PeerSendStatus::Connecting);
                     let route_task = if remember_route {
@@ -1033,6 +1129,54 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         return Task::perform(
                             process_inbound_mls_application_task(stored_event),
                             move |result| Message::MlsInboundProcessed(sequence, event, result),
+                        );
+                    }
+                    peer::PeerEvent::DelegatedMlsCopyReceived {
+                        sequence,
+                        peer_id,
+                        grant,
+                        event,
+                    } => {
+                        let local_device = match state.identity_status {
+                            IdentityStatus::Ready(key) => key,
+                            _ => {
+                                if let Some(commands) = state.peer_session_commands.as_ref() {
+                                    let _ = commands.try_send(peer::PeerCommand::RejectInbound {
+                                        sequence,
+                                        reason: "local device identity is unavailable".into(),
+                                    });
+                                }
+                                return Task::none();
+                            }
+                        };
+                        let stored_event = peer_event_to_encrypted(&event);
+                        if grant.author_device == *peer_id.as_bytes() {
+                            let grant_for_storage = peer_grant_to_storage(*grant);
+                            return Task::perform(
+                                store_delegated_copy_task(
+                                    grant_for_storage,
+                                    stored_event,
+                                    *peer_id.as_bytes(),
+                                ),
+                                move |result| {
+                                    Message::DelegatedCopyStored(sequence, event.event_id, result)
+                                },
+                            );
+                        }
+                        let grant_for_storage = peer_grant_to_storage(*grant);
+                        return Task::perform(
+                            process_delegated_copy_for_recipient_task(
+                                grant_for_storage,
+                                stored_event,
+                                local_device,
+                            ),
+                            move |result| Message::DelegatedCopyReceiptProcessed(sequence, result),
+                        );
+                    }
+                    peer::PeerEvent::DelegatedMlsCopiesRequested { peer_id } => {
+                        return Task::perform(
+                            load_delegated_copies_task(*peer_id.as_bytes()),
+                            Message::DelegatedCopiesLoaded,
                         );
                     }
                     peer::PeerEvent::MlsCommitReceived { sequence, commit } => {
@@ -1282,6 +1426,32 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                             update_mls_outbound_state_task(event_id, peer_device),
                             move |result| Message::MlsOutboundHeld(request_id, event_id, result),
                         );
+                    }
+                    peer::PeerEvent::DelegatedMlsCopyAcknowledged { request_id } => {
+                        let Some(event_id) = state.delegated_copy_sends.get(&request_id).copied()
+                        else {
+                            // An author-to-helper store ACK does not correspond to a local held copy.
+                            return Task::none();
+                        };
+                        let recipient = match parse_peer_id(&state.peer_public_key) {
+                            Ok(peer) => *peer.as_bytes(),
+                            Err(error) => {
+                                state.mls_status = format!("Peer da cópia inválido: {error}");
+                                return Task::none();
+                            }
+                        };
+                        return Task::perform(
+                            acknowledge_delegated_copy_task(event_id, recipient),
+                            move |result| Message::DelegatedCopyAcknowledged(request_id, result),
+                        );
+                    }
+                    peer::PeerEvent::DelegatedMlsCopyRejected { request_id, reason } => {
+                        state.delegated_copy_sends.remove(&request_id);
+                        state.mls_status = format!("Cópia MLS delegada recusada: {reason}");
+                    }
+                    peer::PeerEvent::DelegatedMlsCopyDeliveryUnknown { request_id } => {
+                        state.delegated_copy_sends.remove(&request_id);
+                        state.mls_status = "Entrega da cópia MLS desconhecida; ela permanece disponível para nova busca.".into();
                     }
                     peer::PeerEvent::MlsEventDeliveryUnknown { request_id } => {
                         state.mls_pending_events.remove(&request_id);
@@ -2142,15 +2312,19 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             match result {
                 Ok(report) if report.failures.is_empty() => {
                     state.mls_status = format!(
-                        "Fan-out MLS: {} evento(s) confirmados por ACK em {} peer(s); {} expirado(s).",
-                        report.events_acked, report.recipients, report.events_expired
+                        "Fan-out MLS: {} evento(s) recebidos em {} peer(s), {} cópia(s) guardadas por ajudantes; {} expirado(s).",
+                        report.events_acked,
+                        report.recipients,
+                        report.copies_held,
+                        report.events_expired
                     );
                 }
                 Ok(report) => {
                     state.mls_status = format!(
-                        "Fan-out MLS parcial: {} evento(s) confirmados em {} peer(s); {} pendentes, {} expirado(s). {}",
+                        "Fan-out MLS parcial: {} evento(s) recebidos em {} peer(s), {} cópia(s) guardadas; {} peer(s) pendente(s), {} expirado(s). {}",
                         report.events_acked,
                         report.recipients,
+                        report.copies_held,
                         report.failures.len(),
                         report.events_expired,
                         report.failures.join(" · ")
@@ -3111,6 +3285,109 @@ async fn set_delegated_mls_storage_task(
     .map_err(|error| format!("delegated MLS storage update task failed: {error}"))?
 }
 
+fn peer_grant_to_storage(grant: peer::DelegatedMlsCopyGrant) -> storage::DelegatedMlsCopyGrant {
+    storage::DelegatedMlsCopyGrant {
+        event_id: grant.event_id,
+        author_device: grant.author_device,
+        recipient_device: grant.recipient_device,
+        group_id: grant.group_id,
+        epoch: grant.epoch,
+        expires_at_unix: grant.expires_at_unix,
+        checkpoint: grant.checkpoint,
+        ciphertext_digest: grant.ciphertext_digest,
+        signature: grant.signature,
+    }
+}
+
+fn delegated_copy_grant_to_peer(
+    grant: storage::DelegatedMlsCopyGrant,
+) -> peer::DelegatedMlsCopyGrant {
+    peer::DelegatedMlsCopyGrant {
+        event_id: grant.event_id,
+        author_device: grant.author_device,
+        recipient_device: grant.recipient_device,
+        group_id: grant.group_id,
+        epoch: grant.epoch,
+        expires_at_unix: grant.expires_at_unix,
+        checkpoint: grant.checkpoint,
+        ciphertext_digest: grant.ciphertext_digest,
+        signature: grant.signature,
+    }
+}
+
+fn peer_event_to_encrypted(event: &peer::MlsEventEnvelope) -> storage::EncryptedEvent {
+    storage::EncryptedEvent {
+        event_id: event.event_id,
+        author_device: event.author_device,
+        group_id: event.group_id.clone(),
+        epoch: event.epoch,
+        checkpoint: event.checkpoint.clone(),
+        expires_at_unix: event.expires_at_unix,
+        ciphertext: event.ciphertext.clone(),
+    }
+}
+
+fn encrypted_event_to_peer(
+    grant: &storage::DelegatedMlsCopyGrant,
+    ciphertext: Vec<u8>,
+) -> peer::MlsEventEnvelope {
+    peer::MlsEventEnvelope {
+        event_id: grant.event_id,
+        author_device: grant.author_device,
+        group_id: grant.group_id.to_vec(),
+        epoch: grant.epoch,
+        checkpoint: grant.checkpoint.clone(),
+        expires_at_unix: grant.expires_at_unix,
+        ciphertext,
+    }
+}
+
+async fn store_delegated_copy_task(
+    grant: storage::DelegatedMlsCopyGrant,
+    event: storage::EncryptedEvent,
+    authenticated_author: [u8; 32],
+) -> Result<storage::DelegatedCopyStoreResult, String> {
+    tokio::task::spawn_blocking(move || {
+        storage::store_delegated_mls_copy(&grant, &event, authenticated_author)
+    })
+    .await
+    .map_err(|error| format!("delegated copy storage task failed: {error}"))?
+}
+
+async fn process_delegated_copy_for_recipient_task(
+    grant: storage::DelegatedMlsCopyGrant,
+    event: storage::EncryptedEvent,
+    recipient_device: [u8; 32],
+) -> Result<storage::ProcessedMlsApplicationEvent, String> {
+    tokio::task::spawn_blocking(move || {
+        storage::verify_delegated_mls_copy(&grant, &event, recipient_device)?;
+        storage::process_inbound_mls_application_event(&event)
+    })
+    .await
+    .map_err(|error| format!("delegated copy recipient task failed: {error}"))?
+}
+
+async fn load_delegated_copies_task(
+    recipient_device: [u8; 32],
+) -> Result<Vec<storage::StoredDelegatedMlsCopy>, String> {
+    tokio::task::spawn_blocking(move || {
+        storage::list_delegated_mls_copies_for_device(recipient_device, peer::MAX_PENDING_MESSAGES)
+    })
+    .await
+    .map_err(|error| format!("delegated copy fetch task failed: {error}"))?
+}
+
+async fn acknowledge_delegated_copy_task(
+    event_id: [u8; 16],
+    recipient_device: [u8; 32],
+) -> Result<bool, String> {
+    tokio::task::spawn_blocking(move || {
+        storage::acknowledge_delegated_mls_copy(event_id, recipient_device)
+    })
+    .await
+    .map_err(|error| format!("delegated copy acknowledgement task failed: {error}"))?
+}
+
 fn load_mls_groups() -> Task<Message> {
     Task::perform(load_mls_groups_task(), Message::MlsGroupsLoaded)
 }
@@ -3552,6 +3829,17 @@ async fn fanout_mls_commits_to_peer(
                     break false;
                 }
                 Ok(Some(peer::PeerEvent::Connected { .. })) => continue,
+                Ok(Some(peer::PeerEvent::DelegatedMlsCopiesRequested { .. })) => continue,
+                Ok(Some(peer::PeerEvent::DelegatedMlsCopyReceived { sequence, .. })) => {
+                    let _ = commands
+                        .send(peer::PeerCommand::RejectInbound {
+                            sequence,
+                            reason: "background Commit fan-out does not consume delegated copies"
+                                .into(),
+                        })
+                        .await;
+                    continue;
+                }
                 Ok(Some(event)) => {
                     outcome.failure = Some(format!(
                         "unexpected event during Commit delivery: {event:?}"
@@ -3618,15 +3906,29 @@ async fn fanout_mls_events_task(group_id: Vec<u8>) -> Result<MlsEventFanoutRepor
     let mut report = MlsEventFanoutReport {
         recipients: recipients.len(),
         events_acked: 0,
+        copies_held: 0,
         events_expired,
         failures: Vec::new(),
     };
-    for peer_device in recipients {
+    for peer_device in recipients.iter().copied() {
         let Some(address) = route_by_device.get(&peer_device).cloned() else {
-            report.failures.push(format!(
-                "{}… sem rota salva",
-                hex_encode_bytes(&peer_device[..4])
-            ));
+            let pending = load_all_mls_events_for_peer_task(group_id.clone(), peer_device).await?;
+            if !pending.is_empty() {
+                let (held, failure) = fanout_mls_copies_to_helpers(
+                    peer_device,
+                    &pending,
+                    &recipients,
+                    &route_by_device,
+                )
+                .await;
+                report.copies_held += held;
+                if let Some(reason) = failure {
+                    report.failures.push(format!(
+                        "{}… sem rota direta; cópia: {reason}",
+                        hex_encode_bytes(&peer_device[..4])
+                    ));
+                }
+            }
             continue;
         };
         let commits = load_mls_commits_for_peer_task(group_id.clone(), peer_device).await?;
@@ -3651,13 +3953,35 @@ async fn fanout_mls_events_task(group_id: Vec<u8>) -> Result<MlsEventFanoutRepor
             if events.is_empty() {
                 break;
             }
-            let has_more = events.len() == 100;
+            let has_more = events.len() == 16;
             let outcome = fanout_mls_events_to_peer(peer_device, address.clone(), events).await;
             report.events_acked += outcome.0;
             if let Some(error) = outcome.1 {
-                report
-                    .failures
-                    .push(format!("{}…: {error}", hex_encode_bytes(&peer_device[..4])));
+                let events_for_copy =
+                    load_all_mls_events_for_peer_task(group_id.clone(), peer_device).await?;
+                let (held, copy_failure) = fanout_mls_copies_to_helpers(
+                    peer_device,
+                    &events_for_copy,
+                    &recipients,
+                    &route_by_device,
+                )
+                .await;
+                report.copies_held += held;
+                if held == 0 {
+                    report.failures.push(format!(
+                        "{}…: {error}; cópia: {}",
+                        hex_encode_bytes(&peer_device[..4]),
+                        copy_failure.unwrap_or_else(|| "nenhum ajudante aceitou".to_owned())
+                    ));
+                    break;
+                }
+                if let Some(copy_failure) = copy_failure {
+                    report.failures.push(format!(
+                        "{}…: {} evento(s) direto(s) falharam; cópia parcial: {copy_failure}",
+                        hex_encode_bytes(&peer_device[..4]),
+                        held
+                    ));
+                }
                 break;
             }
             if !has_more {
@@ -3666,6 +3990,191 @@ async fn fanout_mls_events_task(group_id: Vec<u8>) -> Result<MlsEventFanoutRepor
         }
     }
     Ok(report)
+}
+
+async fn fanout_mls_copies_to_helpers(
+    target_device: [u8; 32],
+    events: &[storage::StoredOutboundEvent],
+    group_members: &[[u8; 32]],
+    routes: &std::collections::HashMap<[u8; 32], String>,
+) -> (usize, Option<String>) {
+    let mut last_failure = None;
+    for helper_device in group_members.iter().copied() {
+        if helper_device == target_device
+            || events
+                .first()
+                .is_some_and(|event| event.event.author_device == helper_device)
+        {
+            continue;
+        }
+        let Some(address) = routes.get(&helper_device).cloned() else {
+            continue;
+        };
+        let (stored, failure) =
+            fanout_mls_copies_to_helper(helper_device, address, target_device, events).await;
+        if stored == events.len() {
+            return (stored, None);
+        }
+        last_failure =
+            failure.or_else(|| Some(format!("helper stored {stored}/{} copies", events.len())));
+        if stored > 0 {
+            return (stored, last_failure);
+        }
+    }
+    (
+        0,
+        Some(last_failure.unwrap_or_else(|| "no reachable opted-in group helper".to_owned())),
+    )
+}
+
+async fn fanout_mls_copies_to_helper(
+    helper_device: [u8; 32],
+    address: String,
+    target_device: [u8; 32],
+    events: &[storage::StoredOutboundEvent],
+) -> (usize, Option<String>) {
+    let endpoint = match parse_peer_id(&hex_encode_bytes(&helper_device)) {
+        Ok(endpoint) => endpoint,
+        Err(error) => return (0, Some(format!("invalid helper identity: {error}"))),
+    };
+    let address = match address.parse::<std::net::SocketAddr>() {
+        Ok(address) if !address.ip().is_unspecified() && address.port() != 0 => address,
+        _ => {
+            return (
+                0,
+                Some("saved helper route is not a reachable IP:port".to_owned()),
+            );
+        }
+    };
+    let identity = match load_peer_secret_key_task().await {
+        Ok(identity) => identity,
+        Err(error) => return (0, Some(error)),
+    };
+    let session = match peer::connect_peer(identity, endpoint, address).await {
+        Ok(session) => session,
+        Err(error) => return (0, Some(error)),
+    };
+    let (commands, receiver) = tokio::sync::mpsc::channel(8);
+    let mut stream = Box::pin(session.run(receiver));
+    match tokio::time::timeout(Duration::from_secs(8), stream.next()).await {
+        Ok(Some(peer::PeerEvent::Connected { peer_id }))
+            if *peer_id.as_bytes() == helper_device => {}
+        Ok(Some(event)) => {
+            return (
+                0,
+                Some(format!("unexpected helper session event: {event:?}")),
+            );
+        }
+        Ok(None) => return (0, Some("helper session ended before connect".to_owned())),
+        Err(_) => return (0, Some("timed out connecting to helper".to_owned())),
+    }
+    let mut stored = 0;
+    let mut failure = None;
+    for (index, queued) in events.iter().enumerate() {
+        let event = peer_event_from_encrypted(&queued.event);
+        let event_for_signing = queued.event.clone();
+        let grant = match tokio::task::spawn_blocking(move || {
+            storage::sign_delegated_mls_copy_grant(&event_for_signing, target_device)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result)
+        {
+            Ok(grant) => grant,
+            Err(error) => {
+                failure = Some(format!("could not authorize copy: {error}"));
+                break;
+            }
+        };
+        let request_id = index as u64 + 1;
+        if let Err(error) = commands
+            .send(peer::PeerCommand::SendDelegatedMlsCopy {
+                request_id,
+                grant: Box::new(delegated_copy_grant_to_peer(grant)),
+                event: Box::new(event),
+            })
+            .await
+        {
+            failure = Some(format!("could not queue delegated copy: {error}"));
+            break;
+        }
+        let accepted = loop {
+            match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+                Ok(Some(peer::PeerEvent::DelegatedMlsCopyAcknowledged { request_id: ack }))
+                    if ack == request_id =>
+                {
+                    break true;
+                }
+                Ok(Some(peer::PeerEvent::DelegatedMlsCopyRejected {
+                    request_id: rejected,
+                    reason,
+                })) if rejected == request_id => {
+                    failure = Some(format!("helper declined storage: {reason}"));
+                    break false;
+                }
+                Ok(Some(peer::PeerEvent::DelegatedMlsCopyDeliveryUnknown {
+                    request_id: unknown,
+                })) if unknown == request_id => {
+                    failure = Some("helper storage acknowledgement is unknown".to_owned());
+                    break false;
+                }
+                Ok(Some(peer::PeerEvent::Disconnected { reason })) => {
+                    failure = Some(format!("helper disconnected: {reason}"));
+                    break false;
+                }
+                Ok(Some(peer::PeerEvent::Connected { .. })) => continue,
+                Ok(Some(peer::PeerEvent::DelegatedMlsCopiesRequested { .. })) => continue,
+                Ok(Some(peer::PeerEvent::DelegatedMlsCopyReceived { sequence, .. })) => {
+                    let _ = commands
+                        .send(peer::PeerCommand::RejectInbound {
+                            sequence,
+                            reason: "background helper fan-out does not consume inbound copies"
+                                .into(),
+                        })
+                        .await;
+                    continue;
+                }
+                Ok(Some(other)) => {
+                    failure = Some(format!("unexpected event during helper storage: {other:?}"));
+                    break false;
+                }
+                Ok(None) => {
+                    failure = Some("helper session ended before copy ACK".to_owned());
+                    break false;
+                }
+                Err(_) => {
+                    failure = Some("timed out waiting for helper storage ACK".to_owned());
+                    break false;
+                }
+            }
+        };
+        if !accepted {
+            break;
+        }
+        stored += 1;
+    }
+    let _ = commands.send(peer::PeerCommand::Disconnect).await;
+    let _ = tokio::time::timeout(Duration::from_secs(8), async {
+        while let Some(event) = stream.next().await {
+            if matches!(event, peer::PeerEvent::Disconnected { .. }) {
+                break;
+            }
+        }
+    })
+    .await;
+    (stored, failure)
+}
+
+fn peer_event_from_encrypted(event: &storage::EncryptedEvent) -> peer::MlsEventEnvelope {
+    peer::MlsEventEnvelope {
+        event_id: event.event_id,
+        author_device: event.author_device,
+        group_id: event.group_id.clone(),
+        epoch: event.epoch,
+        checkpoint: event.checkpoint.clone(),
+        expires_at_unix: event.expires_at_unix,
+        ciphertext: event.ciphertext.clone(),
+    }
 }
 
 async fn fanout_mls_events_to_peer(
@@ -3757,6 +4266,17 @@ async fn fanout_mls_events_to_peer(
                     break false;
                 }
                 Ok(Some(peer::PeerEvent::Connected { .. })) => continue,
+                Ok(Some(peer::PeerEvent::DelegatedMlsCopiesRequested { .. })) => continue,
+                Ok(Some(peer::PeerEvent::DelegatedMlsCopyReceived { sequence, .. })) => {
+                    let _ = commands
+                        .send(peer::PeerCommand::RejectInbound {
+                            sequence,
+                            reason: "background event fan-out does not consume delegated copies"
+                                .into(),
+                        })
+                        .await;
+                    continue;
+                }
                 Ok(Some(other)) => {
                     failure = Some(format!("unexpected event during MLS delivery: {other:?}"));
                     break false;
@@ -3827,10 +4347,21 @@ async fn load_mls_events_for_peer_task(
     peer_device: [u8; 32],
 ) -> Result<Vec<storage::StoredOutboundEvent>, String> {
     tokio::task::spawn_blocking(move || {
-        storage::list_queued_mls_events_for_peer(&group_id, peer_device, 100)
+        storage::list_queued_mls_events_for_peer(&group_id, peer_device, 16)
     })
     .await
     .map_err(|error| format!("MLS peer outbox task failed: {error}"))?
+}
+
+async fn load_all_mls_events_for_peer_task(
+    group_id: Vec<u8>,
+    peer_device: [u8; 32],
+) -> Result<Vec<storage::StoredOutboundEvent>, String> {
+    tokio::task::spawn_blocking(move || {
+        storage::list_queued_mls_events_for_peer(&group_id, peer_device, 500)
+    })
+    .await
+    .map_err(|error| format!("MLS helper-copy outbox task failed: {error}"))?
 }
 
 async fn create_mls_application_task(
@@ -4073,6 +4604,8 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
         peer::PeerEvent::MlsProposalReceived { .. } => {}
         peer::PeerEvent::MlsKeyPackageReceived { .. } => {}
         peer::PeerEvent::MlsWelcomeReceived { .. } => {}
+        peer::PeerEvent::DelegatedMlsCopyReceived { .. }
+        | peer::PeerEvent::DelegatedMlsCopiesRequested { .. } => {}
         peer::PeerEvent::MlsCommitRequested { .. } => {}
         peer::PeerEvent::MlsEventAcknowledged { request_id } => {
             state.peer_send_status = PeerSendStatus::Failed(format!(
@@ -4099,7 +4632,10 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
         | peer::PeerEvent::MlsKeyPackageDeliveryUnknown { .. }
         | peer::PeerEvent::MlsWelcomeAcknowledged { .. }
         | peer::PeerEvent::MlsWelcomeRejected { .. }
-        | peer::PeerEvent::MlsWelcomeDeliveryUnknown { .. } => {}
+        | peer::PeerEvent::MlsWelcomeDeliveryUnknown { .. }
+        | peer::PeerEvent::DelegatedMlsCopyAcknowledged { .. }
+        | peer::PeerEvent::DelegatedMlsCopyRejected { .. }
+        | peer::PeerEvent::DelegatedMlsCopyDeliveryUnknown { .. } => {}
         peer::PeerEvent::Unauthorized { .. } => {
             state.peer_listen_status = PeerListenStatus::Unauthorized(
                 "peer não corresponde à chave pública fixada".to_owned(),
