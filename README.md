@@ -138,6 +138,34 @@ remains queued after the first recipient ACK and a database reopen. New members 
 pinned session after the committer admits their KeyPackage. The transcript reloads locally, and **Reenviar pendentes**
 sends queued events for the selected group after reconnecting.
 
+### Testar fan-out MLS com três dispositivos
+
+Use três máquinas na mesma LAN (A, B e C). Em cada uma, crie uma identidade e
+troque as chaves públicas por um canal confiável. Libere no firewall UDP para a
+porta escolhida em cada máquina.
+
+1. Em A, crie um grupo MLS. Em B, conecte a A usando o endereço LAN anunciado e
+   envie o KeyPackage público. Em A, admita B e envie o Welcome. Confirme que B
+   abriu o mesmo grupo.
+2. Repita com C. C recebe o Welcome no epoch atual; B precisa aplicar o Commit
+   que adicionou C.
+3. Faça A conectar uma vez a B e uma vez a C usando as chaves pinadas e os
+   endereços LAN deles. Isso salva as duas rotas no dispositivo A. Encerre a
+   sessão/listener e, em A, clique em **Distribuir a todos os peers salvos**
+   para entregar a B os Commits pendentes.
+4. Confirme que os três dispositivos mostram o mesmo grupo e epoch. Em A,
+   envie uma mensagem MLS e clique em **Distribuir mensagens MLS aos peers
+   salvos**. B e C devem mostrar a mensagem recebida. Em A, o status deve
+   confirmar ACK de ambos e a outbox só deve fechar depois dos dois ACKs.
+5. Para conferir a retomada, feche ou desconecte C antes do próximo fan-out.
+   B deve receber e confirmar a mensagem; C deve continuar pendente. Reconecte
+   A a C para atualizar a rota, feche a sessão e repita o fan-out. C deve
+   receber o mesmo evento, sem duplicar a mensagem em B.
+
+Esse fluxo exercita rotas diretas salvas e ACK por membro; não usa Postgres nem
+helper. Uma rota inacessível fica pendente, e o ACK confirma persistência no
+cliente remoto, não leitura humana.
+
 The MLS screen lists groups saved in the local SQLCipher database with their
 current epoch and quarantine state. **Abrir** restores a group's ID, bounded
 transcript, pending Commits, and security alert, so reopening the app does not
