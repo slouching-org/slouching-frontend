@@ -335,8 +335,9 @@ rejection. It requires key material supplied by a call MLS exporter, which is
 now available from a separately typed call MLS group. The call purpose is
 persisted in SQLCipher and carried by the authenticated Welcome; conversation
 groups cannot export media keys. This is a key-management foundation only: the
-UI does not create call groups yet, and no call uses SFrame, WebRTC, or audio
-capture. Device choices are not persisted or used by calls yet.
+call screen can create a dedicated group, copy its ID, and open the existing MLS
+invitation flow. It still does not start a call: no call uses SFrame, WebRTC, or
+audio capture. Device choices are not persisted or used by calls yet.
 Camera and screen capture are also inactive. **Rede & P2P** in Settings retains
 the Elixir HTTP/WebSocket diagnostics and manual refresh. On Linux, this uses
 Secret Service, so a desktop password vault must
@@ -352,7 +353,7 @@ be installed and available in the user session.
 
 ![Actual native Iced peer verification screen after importing a QR, with separate LAN and VPN address choices; all values are capture fixtures](docs/design/runtime/native-vhs/08-verify-invite-imported.png)
 
-![Actual native Iced group-call preview; media and sample messages are illustrative](docs/design/runtime/native-vhs/10-call.png)
+![Native Iced group-call preview captured before the MLS group setup controls were added; media and sample messages are illustrative](docs/design/runtime/native-vhs/10-call.png)
 
 ![Actual 934 × 1000 native Iced MLS screen showing pending, approved, and rejected self-update proposal review controls; proposal rows are capture fixtures](docs/design/runtime/native-vhs/11-mls.png)
 

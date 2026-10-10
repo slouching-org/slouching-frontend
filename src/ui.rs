@@ -1,8 +1,8 @@
-//! Native widgets composed from the supplied design board. All call/chat
-//! content is explicitly a visual preview until product capabilities exist.
+//! Native widgets composed from the supplied design board. Call media and room
+//! chat remain previews; call-group creation and MLS invitations use live state.
 use crate::{
     BackendConnection, Message, Screen, Slouching, TransportState,
-    file_transfer::FileAttachmentOffer, storage,
+    file_transfer::FileAttachmentOffer, peer, storage,
 };
 use iced::widget::{
     self, button, canvas, column, container, image, progress_bar, row, scrollable, space, stack,
@@ -1137,13 +1137,59 @@ fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
         l.label("saving both to the tape", 12.0, PAPER)
     ]
     .spacing(l.px(12.0));
+    let identity_ready = matches!(state.identity_status, crate::IdentityStatus::Ready(_));
+    let call_group_controls: Element<'_, Message> = if state.call_group_id.is_empty() {
+        column![
+            l.label("Nenhum grupo MLS de chamada neste perfil.", 10.0, MUTED),
+            l.control(
+                "users",
+                "Criar grupo protegido",
+                Some(Message::CreateCallMlsGroup),
+                identity_ready && !state.call_group_creating
+            )
+        ]
+        .spacing(l.px(7.0))
+        .into()
+    } else {
+        let group_id = &state.call_group_id;
+        column![
+            l.label(
+                format!("ID {}…", &group_id[..group_id.len().min(16)]),
+                10.0,
+                PAPER
+            ),
+            l.control(
+                "key",
+                "Copiar ID",
+                Some(Message::CopyMlsValue(state.call_group_id.clone())),
+                false
+            ),
+            l.control(
+                "users",
+                "Convidar participantes",
+                Some(Message::OpenCallMlsGroup),
+                true
+            ),
+            l.control(
+                "plus",
+                "Preparar outra chamada",
+                Some(Message::CreateCallMlsGroup),
+                identity_ready && !state.call_group_creating
+            )
+        ]
+        .spacing(l.px(5.0))
+        .into()
+    };
     let camp = column![
-        l.label("C A M P F I R E  C H A T", 11.0, MUTED),
-        l.label("EXEMPLOS · nenhum envio", 10.0, VIOLET),
-        scrollable(samples).height(Fill),
-        l.input("Mensagem · prévia", &state.draft, Message::DraftChanged)
+        l.label("GRUPO MLS DA CHAMADA", 11.0, GOLD),
+        call_group_controls,
+        l.label(&state.call_group_status, 10.0, MUTED),
+        l.label("ÁUDIO E VÍDEO · ainda não conectados", 9.0, VIOLET),
+        rule(LINE, 1.0),
+        l.label("PRÉVIA VISUAL", 10.0, MUTED),
+        scrollable(samples).height(Fill)
     ]
-    .spacing(l.px(12.0));
+    .spacing(l.px(8.0));
     stack![
         l.place(boxed(stage), 22.0, 70.0, 920.0, 426.0),
         l.place(filmstrip, 22.0, 510.0, 920.0, 164.0),
@@ -1370,7 +1416,15 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
                     if group.quarantined {
                         l.label("EM QUARENTENA", 9.0, GOLD)
                     } else {
-                        l.label("local", 9.0, MUTED)
+                        l.label(
+                            if group.purpose == peer::MlsGroupPurpose::Call {
+                                "CHAMADA · local"
+                            } else {
+                                "CONVERSA · local"
+                            },
+                            9.0,
+                            MUTED,
+                        )
                     }
                 ]
                 .spacing(l.px(2.0)),

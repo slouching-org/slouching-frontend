@@ -215,7 +215,6 @@ struct Slouching {
     settings_tab: u8,
     share_tab: u8,
     selected_source: u8,
-    draft: String,
     texture: bool,
     note: Option<&'static str>,
     capture_dir: Option<std::path::PathBuf>,
@@ -283,6 +282,9 @@ struct Slouching {
     mls_pending_peer_key_package: Option<PendingPeerKeyPackage>,
     mls_pending_peer_welcome: Option<PendingPeerWelcome>,
     mls_commit_recipients: Vec<storage::MlsCommitRecipientStatus>,
+    call_group_id: String,
+    call_group_status: String,
+    call_group_creating: bool,
     mls_fanout_running: bool,
     mls_event_fanout_running: bool,
     mls_pending_events: std::collections::HashMap<u64, ([u8; 16], [u8; 32])>,
@@ -394,7 +396,6 @@ impl Default for Slouching {
             settings_tab: 1,
             share_tab: 0,
             selected_source: 0,
-            draft: String::new(),
             texture: true,
             note: None,
             capture_dir: None,
@@ -464,6 +465,9 @@ impl Default for Slouching {
             mls_pending_peer_key_package: None,
             mls_pending_peer_welcome: None,
             mls_commit_recipients: Vec::new(),
+            call_group_id: String::new(),
+            call_group_status: "Crie um grupo MLS isolado para preparar uma chamada.".to_owned(),
+            call_group_creating: false,
             mls_fanout_running: false,
             mls_event_fanout_running: false,
             mls_pending_events: std::collections::HashMap::new(),
@@ -507,7 +511,6 @@ enum Message {
     AudioMonitorEvent(AudioMonitorEvent),
     ShareTab(u8),
     SelectSource(u8),
-    DraftChanged(String),
     ToggleTexture,
     PreviewAction(&'static str),
     DismissNote,
@@ -625,6 +628,9 @@ enum Message {
     MlsRatchetTreeChanged(String),
     CreateMlsGroup,
     MlsGroupCreated(Result<storage::CreatedMlsGroup, String>),
+    CreateCallMlsGroup,
+    CallMlsGroupCreated(Result<storage::CreatedMlsGroup, String>),
+    OpenCallMlsGroup,
     PrepareMlsKeyPackage,
     MlsKeyPackagePrepared(Result<storage::PreparedMlsKeyPackage, String>),
     AdmitMlsMember,
@@ -853,6 +859,51 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.show_gallery = false;
             state.note = None;
         }
+        Message::CreateCallMlsGroup => {
+            if !matches!(state.identity_status, IdentityStatus::Ready(_)) {
+                state.call_group_status =
+                    "Crie ou carregue a identidade do dispositivo antes de preparar o grupo."
+                        .to_owned();
+                return Task::none();
+            }
+            if state.call_group_creating {
+                return Task::none();
+            }
+            state.call_group_creating = true;
+            state.call_group_status = "Criando grupo MLS isolado para esta chamada…".to_owned();
+            return Task::perform(create_call_mls_group_task(), Message::CallMlsGroupCreated);
+        }
+        Message::CallMlsGroupCreated(result) => {
+            state.call_group_creating = false;
+            match result {
+                Ok(group) => {
+                    state.call_group_id = hex_encode_bytes(&group.group_id);
+                    state.mls_group_id = state.call_group_id.clone();
+                    state.call_group_status = format!(
+                        "Grupo de chamada criado no epoch {}. Convide dispositivos pelo fluxo MLS; mídia ainda não conectada.",
+                        group.epoch
+                    );
+                    let history = load_mls_history(state, group.group_id);
+                    return Task::batch([history, load_mls_groups()]);
+                }
+                Err(error) => {
+                    state.call_group_status = format!("Falha ao criar grupo de chamada: {error}");
+                }
+            }
+        }
+        Message::OpenCallMlsGroup => {
+            if let Ok(group_id) = hex_decode_bytes(&state.call_group_id)
+                && group_id.len() == 16
+            {
+                state.mls_group_id = state.call_group_id.clone();
+                state.mls_status =
+                    "Grupo MLS da chamada selecionado. Adicione cada participante pelo peer fixado."
+                        .to_owned();
+                state.screen = Screen::Mls;
+                return Task::batch([load_mls_history(state, group_id), load_mls_groups()]);
+            }
+            state.call_group_status = "Crie ou selecione um grupo MLS de chamada primeiro.".into();
+        }
         Message::InviteChanged(value) => state.invite = value,
         Message::NameChanged(value) => state.name = value,
         Message::ChooseFamiliar(value) => state.familiar = value,
@@ -969,7 +1020,6 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.selected_source = 0;
         }
         Message::SelectSource(value) => state.selected_source = value,
-        Message::DraftChanged(value) => state.draft = value,
         Message::ToggleTexture => state.texture = !state.texture,
         Message::PreviewAction(note) => state.note = Some(note),
         Message::DismissNote => state.note = None,
@@ -2272,6 +2322,15 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 return Task::none();
             }
             state.mls_group_id = hex_encode_bytes(&group_id);
+            if state.mls_groups.iter().any(|group| {
+                group.group_id == group_id.as_slice()
+                    && group.purpose == peer::MlsGroupPurpose::Call
+            }) {
+                state.call_group_id = state.mls_group_id.clone();
+                state.call_group_status =
+                    "Grupo de chamada local selecionado; convide participantes pelo fluxo MLS."
+                        .to_owned();
+            }
             state.mls_history.clear();
             state.mls_commit.clear();
             state.mls_pending_commits.clear();
@@ -2281,6 +2340,15 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         Message::RefreshMlsGroups => return load_mls_groups(),
         Message::MlsGroupsLoaded(result) => match result {
             Ok(groups) => {
+                if state.call_group_id.is_empty()
+                    && let Some(group) = groups
+                        .iter()
+                        .find(|group| group.purpose == peer::MlsGroupPurpose::Call)
+                {
+                    state.call_group_id = hex_encode_bytes(&group.group_id);
+                    state.call_group_status =
+                        "Grupo MLS de chamada restaurado do perfil local.".to_owned();
+                }
                 state.mls_groups = groups;
                 state.mls_groups_error = None;
             }
@@ -2596,6 +2664,12 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         Message::MlsGroupJoined(result) => match result {
             Ok(group) => {
                 state.mls_group_id = hex_encode_bytes(&group.group_id);
+                if group.purpose == peer::MlsGroupPurpose::Call {
+                    state.call_group_id = state.mls_group_id.clone();
+                    state.call_group_status =
+                        "Você entrou no grupo MLS da chamada; mídia ainda não está conectada."
+                            .to_owned();
+                }
                 state.mls_status = format!(
                     "Grupo ingressado no epoch {}. O grupo e as chaves estão no SQLCipher local.",
                     group.epoch
@@ -2626,6 +2700,12 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 };
                 state.mls_pending_peer_welcome = None;
                 state.mls_group_id = hex_encode_bytes(&group.group_id);
+                if group.purpose == peer::MlsGroupPurpose::Call {
+                    state.call_group_id = state.mls_group_id.clone();
+                    state.call_group_status =
+                        "Você entrou no grupo MLS da chamada; mídia ainda não está conectada."
+                            .to_owned();
+                }
                 let history = load_mls_history(state, group.group_id);
                 return Task::batch([history, load_mls_groups()]);
             }
@@ -4667,6 +4747,16 @@ async fn create_mls_group_task() -> Result<storage::CreatedMlsGroup, String> {
     })
     .await
     .map_err(|error| format!("MLS group task failed: {error}"))?
+}
+
+async fn create_call_mls_group_task() -> Result<storage::CreatedMlsGroup, String> {
+    tokio::task::spawn_blocking(|| {
+        storage::create_call_mls_group(
+            openmls::prelude::Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519,
+        )
+    })
+    .await
+    .map_err(|error| format!("call MLS group task failed: {error}"))?
 }
 
 async fn create_mls_key_package_task() -> Result<storage::PreparedMlsKeyPackage, String> {
