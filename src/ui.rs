@@ -1214,18 +1214,39 @@ fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
         .style(panel_style)
         .into()
     } else {
-        tile(
+        tile(l, "orb", "Prévia ilustrativa · câmera desconectada")
+    };
+    let local_call_name = if state.name.trim().is_empty() {
+        "Você"
+    } else {
+        state.name.as_str()
+    };
+    let local_video = boxed(tile(
+        l,
+        "hat",
+        format!("{local_call_name} · câmera desligada"),
+    ));
+    let remote_video = if state.call_rtc_session.is_some() {
+        let remote_name = state
+            .active_peer_device
+            .map(|device| {
+                let alias = state.peer_contact_alias.trim();
+                if alias.is_empty() {
+                    format!("Peer {}", crate::hex_encode_bytes(&device[..4]))
+                } else {
+                    alias.to_owned()
+                }
+            })
+            .unwrap_or_else(|| "Peer conectado".to_owned());
+        boxed(tile(
             l,
             "orb",
-            "Bram · cena ilustrativa / nenhuma câmera conectada",
-        )
+            format!("{remote_name} · vídeo indisponível"),
+        ))
+    } else {
+        boxed(tile(l, "orb", "Aguardando peer"))
     };
-    let filmstrip = row![
-        boxed(tile(l, "frog-scene", "Mara · personagem")),
-        boxed(tile(l, "gnome-scene", "Pim · personagem")),
-        boxed(tile(l, "hat", "Você · câmera indisponível"))
-    ]
-    .spacing(l.px(12.0));
+    let filmstrip = row![remote_video, local_video].spacing(l.px(12.0));
     let video_control: Element<'_, Message> = if state.screen_sharing_active {
         l.control(
             "close",
@@ -1270,14 +1291,39 @@ fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
             })
     ]
     .spacing(l.px(10.0));
-    let roster = column![
-        l.label("I N  T H E  R O O M", 11.0, MUTED),
-        person(l, "orb-avatar", "Bram", "exemplo"),
-        person(l, "frog", "Mara", "exemplo"),
-        person(l, "gnome", "Pim", "exemplo"),
-        person(l, "wizard", "You", "prévia")
-    ]
-    .spacing(l.px(13.0));
+    let mut roster_entries = vec![
+        l.label("PARTICIPANTES DA CHAMADA", 11.0, MUTED).into(),
+        person(
+            l,
+            "wizard",
+            local_call_name,
+            if state.call_rtc_session.is_some() {
+                "você · conectado"
+            } else {
+                "dispositivo local"
+            },
+        ),
+    ];
+    if state.call_rtc_session.is_some() {
+        let remote_name = state
+            .active_peer_device
+            .map(|device| {
+                let alias = state.peer_contact_alias.trim();
+                if alias.is_empty() {
+                    format!("Peer {}", crate::hex_encode_bytes(&device[..4]))
+                } else {
+                    alias.to_owned()
+                }
+            })
+            .unwrap_or_else(|| "Peer conectado".to_owned());
+        roster_entries.push(person(l, "orb-avatar", &remote_name, "áudio ativo"));
+    } else {
+        roster_entries.push(
+            l.label("Nenhum peer conectado à chamada.", 10.0, MUTED)
+                .into(),
+        );
+    }
+    let roster = column(roster_entries).spacing(l.px(13.0));
     let room_messages: Element<'_, Message> = if state.call_room_messages.is_empty() {
         column![l.label(
             "As mensagens desta chamada ficam só na memória e desaparecem ao sair.",

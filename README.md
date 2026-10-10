@@ -234,6 +234,10 @@ trial, but have only been verified with two local WebRTC peers so far. Both devi
 manually pinned direct peer session and membership in the **same dedicated call
 MLS group**.
 
+The call UI currently supports one remote peer per device. The MLS call group
+can have multiple members, but three-or-more-party media and the Elixir SFU are
+not implemented; the sample characters in the call artwork are decorative.
+
 1. On one device, open **Chamada**, create a protected call group, then use
    **Convidar participantes** to admit the other device through the MLS flow.
    Complete the Welcome on the other device and confirm both screens show the
@@ -559,6 +563,9 @@ the missing display environment are recorded in the capture instructions below.
 
 ![Native Iced call screen capture from before protected Opus RTP integration; a fresh capture needs a Wayland or X11 display](docs/design/runtime/native-vhs/10-call.png)
 
+This capture also predates the live participant roster. Refreshing it was
+attempted after that UI change, but this checkout has no Wayland or X11 display.
+
 ![Actual 934 × 1000 native Iced MLS screen showing pending, approved, and rejected self-update proposal review controls; proposal rows are capture fixtures](docs/design/runtime/native-vhs/11-mls.png)
 
 ![Actual native Iced MLS screen with an encrypted attachment card and save action; attachment and connected state are capture fixtures](docs/design/runtime/native-vhs/12-mls-attachments.png)
@@ -686,6 +693,8 @@ in the identity screen; its keys and address are fixtures.
 after QR import; all values are fixtures.
 `--capture-call-negotiation` shows call controls with sample identity, peer, and
 group values; they do not represent a live MLS group or WebRTC session.
+Its screenshot could not be refreshed in this headless environment because
+Iced requires `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, or `DISPLAY`.
 `--capture-share-camera` shows the camera tab with real enumerated device names;
 it does not open a camera or display a live image. `--capture-share-window`
 shows two illustrative window rows; it does not enumerate live windows, open the
