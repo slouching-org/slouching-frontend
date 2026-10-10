@@ -88,7 +88,8 @@ local profile. The relay carries encrypted QUIC traffic and can observe
 connection metadata; it is operated by a group member, not provided by
 Slouching. Remote relays must use HTTPS and require the same shared token on
 all members. The local integration test starts an authenticated Iroh Relay
-1.3 server and confirms a pinned message and ACK with no direct peer address;
+1.3 server and confirms a pinned text message, opaque MLS event, and their
+ACKs with no direct peer address; this tests transport, not MLS cryptography;
 remote TLS deployment and cross-network behavior have not yet been verified.
 
 If both devices use the same VPN, they can also try the direct flow now: enter

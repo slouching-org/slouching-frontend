@@ -2003,7 +2003,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_authenticated_relay_carries_a_pinned_peer_message() {
+    async fn custom_authenticated_relay_carries_pinned_text_and_mls_events() {
         let token = "integration-test-shared-token";
         let mut config = ServerConfig::default();
         let mut relay_config = RelayConfig::new("127.0.0.1:0".parse::<SocketAddr>().unwrap());
@@ -2022,6 +2022,16 @@ mod tests {
 
         let receiver_key = SecretKey::from_bytes(&[0x71; 32]);
         let sender_key = SecretKey::from_bytes(&[0x72; 32]);
+        let expected_event = MlsEventEnvelope {
+            event_id: [0x73; 16],
+            author_device: *sender_key.public().as_bytes(),
+            group_id: vec![0x74; 16],
+            epoch: 2,
+            checkpoint: Some(vec![0x75; 32]),
+            expires_at_unix: 1_900_000_000,
+            ciphertext: vec![0x76; 48],
+        };
+        let expected_event_at_receiver = expected_event.clone();
         let receiver = bind_listener_with_relay(
             receiver_key.clone(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2039,6 +2049,7 @@ mod tests {
             let (commands, command_rx) = mpsc::channel(4);
             let mut events = Box::pin(session.run(command_rx));
             let mut received_message = false;
+            let mut received_mls_event = false;
             while let Some(event) = tokio::time::timeout(Duration::from_secs(12), events.next())
                 .await
                 .expect("relay-routed message should arrive")
@@ -2052,7 +2063,17 @@ mod tests {
                             .await
                             .expect("receiver should acknowledge the saved message");
                     }
-                    PeerEvent::Disconnected { .. } => return received_message,
+                    PeerEvent::MlsEventReceived { sequence, event } => {
+                        assert_eq!(event, expected_event_at_receiver);
+                        received_mls_event = true;
+                        commands
+                            .send(PeerCommand::AcceptInbound { sequence })
+                            .await
+                            .expect("receiver should acknowledge the MLS event");
+                    }
+                    PeerEvent::Disconnected { .. } => {
+                        return received_message && received_mls_event;
+                    }
                     _ => {}
                 }
             }
@@ -2071,13 +2092,26 @@ mod tests {
             })
             .await
             .unwrap();
-        let mut acknowledged = false;
+        commands
+            .send(PeerCommand::SendMlsEvent {
+                request_id: 2,
+                event: expected_event,
+            })
+            .await
+            .unwrap();
+        let mut text_acknowledged = false;
+        let mut mls_acknowledged = false;
         while let Some(event) = tokio::time::timeout(Duration::from_secs(12), events.next())
             .await
             .expect("relay-routed message should receive an ACK")
         {
             if matches!(event, PeerEvent::Acknowledged { request_id: 1, .. }) {
-                acknowledged = true;
+                text_acknowledged = true;
+            }
+            if matches!(event, PeerEvent::MlsEventAcknowledged { request_id: 2 }) {
+                mls_acknowledged = true;
+            }
+            if text_acknowledged && mls_acknowledged {
                 commands.send(PeerCommand::Disconnect).await.unwrap();
             }
             if matches!(event, PeerEvent::Disconnected { .. }) {
@@ -2085,8 +2119,12 @@ mod tests {
             }
         }
         assert!(
-            acknowledged,
-            "receiver ACK should reach the sender over relay"
+            text_acknowledged,
+            "receiver text ACK should reach the sender over relay"
+        );
+        assert!(
+            mls_acknowledged,
+            "receiver MLS ACK should reach sender over relay"
         );
         assert!(receiver_task.await.unwrap());
         server
