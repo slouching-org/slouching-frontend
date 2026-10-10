@@ -196,6 +196,8 @@ struct Slouching {
     capture_once: bool,
     profile_status: ProfileStatus,
     identity_status: IdentityStatus,
+    delegated_mls_storage: Option<storage::DelegatedMlsStorageStatus>,
+    delegated_mls_storage_error: Option<String>,
     peer_public_key: String,
     peer_routes: Vec<storage::StoredPeerRoute>,
     peer_routes_error: Option<String>,
@@ -339,6 +341,8 @@ impl Default for Slouching {
             capture_once: false,
             profile_status: ProfileStatus::Loading,
             identity_status: IdentityStatus::Loading,
+            delegated_mls_storage: None,
+            delegated_mls_storage_error: None,
             peer_public_key: String::new(),
             peer_routes: Vec::new(),
             peer_routes_error: None,
@@ -418,6 +422,9 @@ enum Message {
     IdentityLoaded(Result<Option<[u8; 32]>, String>),
     CreateIdentity,
     IdentityCreated(Result<[u8; 32], String>),
+    DelegatedMlsStorageLoaded(Result<storage::DelegatedMlsStorageStatus, String>),
+    SetDelegatedMlsStorage(bool),
+    DelegatedMlsStorageSaved(bool, Result<storage::DelegatedMlsStorageStatus, String>),
     CopyDeviceKey,
     CopyPeerListenAddress(String),
     PeerPublicKeyChanged(String),
@@ -587,6 +594,36 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             };
         }
         Message::TransportEvent(_, _) => {}
+        Message::DelegatedMlsStorageLoaded(result) => match result {
+            Ok(status) => {
+                state.delegated_mls_storage = Some(status);
+                state.delegated_mls_storage_error = None;
+            }
+            Err(error) => state.delegated_mls_storage_error = Some(error),
+        },
+        Message::SetDelegatedMlsStorage(enabled) => {
+            let quota = state
+                .delegated_mls_storage
+                .as_ref()
+                .map_or(64 * 1024 * 1024, |s| s.quota_bytes);
+            state.delegated_mls_storage_error = None;
+            return Task::perform(
+                set_delegated_mls_storage_task(enabled, quota),
+                move |result| Message::DelegatedMlsStorageSaved(enabled, result),
+            );
+        }
+        Message::DelegatedMlsStorageSaved(enabled, result) => match result {
+            Ok(status) => {
+                state.delegated_mls_storage = Some(status);
+                state.delegated_mls_storage_error = None;
+            }
+            Err(error) => {
+                state.delegated_mls_storage_error = Some(error);
+                if let Some(status) = &mut state.delegated_mls_storage {
+                    status.enabled = !enabled;
+                }
+            }
+        },
         Message::Navigate(screen) => {
             state.screen = screen;
             state.show_gallery = false;
@@ -3005,6 +3042,11 @@ fn boot() -> (Slouching, Task<Message>) {
         state.screen = screen;
         state.capture_once = true;
     }
+    if let Some(pos) = args.iter().position(|s| s == "--settings-tab")
+        && let Some(value) = args.get(pos + 1).and_then(|value| value.parse::<u8>().ok())
+    {
+        state.settings_tab = value.min(7);
+    }
     if let Some(pos) = args.iter().position(|s| s == "--capture-dir")
         && let Some(path) = args.get(pos + 1)
     {
@@ -3033,6 +3075,10 @@ fn boot() -> (Slouching, Task<Message>) {
             Task::perform(fetch_backend_status(), Message::BackendFetched),
             Task::perform(load_profile_task(), Message::ProfileLoaded),
             Task::perform(load_identity_task(), Message::IdentityLoaded),
+            Task::perform(
+                load_delegated_mls_storage_task(),
+                Message::DelegatedMlsStorageLoaded,
+            ),
             load_mls_groups(),
             Task::perform(load_peer_routes_task(), Message::PeerRoutesLoaded),
             transport,
@@ -3045,6 +3091,24 @@ async fn load_profile_task() -> Result<Option<storage::LocalProfile>, String> {
     tokio::task::spawn_blocking(storage::load_profile)
         .await
         .map_err(|error| format!("local profile task failed: {error}"))?
+}
+
+async fn load_delegated_mls_storage_task() -> Result<storage::DelegatedMlsStorageStatus, String> {
+    tokio::task::spawn_blocking(storage::load_delegated_mls_storage_status)
+        .await
+        .map_err(|error| format!("delegated MLS storage task failed: {error}"))?
+}
+
+async fn set_delegated_mls_storage_task(
+    enabled: bool,
+    quota_bytes: i64,
+) -> Result<storage::DelegatedMlsStorageStatus, String> {
+    tokio::task::spawn_blocking(move || {
+        storage::set_delegated_mls_storage_policy(enabled, quota_bytes)?;
+        storage::load_delegated_mls_storage_status()
+    })
+    .await
+    .map_err(|error| format!("delegated MLS storage update task failed: {error}"))?
 }
 
 fn load_mls_groups() -> Task<Message> {

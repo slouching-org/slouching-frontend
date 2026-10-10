@@ -797,7 +797,38 @@ fn settings(state: &Slouching, l: Layout) -> Element<'_, Message> {
                     "Abrir mensagens diretas LAN",
                     Some(Message::Navigate(Screen::Chat)),
                     true
-                )
+                ),
+                rule(LINE, l.px(8.0)),
+                l.label("CÓPIAS MLS DELEGADAS", 11.0, GOLD),
+                l.label(
+                    "Permite que este dispositivo guarde temporariamente ciphertext MLS autorizado por outro membro. O conteúdo permanece criptografado.",
+                    12.0,
+                    PAPER
+                ),
+                l.label(
+                    match state.delegated_mls_storage {
+                        Some(status) if status.enabled => "Armazenamento ativado · limite de 64 MiB",
+                        Some(_) => "Armazenamento desativado · nenhuma cópia é retida",
+                        None => "Carregando política local de armazenamento…",
+                    },
+                    11.0,
+                    if state.delegated_mls_storage.is_some_and(|status| status.enabled) { GREEN } else { MUTED }
+                ),
+                l.control(
+                    "shield",
+                    if state.delegated_mls_storage.is_some_and(|status| status.enabled) {
+                        "Desativar cópias MLS neste dispositivo"
+                    } else {
+                        "Permitir cópias MLS neste dispositivo"
+                    },
+                    state.delegated_mls_storage.map(|status| Message::SetDelegatedMlsStorage(!status.enabled)),
+                    state.delegated_mls_storage.is_some()
+                ),
+                if let Some(error) = &state.delegated_mls_storage_error {
+                    l.label(error, 11.0, RED)
+                } else {
+                    l.label("A fila expira em até 30 dias e é apagada após a confirmação do destinatário.", 11.0, MUTED)
+                }
             ]
             .spacing(l.px(24.0)),
         ),

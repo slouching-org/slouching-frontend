@@ -175,6 +175,14 @@ pub struct StoredDelegatedMlsCopy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DelegatedMlsStorageStatus {
+    pub enabled: bool,
+    pub quota_bytes: i64,
+    pub used_bytes: i64,
+    pub queued_copies: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegatedCopyStoreResult {
     Stored,
     AlreadyStored,
@@ -205,6 +213,40 @@ pub fn set_delegated_mls_storage_policy(enabled: bool, quota_bytes: i64) -> Resu
         )
         .map_err(|error| format!("could not save delegated storage policy: {error}"))?;
     Ok(())
+}
+
+pub fn load_delegated_mls_storage_status() -> Result<DelegatedMlsStorageStatus, String> {
+    let connection = open_local_database()?;
+    let now = unix_time_now()?;
+    connection
+        .execute(
+            "UPDATE local_delegated_mls_copies
+             SET delivery_state = 'expired', ciphertext = NULL
+             WHERE delivery_state = 'queued' AND expires_at_unix <= ?1",
+            [now],
+        )
+        .map_err(|error| format!("could not expire delegated MLS copies: {error}"))?;
+    cleanup_delegated_mls_tombstones(&connection, now)?;
+    connection
+        .query_row(
+            "SELECT p.enabled, p.quota_bytes,
+                    COALESCE(SUM(CASE WHEN c.delivery_state = 'queued'
+                                      THEN length(c.ciphertext) ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN c.delivery_state = 'queued' THEN 1 ELSE 0 END), 0)
+             FROM local_delegation_policy p
+             LEFT JOIN local_delegated_mls_copies c ON 1 = 1
+             WHERE p.id = 1",
+            [],
+            |row| {
+                Ok(DelegatedMlsStorageStatus {
+                    enabled: row.get(0)?,
+                    quota_bytes: row.get(1)?,
+                    used_bytes: row.get(2)?,
+                    queued_copies: row.get(3)?,
+                })
+            },
+        )
+        .map_err(|error| format!("could not load delegated storage status: {error}"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -239,6 +239,13 @@ be installed and available in the user session.
 
 ![Actual 1884 × 1000 native Iced MLS screen describing the direct KeyPackage and Welcome session flow](docs/design/runtime/native-vhs/11-mls.png)
 
+![Actual native Iced Network and P2P settings with the delegated MLS copy consent control; Secret Service is unavailable in this capture, so the local policy cannot load](docs/design/runtime/native-vhs/02-settings.png)
+
+The Network and P2P settings now expose persisted opt-in for delegated
+encrypted MLS copies, with the local quota and expiry policy beside the
+control. Transport and recipient fetch are still pending, so this consent
+setting alone does not provide offline delivery.
+
 The MLS screen now detects authenticated committer equivocation. It verifies a
 conflicting historical Commit against a saved OpenMLS epoch snapshot, stores
 both Commit values in the encrypted database, and quarantines that group on
