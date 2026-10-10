@@ -64,8 +64,9 @@ path.
    after an ACK; received text appears live after the pinned identity check.
 
 A successful outbound connection saves the pinned device key and socket address
-in the encrypted local route book. The chat screen lists these routes for future
-group-member delivery; LAN addresses can become stale. The listener stays
+in the encrypted local route book. The chat screen lists these routes, and the
+MLS screen can use them to distribute pending Commits to current group members.
+LAN addresses can become stale; peers without a saved route remain pending. The listener stays
 available through the session. Either side can use **Desconectar sessão** to
 close it; start a new session to reconnect. The
 receiver saves an inbound message to its encrypted local history before ACK;
@@ -110,8 +111,13 @@ epoch before ACK, and the sender stores that ACK per recipient. Exact redelivery
 is harmless. When a pinned peer connects, the client checks for that device's
 eligible Commit chain and starts delivery automatically; each next Commit waits
 for the preceding durable ACK. The manual **Enviar Commits pendentes** control
-remains available. Connect to each member to deliver its eligible chain;
-offline delivery remains in progress. If a recipient is behind, it requests the missing predecessor over
+remains available for the connected peer. **Distribuir a todos os peers salvos**
+walks the queued recipient ledger, connects to each peer's saved route in turn,
+and sends its eligible Commits in bounded batches. Each Commit waits for its
+durable ACK before the next is sent; one unavailable peer does not stop delivery
+to the others. Stop the current listener/session before starting the fan-out.
+Stale or missing routes are reported and can be retried after reconnecting.
+Offline delivery remains in progress. If a recipient is behind, it requests the missing predecessor over
 the pinned session; the committer serves it only when that device was in the
 Commit's predecessor snapshot, including Commits already marked delivered.
 The MLS screen
@@ -230,8 +236,9 @@ Assets and font license/provenance notes are in [assets/README.md](assets/README
   in SQLCipher. MLS application messages use the direct pinned Iroh/QUIC session with a
   local SQLCipher transcript and retryable outbox. Membership Commit bytes are
   atomically journaled with group state; ordered direct delivery, per-device
-  ACKs, and predecessor recovery are available, while automatic multi-member
-  fan-out, helper delivery, and media remain in progress.
+  ACKs, predecessor recovery, and sequential multi-member fan-out over saved
+  pinned routes are available. Helper delivery, offline delivery, and media
+  remain in progress.
 - **Server/backend:** Elixir in
   [`slouching-org/slouching-backend`](https://github.com/slouching-org/slouching-backend).
 - **Current boundary:** loopback HTTP status and binary protobuf WebSocket

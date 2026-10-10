@@ -1396,6 +1396,23 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             Some(Message::DistributeMlsCommit),
             state.mls_quarantine_reason.is_none()
         ),
+        l.control(
+            "users",
+            if state.mls_fanout_running {
+                "Distribuindo Commits…"
+            } else {
+                "Distribuir a todos os peers salvos"
+            },
+            Some(Message::DistributeMlsCommitsToAll),
+            state.mls_quarantine_reason.is_none()
+                && !state.mls_fanout_running
+                && state.peer_listener_handle.is_none()
+        ),
+        l.label(
+            "Usa rotas pinadas salvas; encerre o listener/sessão atual. Cada próximo Commit aguarda o ACK durável do anterior.",
+            10.0,
+            MUTED
+        ),
         l.label("WELCOME · COPIE PARA O DISPOSITIVO CONVIDADO", 10.0, GOLD),
         l.input(
             "Welcome hexadecimal",

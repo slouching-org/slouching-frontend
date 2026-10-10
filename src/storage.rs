@@ -608,6 +608,32 @@ pub fn list_mls_commit_recipient_status(
     list_mls_commit_recipient_status_in(&connection, group_id, limit)
 }
 
+pub fn list_queued_mls_commit_recipients(group_id: &[u8]) -> Result<Vec<[u8; 32]>, String> {
+    if group_id.len() != 16 {
+        return Err("MLS group ID must be 16 bytes".to_owned());
+    }
+    let connection = open_local_database()?;
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT r.device_public_key
+             FROM local_mls_commit_recipients r
+             JOIN local_mls_commits c ON c.event_id = r.commit_event_id
+             WHERE c.group_id = ?1 AND r.delivery_state = 'queued'
+             ORDER BY r.device_public_key",
+        )
+        .map_err(|error| format!("could not prepare queued MLS recipient query: {error}"))?;
+    let rows = statement
+        .query_map(params![group_id], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(|error| format!("could not query queued MLS recipients: {error}"))?;
+    rows.map(|row| {
+        fixed_bytes(
+            row.map_err(|error| format!("could not read queued MLS recipient: {error}"))?,
+            "MLS recipient device key",
+        )
+    })
+    .collect()
+}
+
 fn list_mls_commit_recipient_status_in(
     connection: &Connection,
     group_id: &[u8],
@@ -755,23 +781,60 @@ fn list_queued_mls_commits_for_peer_in(
     if group_id.len() != 16 || !(1..=100).contains(&limit) {
         return Err("MLS group ID must be 16 bytes and limit must be 1..100".to_owned());
     }
-    let commits = list_queued_mls_commits_in(connection, group_id, limit)?;
-    let mut eligible = Vec::new();
-    for commit in commits {
-        let delivery_state: Option<String> = connection
-            .query_row(
-                "SELECT delivery_state FROM local_mls_commit_recipients
-                 WHERE commit_event_id = ?1 AND device_public_key = ?2",
-                params![commit.event_id.as_slice(), peer_device.as_slice()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| format!("could not load Commit recipient state: {error}"))?;
-        if delivery_state.as_deref() == Some("queued") {
-            eligible.push(commit);
+    ensure_mls_group_not_quarantined(connection, group_id)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT c.event_id, c.group_id, c.predecessor_epoch, c.epoch,
+                    c.author_device, c.commit_hash, c.commit_bytes
+             FROM local_mls_commits c
+             JOIN local_mls_commit_recipients r ON r.commit_event_id = c.event_id
+             WHERE c.group_id = ?1 AND r.device_public_key = ?2
+               AND r.delivery_state = 'queued'
+             ORDER BY c.predecessor_epoch, c.epoch LIMIT ?3",
+        )
+        .map_err(|error| format!("could not prepare peer MLS Commit query: {error}"))?;
+    let rows = statement
+        .query_map(
+            params![group_id, peer_device.as_slice(), limit as i64],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                ))
+            },
+        )
+        .map_err(|error| format!("could not query peer MLS Commits: {error}"))?;
+    let mut queued = Vec::new();
+    for row in rows {
+        let (event_id, stored_group_id, predecessor_epoch, epoch, author_device, digest, commit) =
+            row.map_err(|error| format!("could not read peer MLS Commit: {error}"))?;
+        let commit_hash = fixed_bytes(digest, "MLS Commit digest")?;
+        if blake3::hash(&commit).as_bytes() != &commit_hash {
+            return Err("saved MLS Commit bytes do not match their digest".to_owned());
         }
+        let predecessor_epoch = u64::try_from(predecessor_epoch)
+            .map_err(|_| "saved MLS Commit has an invalid predecessor epoch".to_owned())?;
+        let epoch =
+            u64::try_from(epoch).map_err(|_| "saved MLS Commit has an invalid epoch".to_owned())?;
+        if epoch != predecessor_epoch.saturating_add(1) {
+            return Err("saved MLS Commit is not the next group epoch".to_owned());
+        }
+        queued.push(StoredMlsCommit {
+            event_id: fixed_bytes(event_id, "MLS Commit event id")?,
+            group_id: fixed_bytes::<16>(stored_group_id, "MLS Commit group id")?.to_vec(),
+            predecessor_epoch,
+            epoch,
+            author_device: fixed_bytes(author_device, "MLS Commit author")?,
+            commit_hash,
+            commit,
+        });
     }
-    Ok(eligible)
+    Ok(queued)
 }
 
 pub fn mark_mls_commit_delivered(
@@ -4572,7 +4635,6 @@ mod tests {
             ),
             (0, 1)
         );
-
         let wrong_committer = join_mls_group_from_welcome_in(
             &mut invitee,
             &admission.welcome,
@@ -4768,6 +4830,15 @@ mod tests {
         let second_admission = second_admission
             .expect("designated committer should generate the next membership Commit");
         assert_eq!(second_admission.epoch, 2);
+        let invitee_queue = list_queued_mls_commits_for_peer_in(
+            &mut creator,
+            &group.group_id,
+            &invitee_public_key,
+            100,
+        )
+        .expect("peer fan-out query should find its queued membership Commit");
+        assert_eq!(invitee_queue.len(), 1);
+        assert_eq!(invitee_queue[0].event_id, second_admission.commit_event_id);
         assert_eq!(
             second_admission.commit_event_id.as_slice(),
             &blake3::hash(&second_admission.commit).as_bytes()[..16]

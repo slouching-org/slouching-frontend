@@ -154,6 +154,19 @@ impl Screen {
 type PendingPeerKeyPackage = (u64, [u8; 32], Vec<u8>, Vec<u8>);
 type PendingPeerWelcome = (u64, [u8; 32], Vec<u8>, Vec<u8>, Vec<u8>);
 
+#[derive(Debug, Clone)]
+struct MlsCommitFanoutReport {
+    recipients: usize,
+    commits_acked: usize,
+    failures: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct MlsCommitFanoutPeerOutcome {
+    commits_acked: usize,
+    failure: Option<String>,
+}
+
 struct Slouching {
     backend: BackendConnection,
     transport: TransportState,
@@ -217,6 +230,7 @@ struct Slouching {
     mls_pending_peer_key_package: Option<PendingPeerKeyPackage>,
     mls_pending_peer_welcome: Option<PendingPeerWelcome>,
     mls_commit_recipients: Vec<storage::MlsCommitRecipientStatus>,
+    mls_fanout_running: bool,
     mls_pending_events: std::collections::HashMap<u64, [u8; 16]>,
     mls_sending_commits: std::collections::HashMap<u64, [u8; 16]>,
     mls_sending_proposals: std::collections::HashSet<u64>,
@@ -358,6 +372,7 @@ impl Default for Slouching {
             mls_pending_peer_key_package: None,
             mls_pending_peer_welcome: None,
             mls_commit_recipients: Vec::new(),
+            mls_fanout_running: false,
             mls_pending_events: std::collections::HashMap::new(),
             mls_sending_commits: std::collections::HashMap::new(),
             mls_sending_proposals: std::collections::HashSet::new(),
@@ -443,6 +458,8 @@ enum Message {
     ApplyMlsCommit,
     MlsCommitProcessed(Result<storage::ProcessedMlsCommit, String>),
     DistributeMlsCommit,
+    DistributeMlsCommitsToAll,
+    MlsCommitFanoutFinished(Vec<u8>, Result<MlsCommitFanoutReport, String>),
     MlsCommitsReadyToSend(Vec<u8>, Result<Vec<storage::StoredMlsCommit>, String>),
     MlsCommitPeerCommandSent(u64, Result<(), String>),
     MlsCommitDelivered(u64, Result<(), String>),
@@ -1959,6 +1976,56 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 state.mls_status = format!("Falha ao criar Commit das propostas: {error}")
             }
         },
+        Message::DistributeMlsCommitsToAll => {
+            if state.mls_quarantine_reason.is_some() {
+                state.mls_status =
+                    "Grupo em quarentena; fan-out de Commits está bloqueado.".to_owned();
+                return Task::none();
+            }
+            if state.mls_fanout_running
+                || state.peer_listener_handle.is_some()
+                || !state.peer_pending_sends.is_empty()
+                || !state.mls_sending_commits.is_empty()
+            {
+                state.mls_status = "Encerre a sessão/listener atual e aguarde as entregas em curso antes do fan-out.".into();
+                return Task::none();
+            }
+            let group_id = match hex_decode_bytes(&state.mls_group_id) {
+                Ok(group_id) if group_id.len() == 16 => group_id,
+                _ => {
+                    state.mls_status = "Informe o ID do grupo MLS.".to_owned();
+                    return Task::none();
+                }
+            };
+            state.mls_fanout_running = true;
+            state.mls_status =
+                "Buscando rotas salvas e entregando Commits em ordem, com ACK por membro…".into();
+            return Task::perform(fanout_mls_commits_task(group_id.clone()), move |result| {
+                Message::MlsCommitFanoutFinished(group_id, result)
+            });
+        }
+        Message::MlsCommitFanoutFinished(group_id, result) => {
+            state.mls_fanout_running = false;
+            match result {
+                Ok(report) if report.failures.is_empty() => {
+                    state.mls_status = format!(
+                        "Fan-out concluído: {} Commit(s) confirmados por ACK em {} peer(s).",
+                        report.commits_acked, report.recipients
+                    );
+                }
+                Ok(report) => {
+                    state.mls_status = format!(
+                        "Fan-out parcial: {} Commit(s) confirmados em {} peer(s); {} peer(s) pendentes/sem rota. {}",
+                        report.commits_acked,
+                        report.recipients,
+                        report.failures.len(),
+                        report.failures.join(" · ")
+                    );
+                }
+                Err(error) => state.mls_status = format!("Fan-out falhou: {error}"),
+            }
+            return load_mls_history(state, group_id);
+        }
         Message::DistributeMlsCommit => {
             if state.mls_quarantine_reason.is_some() {
                 state.mls_status =
@@ -3017,6 +3084,210 @@ async fn load_mls_commits_for_peer_task(
     })
     .await
     .map_err(|error| format!("MLS Commit peer check failed: {error}"))?
+}
+
+async fn fanout_mls_commits_task(group_id: Vec<u8>) -> Result<MlsCommitFanoutReport, String> {
+    let recipient_group_id = group_id.clone();
+    let (statuses, routes) = tokio::task::spawn_blocking(move || {
+        Ok::<_, String>((
+            storage::list_queued_mls_commit_recipients(&recipient_group_id)?,
+            storage::list_peer_routes()?,
+        ))
+    })
+    .await
+    .map_err(|error| format!("MLS fan-out preparation task failed: {error}"))??;
+    let route_by_device = routes
+        .into_iter()
+        .map(|route| (route.device_public_key, route.address))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut recipients = statuses;
+    recipients.sort_unstable();
+    recipients.dedup();
+
+    let mut report = MlsCommitFanoutReport {
+        recipients: recipients.len(),
+        commits_acked: 0,
+        failures: Vec::new(),
+    };
+    for peer_device in recipients {
+        let Some(address) = route_by_device.get(&peer_device).cloned() else {
+            report.failures.push(format!(
+                "{}… sem rota salva",
+                hex_encode_bytes(&peer_device[..4])
+            ));
+            continue;
+        };
+        loop {
+            let commits = match load_mls_commits_for_peer_task(group_id.clone(), peer_device).await
+            {
+                Ok(commits) => commits,
+                Err(error) => {
+                    report
+                        .failures
+                        .push(format!("{}…: {error}", hex_encode_bytes(&peer_device[..4])));
+                    break;
+                }
+            };
+            if commits.is_empty() {
+                break;
+            }
+            let has_more = commits.len() == 100;
+            let outcome = fanout_mls_commits_to_peer(peer_device, address.clone(), commits).await;
+            report.commits_acked += outcome.commits_acked;
+            if let Some(error) = outcome.failure {
+                report
+                    .failures
+                    .push(format!("{}…: {error}", hex_encode_bytes(&peer_device[..4])));
+                break;
+            }
+            if !has_more {
+                break;
+            }
+        }
+    }
+    Ok(report)
+}
+
+async fn fanout_mls_commits_to_peer(
+    peer_device: [u8; 32],
+    address: String,
+    commits: Vec<storage::StoredMlsCommit>,
+) -> MlsCommitFanoutPeerOutcome {
+    let mut outcome = MlsCommitFanoutPeerOutcome::default();
+    let endpoint = match parse_peer_id(&hex_encode_bytes(&peer_device)) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            outcome.failure = Some(format!("invalid pinned peer key: {error}"));
+            return outcome;
+        }
+    };
+    let address = match address.parse::<std::net::SocketAddr>() {
+        Ok(address) if !address.ip().is_unspecified() && address.port() != 0 => address,
+        _ => {
+            outcome.failure = Some("saved route is not a reachable IP:port".to_owned());
+            return outcome;
+        }
+    };
+    let local_identity = match load_peer_secret_key_task().await {
+        Ok(identity) => identity,
+        Err(error) => {
+            outcome.failure = Some(error);
+            return outcome;
+        }
+    };
+    let session = match peer::connect_peer(local_identity, endpoint, address).await {
+        Ok(session) => session,
+        Err(error) => {
+            outcome.failure = Some(error);
+            return outcome;
+        }
+    };
+    let (commands, receiver) = tokio::sync::mpsc::channel(8);
+    let mut events = Box::pin(session.run(receiver));
+    match tokio::time::timeout(Duration::from_secs(8), events.next()).await {
+        Ok(Some(peer::PeerEvent::Connected { peer_id })) if *peer_id.as_bytes() == peer_device => {}
+        Ok(Some(event)) => {
+            outcome.failure = Some(format!("unexpected session start event: {event:?}"));
+            return outcome;
+        }
+        Ok(None) => {
+            outcome.failure = Some("session ended before connect event".to_owned());
+            return outcome;
+        }
+        Err(_) => {
+            outcome.failure = Some("timed out waiting for connected peer".to_owned());
+            return outcome;
+        }
+    }
+
+    for (index, stored) in commits.into_iter().enumerate() {
+        let request_id = index as u64 + 1;
+        let envelope = peer::MlsCommitEnvelope {
+            event_id: stored.event_id,
+            author_device: stored.author_device,
+            group_id: stored.group_id,
+            predecessor_epoch: stored.predecessor_epoch,
+            epoch: stored.epoch,
+            commit: stored.commit,
+        };
+        if let Err(error) = commands
+            .send(peer::PeerCommand::SendMlsCommit {
+                request_id,
+                commit: envelope,
+            })
+            .await
+        {
+            outcome.failure = Some(format!("could not queue Commit: {error}"));
+            break;
+        }
+        let acknowledged = loop {
+            match tokio::time::timeout(Duration::from_secs(30), events.next()).await {
+                Ok(Some(peer::PeerEvent::MlsCommitAcknowledged {
+                    request_id: acknowledged_id,
+                })) if acknowledged_id == request_id => break true,
+                Ok(Some(peer::PeerEvent::MlsCommitRejected {
+                    request_id: rejected_id,
+                    reason,
+                })) if rejected_id == request_id => {
+                    outcome.failure = Some(format!("Commit rejected: {reason}"));
+                    break false;
+                }
+                Ok(Some(peer::PeerEvent::MlsCommitDeliveryUnknown {
+                    request_id: unknown_id,
+                })) if unknown_id == request_id => {
+                    outcome.failure = Some("Commit delivery is unknown".to_owned());
+                    break false;
+                }
+                Ok(Some(peer::PeerEvent::Disconnected { reason })) => {
+                    outcome.failure = Some(format!("peer disconnected: {reason}"));
+                    break false;
+                }
+                Ok(Some(peer::PeerEvent::Connected { .. })) => continue,
+                Ok(Some(event)) => {
+                    outcome.failure = Some(format!(
+                        "unexpected event during Commit delivery: {event:?}"
+                    ));
+                    break false;
+                }
+                Ok(None) => {
+                    outcome.failure = Some("session ended before Commit ACK".to_owned());
+                    break false;
+                }
+                Err(_) => {
+                    outcome.failure = Some("timed out waiting for Commit ACK".to_owned());
+                    break false;
+                }
+            }
+        };
+        if !acknowledged {
+            break;
+        }
+        let event_id = stored.event_id;
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            storage::mark_mls_commit_delivered(event_id, peer_device)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result)
+        {
+            outcome.failure = Some(format!(
+                "peer ACKed but local recipient ledger could not be updated: {error}"
+            ));
+            break;
+        }
+        outcome.commits_acked += 1;
+    }
+
+    let _ = commands.send(peer::PeerCommand::Disconnect).await;
+    let _ = tokio::time::timeout(Duration::from_secs(8), async {
+        while let Some(event) = events.next().await {
+            if matches!(event, peer::PeerEvent::Disconnected { .. }) {
+                break;
+            }
+        }
+    })
+    .await;
+    outcome
 }
 
 async fn load_authorized_mls_commit_task(

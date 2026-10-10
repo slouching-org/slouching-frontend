@@ -3,8 +3,8 @@
 **Status:** eleven design-board screens plus a native MLS group screen. Direct
 LAN chat uses pinned Ed25519 device identities and persistent Iroh/QUIC
 sessions. Successful outbound connections save the pinned device key and
-last-seen socket address in the encrypted local route book, a foundation for
-planned multi-member Commit fan-out. MLS group setup can send a device-bound KeyPackage over the active
+last-seen socket address in the encrypted local route book. The MLS screen can
+use these saved routes for sequential multi-member Commit fan-out. MLS group setup can send a device-bound KeyPackage over the active
 pinned session; the committer reviews and admits it after matching the package
 identity to the transport peer. After admission, the committer sends Welcome
 and ratchet tree over the pinned session. The invitee validates the target
@@ -14,7 +14,7 @@ messages are encrypted with OpenMLS and sent over the active direct session.
 The receiver validates the sender binding and event metadata, advances the
 ratchet, stores ciphertext and the local transcript in SQLCipher, then ACKs.
 The sender marks the outbox event held by the peer after receiving that ACK.
-Queued application events can be retried from the MLS screen after reconnecting. Membership Commit bytes and the predecessor-epoch member roster are saved atomically with the merged group state. The MLS screen drains pending Commits in epoch order over the active pinned QUIC session, sending only to devices in each Commit's predecessor-epoch recipient snapshot. It waits for each durable ACK before advancing. If a device receives a later Commit before its expected predecessor, it requests that epoch over the pinned session; the committer can return an already-ACKed Commit only to a device in its original recipient snapshot. Newly invited members are excluded; a removed device can receive the Commit that removes it. The receiver validates envelope metadata, MLS signature, group, predecessor epoch, designated committer, and device-bound credentials before atomically persisting the Commit and journal record; transport ACK follows persistence and is durably recorded per recipient on the sender. The UI shows each eligible device's saved adoption ACK. Exact redelivery is idempotent. Repeat after connecting to each other member; multi-peer fan-out, offline delivery, and concurrent proposal handling remain open.
+Queued application events can be retried from the MLS screen after reconnecting. Membership Commit bytes and the predecessor-epoch member roster are saved atomically with the merged group state. The MLS screen drains pending Commits in epoch order over the active pinned QUIC session, sending only to devices in each Commit's predecessor-epoch recipient snapshot. It waits for each durable ACK before advancing. If a device receives a later Commit before its expected predecessor, it requests that epoch over the pinned session; the committer can return an already-ACKed Commit only to a device in its original recipient snapshot. Newly invited members are excluded; a removed device can receive the Commit that removes it. The receiver validates envelope metadata, MLS signature, group, predecessor epoch, designated committer, and device-bound credentials before atomically persisting the Commit and journal record; transport ACK follows persistence and is durably recorded per recipient on the sender. The UI shows each eligible device's saved adoption ACK. Exact redelivery is idempotent. The fan-out control visits recipients with queued Commits and saved routes in turn, sends bounded ordered batches, and persists each ACK before continuing. An unavailable peer does not stop the others; its Commits remain queued for retry. Routes can be stale and are learned from successful outbound pinned connections. Offline delivery and concurrent proposal handling remain open.
 
 Before applying a next-epoch Commit, the client stores the prior OpenMLS group
 state in the encrypted profile database. If a different Commit later arrives
@@ -66,8 +66,8 @@ available in the user session. The settings **Rede & P2P** screen separately
 shows local Elixir HTTP/WebSocket diagnostics; it does not carry chat traffic.
 
 Character scenes and call views remain visual previews. Camera, microphone,
-screen capture, contact discovery, verified pairing, multi-peer group fan-out,
-relay, and offline delivery are not implemented. The older web UI under
+screen capture, contact discovery, verified pairing, relay, and offline delivery
+are not implemented. The older web UI under
 `prototypes/web/` is a design benchmark, not the product runtime.
 
 See [direct peer transport v7](../transport/lan-peer-v7.md) for the direct session
