@@ -1215,9 +1215,17 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         },
         Message::CallRtcStateChanged(generation, state_name) => {
             if generation == 0 || generation == state.call_rtc_generation {
+                let terminal = state_name.contains("WebRTC falhou")
+                    || state_name.contains("peer encerrou a conexão");
+                if state_name.contains("silenciado") || state_name.contains("desconectado") {
+                    state.call_mic_muted = true;
+                } else if state_name.contains("Microfone ativo") {
+                    state.call_mic_muted = false;
+                }
                 state.call_group_status = state_name;
-                if generation == 0 {
+                if generation == 0 || terminal {
                     state.call_rtc_session = None;
+                    state.call_mic_muted = false;
                 }
             }
         }
@@ -3829,8 +3837,23 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     state.mls_status = format!(
                         "ALERTA DE SEGURANÇA: Commits assinados diferentes no predecessor epoch {predecessor_epoch}. Grupo em quarentena; envio MLS pausado."
                     );
-                    return load_mls_groups();
+                    let stop_call = stop_call_media_for_mls_group(
+                        state,
+                        &envelope.group_id,
+                        "grupo em quarentena",
+                    );
+                    return Task::batch([load_mls_groups(), stop_call]);
                 }
+                let stop_call = if matches!(&processed, storage::ProcessedMlsCommit::Applied { .. })
+                {
+                    stop_call_media_for_mls_group(
+                        state,
+                        &envelope.group_id,
+                        "época MLS avançou; renegocie a chamada",
+                    )
+                } else {
+                    Task::none()
+                };
                 if let Some(commands) = state.peer_session_commands.as_ref() {
                     let _ = commands.try_send(peer::PeerCommand::AcceptInbound { sequence });
                 }
@@ -3844,7 +3867,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     storage::ProcessedMlsCommit::EquivocationDetected { .. } => unreachable!(),
                 };
                 let history = load_mls_history(state, envelope.group_id);
-                return Task::batch([history, load_mls_groups()]);
+                return Task::batch([history, load_mls_groups(), stop_call]);
             }
             Err(error) => {
                 if let Some(commands) = state.peer_session_commands.as_ref() {
@@ -3930,13 +3953,30 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     )
                 }
             };
+            let stop_call = if matches!(
+                &result,
+                storage::ProcessedMlsCommit::Applied { .. }
+                    | storage::ProcessedMlsCommit::EquivocationDetected { .. }
+            ) {
+                if let Ok(group_id) = hex_decode_bytes(&state.mls_group_id) {
+                    stop_call_media_for_mls_group(
+                        state,
+                        &group_id,
+                        "época MLS avançou ou o grupo entrou em quarentena",
+                    )
+                } else {
+                    Task::none()
+                }
+            } else {
+                Task::none()
+            };
             let groups = load_mls_groups();
             if let Ok(group_id) = hex_decode_bytes(&state.mls_group_id)
                 && group_id.len() == 16
             {
-                return Task::batch([load_mls_history(state, group_id), groups]);
+                return Task::batch([load_mls_history(state, group_id), groups, stop_call]);
             }
-            return groups;
+            return Task::batch([groups, stop_call]);
         }
         Message::MlsCommitProcessed(Err(error)) => {
             state.mls_status = format!("Commit MLS rejeitado sem avançar o grupo: {error}");
@@ -5297,6 +5337,17 @@ fn watch_call_rtc_state(
                 changed = state.changed() => {
                     if changed.is_err() { break; }
                     let state_name = state.borrow().clone();
+                    if state_name == "Disconnected" {
+                        rtc.set_microphone_muted(true);
+                        yield Message::CallRtcStateChanged(generation, "WebRTC desconectado; microfone silenciado até reconectar.".to_owned());
+                        continue;
+                    }
+                    if state_name == "Failed" || state_name == "Closed" {
+                        rtc.set_microphone_muted(true);
+                        let _ = rtc.close().await;
+                        yield Message::CallRtcStateChanged(generation, "Conexão WebRTC falhou ou foi encerrada; microfone interrompido.".to_owned());
+                        break;
+                    }
                     if state_name == "Connected" && !mic_started {
                         mic_started = true;
                         let status = match rtc.start_microphone().await {
@@ -5317,6 +5368,36 @@ fn watch_call_rtc_state(
         }
     };
     Task::run(events, |message| message)
+}
+
+fn stop_call_media_for_mls_group(
+    state: &mut Slouching,
+    mls_group_id: &[u8],
+    reason: &str,
+) -> Task<Message> {
+    let Ok(call_group_id) = hex_decode_bytes(&state.call_group_id) else {
+        return Task::none();
+    };
+    if call_group_id.as_slice() != mls_group_id {
+        return Task::none();
+    }
+    let Some(session) = state.call_rtc_session.take() else {
+        return Task::none();
+    };
+    // Stop outgoing audio synchronously before the asynchronous peer cleanup.
+    session.set_microphone_muted(true);
+    state.call_mic_muted = true;
+    state.call_rtc_generation = state.call_rtc_generation.saturating_add(1);
+    state.call_group_status = format!("Chamada pausada: {reason}.");
+    Task::perform(async move { session.close().await }, move |result| {
+        Message::CallRtcStateChanged(
+            0,
+            result.map_or_else(
+                |error| format!("Chamada interrompida; falha ao fechar WebRTC: {error}"),
+                |_| "Chamada interrompida para proteger a nova época MLS.".to_owned(),
+            ),
+        )
+    })
 }
 
 async fn create_mls_key_package_task() -> Result<storage::PreparedMlsKeyPackage, String> {
