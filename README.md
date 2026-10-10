@@ -376,8 +376,11 @@ RTP, and verifies decoded samples reach the remote sink. This validates the
 local media path, not audio-device behavior between physical computers. Calls
 require both devices to be members of the same dedicated call MLS group, and
 each must select a microphone and output in Settings. The call screen's
-microphone control silences outgoing frames locally. Camera and screen capture,
-noise suppression, echo cancellation, and push-to-talk are still inactive.
+microphone control silences outgoing frames locally. The screen chooser
+enumerates monitors and captures a still preview on demand without sending it to
+a peer. Continuous screen capture, H.264 encoding, protected video RTP, remote
+video rendering, camera capture, noise suppression, echo cancellation, and
+push-to-talk are still inactive.
 **Rede & P2P** in Settings retains
 the Elixir HTTP/WebSocket diagnostics and manual refresh. On Linux, this uses
 Secret Service, so a desktop password vault must

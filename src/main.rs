@@ -10,6 +10,7 @@ pub mod identity;
 pub mod media;
 mod peer;
 mod peer_invite;
+pub mod screen_capture;
 pub mod storage;
 mod ui;
 use prost::Message as ProstMessage;
@@ -237,7 +238,10 @@ struct Slouching {
     show_gallery: bool,
     settings_tab: u8,
     share_tab: u8,
-    selected_source: u8,
+    screen_sources: Vec<screen_capture::ScreenSource>,
+    selected_source: Option<u32>,
+    screen_capture_status: String,
+    screen_preview: Option<iced::widget::image::Handle>,
     texture: bool,
     note: Option<&'static str>,
     capture_dir: Option<std::path::PathBuf>,
@@ -422,7 +426,10 @@ impl Default for Slouching {
             show_gallery: false,
             settings_tab: 1,
             share_tab: 0,
-            selected_source: 0,
+            screen_sources: Vec::new(),
+            selected_source: None,
+            screen_capture_status: "As telas só serão acessadas após sua ação.".to_owned(),
+            screen_preview: None,
             texture: true,
             note: None,
             capture_dir: None,
@@ -541,7 +548,11 @@ enum Message {
     StopAudioMonitor,
     AudioMonitorEvent(AudioMonitorEvent),
     ShareTab(u8),
-    SelectSource(u8),
+    RefreshScreens,
+    ScreenSourcesLoaded(Result<Vec<screen_capture::ScreenSource>, String>),
+    SelectScreen(u32),
+    CaptureScreen(u32),
+    ScreenCaptured(u32, Result<screen_capture::CapturedScreen, String>),
     ToggleTexture,
     PreviewAction(&'static str),
     DismissNote,
@@ -902,6 +913,11 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.screen = screen;
             state.show_gallery = false;
             state.note = None;
+            if screen == Screen::Share {
+                state.screen_capture_status = "Buscando telas disponíveis…".to_owned();
+                state.screen_preview = None;
+                return Task::perform(enumerate_screens_task(), Message::ScreenSourcesLoaded);
+            }
         }
         Message::CreateCallMlsGroup => {
             if !matches!(state.identity_status, IdentityStatus::Ready(_)) {
@@ -1338,9 +1354,68 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         },
         Message::ShareTab(value) => {
             state.share_tab = value;
-            state.selected_source = 0;
+            state.screen_preview = None;
+            state.screen_capture_status = match value {
+                0 => "Selecione uma tela e capture uma prévia local.".to_owned(),
+                1 => "Captura de janelas ainda não implementada.".to_owned(),
+                _ => "Captura de câmera ainda não implementada.".to_owned(),
+            };
         }
-        Message::SelectSource(value) => state.selected_source = value,
+        Message::RefreshScreens => {
+            state.screen_capture_status = "Buscando telas disponíveis…".to_owned();
+            return Task::perform(enumerate_screens_task(), Message::ScreenSourcesLoaded);
+        }
+        Message::ScreenSourcesLoaded(result) => match result {
+            Ok(sources) => {
+                state.selected_source = sources.first().map(|source| source.id);
+                state.screen_capture_status = if sources.is_empty() {
+                    "Nenhuma tela encontrada pelo sistema.".to_owned()
+                } else {
+                    format!(
+                        "{} tela(s) disponível(is). A captura é local e sob demanda.",
+                        sources.len()
+                    )
+                };
+                state.screen_sources = sources;
+                state.screen_preview = None;
+            }
+            Err(error) => {
+                state.screen_sources.clear();
+                state.selected_source = None;
+                state.screen_preview = None;
+                state.screen_capture_status = error;
+            }
+        },
+        Message::SelectScreen(id) => {
+            state.selected_source = Some(id);
+            state.screen_preview = None;
+        }
+        Message::CaptureScreen(id) => {
+            state.screen_capture_status = "Capturando prévia local…".to_owned();
+            return Task::perform(capture_screen_task(id), move |result| {
+                Message::ScreenCaptured(id, result)
+            });
+        }
+        Message::ScreenCaptured(id, result) => {
+            if state.selected_source == Some(id) {
+                match result {
+                    Ok(frame) => {
+                        state.screen_preview = Some(iced::widget::image::Handle::from_rgba(
+                            frame.width,
+                            frame.height,
+                            frame.rgba,
+                        ));
+                        state.screen_capture_status =
+                            "Prévia local capturada. Ainda não está sendo enviada ao peer."
+                                .to_owned();
+                    }
+                    Err(error) => {
+                        state.screen_preview = None;
+                        state.screen_capture_status = error;
+                    }
+                }
+            }
+        }
         Message::ToggleTexture => state.texture = !state.texture,
         Message::PreviewAction(note) => state.note = Some(note),
         Message::DismissNote => state.note = None,
@@ -6740,6 +6815,18 @@ fn discard_pending_call_offer(state: &mut Slouching, reason: &str) {
         }
         state.call_group_status = format!("Oferta de chamada descartada: {reason}.");
     }
+}
+
+async fn enumerate_screens_task() -> Result<Vec<screen_capture::ScreenSource>, String> {
+    tokio::task::spawn_blocking(screen_capture::enumerate)
+        .await
+        .map_err(|error| format!("tarefa de enumeração de telas falhou: {error}"))?
+}
+
+async fn capture_screen_task(id: u32) -> Result<screen_capture::CapturedScreen, String> {
+    tokio::task::spawn_blocking(move || screen_capture::capture(id))
+        .await
+        .map_err(|error| format!("tarefa de captura de tela falhou: {error}"))?
 }
 
 async fn load_peer_secret_key_task() -> Result<iroh::SecretKey, String> {

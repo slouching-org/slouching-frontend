@@ -1354,88 +1354,124 @@ fn connecting(l: Layout) -> Element<'static, Message> {
 
 fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
     let tabs = row![
+        l.nav("Telas", Message::ShareTab(0), state.share_tab == 0),
         l.nav(
-            "Telas · exemplos",
-            Message::ShareTab(0),
-            state.share_tab == 0
-        ),
-        l.nav(
-            "Janelas · exemplos",
+            "Janelas · em breve",
             Message::ShareTab(1),
             state.share_tab == 1
         ),
-        l.nav("Câmera extra", Message::ShareTab(2), state.share_tab == 2)
+        l.nav(
+            "Câmera · em breve",
+            Message::ShareTab(2),
+            state.share_tab == 2
+        )
     ]
     .spacing(l.px(8.0));
-    let mut sources = row![].spacing(l.px(14.0));
-    let list = if state.share_tab == 0 {
-        [
-            ("home", "Tela 1 · exemplo"),
-            ("reading", "Tela 2 · exemplo"),
-            ("orb", "Somente uma janela…"),
-        ]
-    } else if state.share_tab == 1 {
-        [
-            ("reading", "Grimório · exemplo"),
-            ("frog-scene", "Janela da roda · exemplo"),
-            ("home", "Paisagem · exemplo"),
-        ]
-    } else {
-        [
-            ("frog-scene", "Câmera · ilustração"),
-            ("orb", "Orbe · ilustração"),
-            ("hat", "Sem câmera conectada"),
-        ]
-    };
-    for (i, (art, label)) in list.into_iter().enumerate() {
+    let mut sources = column![].spacing(l.px(8.0));
+    for source in &state.screen_sources {
+        let id = source.id;
+        let selected = state.selected_source == Some(id);
         sources = sources.push(
             button(
-                column![
-                    container(tile(l, art, label)).height(l.px(150.0)),
+                row![
                     l.label(
-                        if state.selected_source == i as u8 {
-                            "Selecionado na prévia"
+                        format!("{} · {} × {}", source.name, source.width, source.height),
+                        13.0,
+                        PAPER
+                    ),
+                    space().width(Fill),
+                    l.label(
+                        if selected {
+                            "SELECIONADA"
                         } else {
-                            "Exemplo de fonte"
+                            "Selecionar"
                         },
-                        11.0,
-                        MUTED
+                        10.0,
+                        if selected { GOLD } else { MUTED }
                     )
                 ]
+                .align_y(iced::Alignment::Center)
                 .spacing(l.px(10.0)),
             )
             .width(Fill)
-            .padding(l.px(10.0))
-            .on_press(Message::SelectSource(i as u8))
-            .style(move |_, s| button_style(s, false, state.selected_source == i as u8)),
+            .padding(l.px(12.0))
+            .on_press(Message::SelectScreen(id))
+            .style(move |_, s| button_style(s, false, selected)),
         );
     }
+    let preview: Element<'_, Message> = if let Some(handle) = state.screen_preview.clone() {
+        image(handle)
+            .content_fit(ContentFit::Contain)
+            .width(Fill)
+            .height(l.px(290.0))
+            .into()
+    } else {
+        container(l.label(
+            "A prévia da tela aparecerá aqui após sua captura.",
+            12.0,
+            MUTED,
+        ))
+        .width(Fill)
+        .height(l.px(290.0))
+        .center_x(Fill)
+        .center_y(Fill)
+        .style(panel_style)
+        .into()
+    };
+    let source_list: Element<'_, Message> = if state.share_tab == 0 {
+        if state.screen_sources.is_empty() {
+            l.label("Nenhuma tela enumerada. Use Atualizar telas ou confira a permissão de captura do ambiente gráfico.", 12.0, MUTED).into()
+        } else {
+            sources.into()
+        }
+    } else {
+        l.label(
+            if state.share_tab == 1 {
+                "Seleção e captura de janelas ainda não estão implementadas."
+            } else {
+                "Seleção e captura de câmera ainda não estão implementadas."
+            },
+            12.0,
+            MUTED,
+        )
+        .into()
+    };
     let body = column![
         l.title("O que você quer mostrar à roda?", 36.0),
         l.label(
-            "PRÉVIA · fontes ilustrativas, nenhuma tela enumerada ou capturada",
+            "CAPTURA LOCAL · nenhuma imagem é enviada ao peer nesta versão",
             12.0,
             MUTED
         ),
         tabs,
-        sources,
-        option(l, "Compartilhar áudio do sistema · indisponível", false),
         row![
             column![
-                l.label("QUALIDADE", 11.0, GOLD),
-                field(l, "720p30 / 1080p30 / 1080p60")
-            ],
-            column![
-                l.label("OTIMIZAR PARA", 11.0, GOLD),
-                field(l, "Texto nítido / movimento")
+                l.label("FONTES DISPONÍVEIS", 11.0, GOLD),
+                scrollable(source_list).height(l.px(290.0)).width(Fill),
+                l.label(state.screen_capture_status.clone(), 11.0, MUTED),
+                row![
+                    l.control(
+                        "refresh",
+                        "Atualizar telas",
+                        Some(Message::RefreshScreens),
+                        false
+                    ),
+                    l.control(
+                        "screen",
+                        "Capturar prévia",
+                        state.selected_source.map(Message::CaptureScreen),
+                        state.selected_source.is_none() || state.share_tab != 0
+                    )
+                ]
+                .spacing(l.px(10.0))
             ]
+            .spacing(l.px(12.0))
+            .width(Fill),
+            column![l.label("PRÉVIA DA TELA", 11.0, GOLD), preview]
+                .spacing(l.px(10.0))
+                .width(Fill)
         ]
-        .spacing(l.px(24.0)),
-        l.label(
-            "Estimativa de upload indisponível · nenhum peer conectado",
-            11.0,
-            MUTED
-        ),
+        .spacing(l.px(20.0)),
         row![
             l.control(
                 "close",
@@ -1444,7 +1480,7 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 false
             ),
             space().width(Fill),
-            l.control("screen", "Captura indisponível", None, true)
+            l.control("screen", "Compartilhar indisponível", None, true)
         ]
         .spacing(l.px(20.0))
     ]

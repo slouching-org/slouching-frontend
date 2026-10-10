@@ -41,6 +41,7 @@ rtc = "=0.21.0"
 webrtc = { version = "=0.21.0", default-features = false, features = ["crypto-ring", "runtime-tokio"] }
 qrcodegen = "=1.8.0"
 rqrr = "=0.10.1"
+xcap = "=0.9.8"
 
 [build-dependencies]
 prost-build = "=0.14.4"

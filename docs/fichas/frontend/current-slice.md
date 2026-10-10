@@ -115,17 +115,22 @@ The audio settings enumerate the host's real input/output devices and let the
 user choose one in the running app. **Testar microfone localmente** explicitly
 opens the selected input and shows an RMS level meter; samples are not saved or
 sent, and the test stops when leaving the audio tab or screen. The device
-choice is not persisted or used by calls yet. Character scenes remain visual
-previews. Call MLS groups and authenticated SFrame member binding are
-implemented. The call screen can start and end a WebRTC offer/answer negotiation
-over pinned QUIC after validating the peer's current call-group membership and
-epoch; gathered host candidates are included in SDP. Local ICE/DTLS loopback is
-tested. A separate Opus/SFrame codec path now round-trips protected 20 ms voice
-frames in local tests, but it is not connected to CPAL or WebRTC RTP. Audio/video
-tracks, microphone/camera capture, playback, and a two-machine VPN call are not
-implemented or verified. Screen capture,
-contact discovery, QR pairing, and guaranteed offline delivery
-are not implemented. The older web UI under
+choice is held in memory and used by direct voice calls. Calls use Opus/SFrame
+over WebRTC RTP after MLS membership and pinned-QUIC signaling. Incoming calls
+wait for explicit acceptance; capture starts after acceptance and ICE/DTLS
+connects. The remote sink receives authenticated decoded frames. A local
+two-peer loopback verifies protected RTP and the decoded audio sink, but
+physical-device and cross-network calls remain unverified. MLS epoch changes
+mute and close the prior media session. The microphone control mutes outgoing
+frames locally.
+
+The **Escolher tela** view uses XCap to enumerate real monitors and capture a
+single still image only after an explicit user action. Blocking enumeration and
+capture run outside Iced's UI thread. This is a local preview only: continuous
+capture, H.264 encoding, video RTP/SFrame, and rendering remote video are not
+implemented, so it does not share the image with a peer. Window and camera
+capture remain unavailable. Contact discovery, automatic pairing, and
+guaranteed offline delivery are also not implemented. The older web UI under
 `prototypes/web/` is a design benchmark, not the product runtime.
 
 See [direct peer transport v10](../transport/lan-peer-v10.md) for the direct session

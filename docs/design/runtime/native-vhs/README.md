@@ -80,6 +80,13 @@ updated Iced window; its sample people and chat remain illustrative. Use
 `--capture-call-negotiation` with `--capture-screen 10-call` to supply fixture
 identity, peer, and group values for a future native capture.
 
+The share screen now enumerates real monitors and can capture a single local
+still preview after the user presses **Capturar prévia**. The image is not sent
+to a peer. The repository screenshot fixtures were not regenerated for this
+change because the current environment has no Wayland or X11 display; capture
+the `05-share` view in a graphical session before treating the fixture as
+current.
+
 Reproduce with `cargo run -- --capture-dir /tmp/slouching-captures`.
 Request a size with `SLOUCHING_WINDOW_SIZE=1280x800`; a tiling compositor may
 need this window floated and resized before the six-second capture delay;
