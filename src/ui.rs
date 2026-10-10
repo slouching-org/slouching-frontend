@@ -1956,7 +1956,11 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
             (!listener_active).then_some(Message::PeerPublicKeyChanged as fn(String) -> Message)
         ),
         l.label(
-            "A mesma chave esperada é usada ao enviar e ao receber.",
+            if listener_active {
+                "Aguardando: esta deve ser a chave de quem vai conectar. Compartilhe sua chave e um endereço anunciado abaixo."
+            } else {
+                "Para conectar, cole a chave de quem está aguardando. Para receber, cada lado aguarda e fixa a chave do outro."
+            },
             10.0,
             MUTED
         ),
@@ -2148,9 +2152,9 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
     };
     let send_address = row![
         column![
-            l.label("ENDEREÇO DIRETO DO PEER", 10.0, GOLD),
+            l.label("ENDEREÇO DO LISTENER · LAN OU VPN", 10.0, GOLD),
             l.input(
-                "IP:porta · vazio usa relay salvo",
+                "IP:porta de quem está aguardando",
                 &state.peer_address,
                 Message::PeerAddressChanged
             )
@@ -2180,6 +2184,11 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
     ]
     .spacing(l.px(10.0))
     .align_y(iced::Bottom);
+    let address_hint = l.label(
+        "Use o IP e a porta mostrados no dispositivo que clicou em Aguardar peer. Em VPN, escolha o IP da interface VPN e libere essa porta UDP no firewall do listener. Endereço vazio usa o relay salvo.",
+        10.0,
+        MUTED,
+    );
     let send_status: Element<'_, Message> = match &state.peer_send_status {
         crate::PeerSendStatus::Idle => l
             .label(
@@ -2353,6 +2362,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
         .align_y(iced::Center),
         rule(LINE, 1.0),
         send_address,
+        address_hint,
         send_status,
         routes,
         rule(LINE, 1.0),

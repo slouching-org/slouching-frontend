@@ -86,19 +86,27 @@ path.
    Ed25519 public keys out of band. On Linux, the system Secret Service must
    be available to create or load this identity.
 2. On both devices, paste the other device's public key into **Chave pública do
-   peer · pin manual**. This manually pins the peer for both sending and receiving.
+   peer · pin manual**. On the listening device, this is the key of the sender
+   that will connect; on the sending device, it is the key of the listener.
 3. Optionally configure the same participant-operated relay URL and shared
    token in **Relay do grupo** on both devices, then save it before starting a
    listener or sending. On the receiving device, choose a UDP port (for
    example `45873`) and click **Aguardar peer**. Each announced socket address
    has its own **Copiar este endereço** button. Pick an address reachable from
    the sender's network; wildcard addresses such as `0.0.0.0` cannot be shared.
-4. On the sending device, enter the receiver's address and port, type a
+4. On the sending device, enter the listener's address and port, type a
    message, and click **Conectar e enviar**. After connection, either device
    can send multiple messages over the same session. Sent text appears only
    after an ACK; received text appears live after the pinned identity check.
    The connected status confirms an authenticated session; it does not claim
    that the route avoided the configured relay.
+
+For a VPN test, use the listener's VPN interface address (not its Wi-Fi or
+public address), keep the listener's UDP port, and allow inbound UDP on that
+port in the listener's firewall. The VPN must route UDP between both devices.
+If the app reports a timeout, the route is not established; this screen does
+not perform NAT traversal. The flow is implemented for reachable socket
+addresses, but a VPN connection between separate machines remains unverified.
 
 A successful connection saves the pinned device key and its direct socket or
 relay-only route in the encrypted local route book. The chat screen lists these
@@ -320,7 +328,7 @@ be installed and available in the user session.
 
 ![Actual refreshed 1280 × 800 native Iced familiar screen from this transport milestone; Secret Service is unavailable in this capture](docs/design/runtime/native-vhs/01-familiar.png)
 
-![Native Iced direct chat with relay settings and separate copy controls for sample LAN and VPN socket addresses; addresses are illustrative and Secret Service is unavailable.](docs/design/runtime/native-vhs/06-chat.png)
+![Native Iced direct chat with explicit listener and VPN address guidance, relay settings, and copy controls for sample LAN and VPN socket addresses; addresses are illustrative and Secret Service is unavailable.](docs/design/runtime/native-vhs/06-chat.png)
 
 ![Actual native Iced home with open scenery and icon-based feature strip, without the frog mage or gnome cutouts](docs/design/runtime/native-vhs/09-home.png)
 
