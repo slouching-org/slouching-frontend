@@ -1,10 +1,10 @@
 # Current frontend slice
 
 **Status:** eleven design-board screens plus a native MLS group screen. Direct
-LAN chat uses pinned Ed25519 device identities and persistent Iroh/QUIC
-sessions. Successful outbound connections save the pinned device key and
-last-seen socket address in the encrypted local route book. The MLS screen can
-use these saved routes for sequential multi-member Commit fan-out. MLS group setup can send a device-bound KeyPackage over the active
+chat uses pinned Ed25519 device identities and persistent Iroh/QUIC sessions.
+Successful connections save the pinned device key and a direct or configured
+relay route in the encrypted local route book. The MLS screen can reuse saved
+routes for sequential multi-member Commit fan-out. MLS group setup can send a device-bound KeyPackage over the active
 pinned session; the committer reviews and admits it after matching the package
 identity to the transport peer. Admission stores the exact Welcome and ratchet
 tree in the encrypted outbox with the membership Commit. The committer sends
@@ -41,8 +41,9 @@ retention is best-effort rather than an availability guarantee.
 An opted-in listener accepts the author and a later recipient in distinct
 authenticated sessions, one at a time. Other application frames remain bound
 to the manually pinned peer. This store-and-forward path requires a reachable
-route to the helper for each connection; it does not implement NAT traversal
-or public relay, and VPN connectivity has not been verified.
+route to the helper for each connection. A configured participant Iroh Relay
+can carry that route, but the helper flow has not been separately tested over
+a remote relay. This does not provide address discovery or hole-punching.
 
 Before applying a next-epoch Commit, the client stores the prior OpenMLS group
 state in the encrypted profile database. If a different Commit later arrives
@@ -79,11 +80,15 @@ individually and handling other proposal types are not implemented.
 The direct-text screen manually pins the peer's Ed25519 device key. One side
 listens and shares a reachable interface address; the other connects to that
 address. A VPN may provide a direct route if it carries UDP, but that path is
-not yet verified between machines. Both can send multiple messages. The receiver stores inbound text
+not yet verified between machines. Both can send multiple messages. A member
+may configure an HTTPS/token Iroh Relay for fallback or relay-only connections;
+the local test exercises pinned text and opaque MLS event delivery through it.
+The receiver stores inbound text
 before ACK; the sender stores sent text after ACK. It reloads the newest 200
 messages for the peer and supports confirmed history deletion. This pairwise
-text path is separate from MLS. Neither path provides relay, address discovery,
-NAT traversal, or offline delivery. The MLS ACK confirms durable local
+text path is separate from MLS. Neither path provides address discovery,
+hole-punching, or guaranteed offline delivery. Remote relay and VPN behavior
+remain unverified. The MLS ACK confirms durable local
 acceptance by the other client, not that a person read the message.
 
 The familiar screen stores the display name and familiar in encrypted SQLite;
@@ -95,8 +100,8 @@ available in the user session. The settings **Rede & P2P** screen separately
 shows local Elixir HTTP/WebSocket diagnostics; it does not carry chat traffic.
 
 Character scenes and call views remain visual previews. Camera, microphone,
-screen capture, contact discovery, verified pairing, relay, and offline delivery
-are not implemented. The older web UI under
+screen capture, contact discovery, verified pairing, and guaranteed offline
+delivery are not implemented. The older web UI under
 `prototypes/web/` is a design benchmark, not the product runtime.
 
 See [direct peer transport v8](../transport/lan-peer-v8.md) for the direct session
