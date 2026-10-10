@@ -238,8 +238,9 @@ marks trust automatically; press **Marcar como conferida** only after
 authenticating the QR source. That decision is local to this encrypted profile
 and exact key. It does not verify a display name, and a replacement key must be
 verified again. A symmetric full 256-bit BLAKE3 fingerprint derived from both device keys is
-available for live comparison; it does not implement SPAKE2 rendezvous or
-establish trust by itself. Camera scanning uses an explicit, temporary local
+available for live comparison. The optional Elixir helper now provides an
+experimental SPAKE2 rendezvous API, but the Iced client does not call it yet.
+Neither fingerprint nor helper establishes trust by itself. Camera scanning uses an explicit, temporary local
 capture and follows the same signature, expiry, self-invite, and trust checks
 as PNG import.
 
@@ -422,9 +423,11 @@ addresses, then imports it from PNG and lets the user choose a route. The QR
 does not auto-verify human identity; a changed key has no inherited trust.
 The trust screen derives a full 256-bit fingerprint from both device keys for
 manual comparison. The client has an experimental SPAKE2 crypto foundation
-with 100-bit pairing codes and transcript-bound key confirmation, but no UI,
-rendezvous, server-side attempt limits, or signed identity exchange. It does
-not mark contacts trusted; see the [prototype boundary](https://github.com/slouching-org/slouching/blob/main/docs/fichas/identity/spake2-prototype.md).
+with 100-bit pairing codes and transcript-bound key confirmation. The Elixir
+helper provides bounded, expiring rendezvous sessions, but there is no Iced
+flow or signed identity exchange yet. It does not mark contacts trusted; see
+the [client boundary](https://github.com/slouching-org/slouching/blob/main/docs/fichas/identity/spake2-prototype.md)
+and [rendezvous contract](https://github.com/slouching-org/slouching/blob/main/docs/fichas/identity/pairing-rendezvous-v1.md).
 Contact pairing and discovery are not implemented. OpenMLS credentials include a versioned binding signed by the durable device key. One-use
 KeyPackages and private MLS state are stored in SQLCipher. The direct-chat
 screen separately pins device public keys. Character scenes remain visual
