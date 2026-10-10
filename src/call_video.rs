@@ -11,6 +11,7 @@ use openh264::{
     encoder::{BitRate, Encoder, EncoderConfig, FrameRate, UsageType},
     formats::{RgbaSliceU8, YUVBuffer, YUVSource},
 };
+use std::collections::HashMap;
 
 const MAX_WIDTH: u32 = 640;
 const MAX_HEIGHT: u32 = 360;
@@ -75,6 +76,11 @@ impl CallVideoEncoder {
 }
 
 pub struct CallVideoDecoder {
+    epoch: u64,
+    senders: HashMap<u64, CallVideoSourceDecoder>,
+}
+
+struct CallVideoSourceDecoder {
     decoder: Decoder,
     unprotector: MediaFrameReceiver,
 }
@@ -84,19 +90,64 @@ impl CallVideoDecoder {
         group_id: &[u8],
         sender_device_public_key: &[u8; 32],
     ) -> Result<Self, String> {
-        Self::new(MediaFrameReceiver::for_call_group_member(
-            group_id,
-            sender_device_public_key,
-        )?)
+        Self::for_call_group_members(group_id, std::slice::from_ref(sender_device_public_key))
     }
 
-    fn new(unprotector: MediaFrameReceiver) -> Result<Self, String> {
+    pub fn for_call_group_members(
+        group_id: &[u8],
+        sender_device_public_keys: &[[u8; 32]],
+    ) -> Result<Self, String> {
+        let context = crate::storage::load_call_media_context(group_id)?;
+        let mut receivers = Vec::with_capacity(sender_device_public_keys.len());
+        for device_key in sender_device_public_keys {
+            let member = context
+                .members
+                .iter()
+                .find(|member| &member.device_public_key == device_key)
+                .ok_or_else(|| "SFrame sender is not a member of this call MLS group".to_owned())?;
+            if member.index == context.local_member_index {
+                return Err("video sender list contains a duplicate or local member".to_owned());
+            }
+            receivers.push((
+                member.index,
+                MediaFrameReceiver::new(context.epoch, member.index, context.base_key.as_slice())?,
+            ));
+        }
+        Self::from_indexed_receivers(context.epoch, receivers)
+    }
+
+    fn from_indexed_receivers(
+        epoch: u64,
+        receivers: impl IntoIterator<Item = (u64, MediaFrameReceiver)>,
+    ) -> Result<Self, String> {
+        let mut senders = HashMap::new();
+        for (member_index, receiver) in receivers {
+            if senders
+                .insert(member_index, Self::source_decoder(receiver)?)
+                .is_some()
+            {
+                return Err("video sender list contains duplicate members".to_owned());
+            }
+        }
+        if senders.is_empty() {
+            return Err("call video requires at least one remote member".to_owned());
+        }
+        Ok(Self { epoch, senders })
+    }
+
+    fn source_decoder(unprotector: MediaFrameReceiver) -> Result<CallVideoSourceDecoder, String> {
         let decoder = Decoder::new()
             .map_err(|error| format!("could not create H.264 screen decoder: {error}"))?;
-        Ok(Self {
+        Ok(CallVideoSourceDecoder {
             decoder,
             unprotector,
         })
+    }
+
+    #[cfg(test)]
+    fn new(epoch: u64, unprotector: MediaFrameReceiver) -> Result<Self, String> {
+        let member_index = unprotector.member_index();
+        Self::from_indexed_receivers(epoch, [(member_index, unprotector)])
     }
 
     /// Authenticate/decrypt one access unit before decoding the H.264 bytes.
@@ -104,8 +155,13 @@ impl CallVideoDecoder {
         &mut self,
         protected: &[u8],
     ) -> Result<Option<DecodedVideoFrame>, String> {
-        let encoded = self.unprotector.decrypt(protected)?;
-        let Some(decoded) = self
+        let member_index = MediaFrameReceiver::sender_member_index(self.epoch, protected)?;
+        let source = self
+            .senders
+            .get_mut(&member_index)
+            .ok_or_else(|| "SFrame sender is not a remote call MLS member".to_owned())?;
+        let encoded = source.unprotector.decrypt(protected)?;
+        let Some(decoded) = source
             .decoder
             .decode(&encoded)
             .map_err(|error| format!("could not decode H.264 screen frame: {error}"))?
@@ -127,7 +183,7 @@ impl CallVideoDecoder {
 pub(crate) fn test_encoder_decoder_pair() -> Result<(CallVideoEncoder, CallVideoDecoder), String> {
     Ok((
         CallVideoEncoder::new(MediaFrameSender::new(9, 1, b"0123456789abcdef")?)?,
-        CallVideoDecoder::new(MediaFrameReceiver::new(9, 1, b"0123456789abcdef")?)?,
+        CallVideoDecoder::new(9, MediaFrameReceiver::new(9, 1, b"0123456789abcdef")?)?,
     ))
 }
 
@@ -187,9 +243,11 @@ mod tests {
         let mut encoder =
             CallVideoEncoder::new(MediaFrameSender::new(9, 1, TEST_MLS_EXPORTER_KEY).unwrap())
                 .unwrap();
-        let mut decoder =
-            CallVideoDecoder::new(MediaFrameReceiver::new(9, 1, TEST_MLS_EXPORTER_KEY).unwrap())
-                .unwrap();
+        let mut decoder = CallVideoDecoder::new(
+            9,
+            MediaFrameReceiver::new(9, 1, TEST_MLS_EXPORTER_KEY).unwrap(),
+        )
+        .unwrap();
         let original = rgba.clone();
         let protected = encoder.encode_and_protect(320, 240, rgba).unwrap();
         assert_ne!(protected, original);
@@ -201,12 +259,63 @@ mod tests {
         assert_eq!(decoded.rgba.len(), 320 * 240 * 4);
         assert!(decoder.unprotect_and_decode(&protected).is_err());
 
-        let mut tampered_receiver =
-            CallVideoDecoder::new(MediaFrameReceiver::new(9, 1, TEST_MLS_EXPORTER_KEY).unwrap())
-                .unwrap();
+        let mut tampered_receiver = CallVideoDecoder::new(
+            9,
+            MediaFrameReceiver::new(9, 1, TEST_MLS_EXPORTER_KEY).unwrap(),
+        )
+        .unwrap();
         let mut tampered = protected;
         *tampered.last_mut().unwrap() ^= 1;
         assert!(tampered_receiver.unprotect_and_decode(&tampered).is_err());
+    }
+
+    #[test]
+    fn video_decoder_routes_each_member_to_its_own_sframe_and_h264_state() {
+        let image = vec![0x70, 0x80, 0x90, 0xff]
+            .into_iter()
+            .cycle()
+            .take(64 * 64 * 4)
+            .collect::<Vec<_>>();
+        let mut sender_a =
+            CallVideoEncoder::new(MediaFrameSender::new(9, 1, TEST_MLS_EXPORTER_KEY).unwrap())
+                .unwrap();
+        let mut sender_b =
+            CallVideoEncoder::new(MediaFrameSender::new(9, 2, TEST_MLS_EXPORTER_KEY).unwrap())
+                .unwrap();
+        let frame_a = sender_a.encode_and_protect(64, 64, image.clone()).unwrap();
+        let frame_b = sender_b.encode_and_protect(64, 64, image).unwrap();
+        let mut decoder = CallVideoDecoder::from_indexed_receivers(
+            9,
+            [
+                (
+                    1,
+                    MediaFrameReceiver::new(9, 1, TEST_MLS_EXPORTER_KEY).unwrap(),
+                ),
+                (
+                    2,
+                    MediaFrameReceiver::new(9, 2, TEST_MLS_EXPORTER_KEY).unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert!(decoder.unprotect_and_decode(&frame_a).unwrap().is_some());
+        assert!(decoder.unprotect_and_decode(&frame_b).unwrap().is_some());
+        assert!(decoder.unprotect_and_decode(&frame_a).is_err());
+        let unauthorized =
+            CallVideoEncoder::new(MediaFrameSender::new(9, 3, TEST_MLS_EXPORTER_KEY).unwrap())
+                .unwrap()
+                .encode_and_protect(
+                    64,
+                    64,
+                    vec![0x70, 0x80, 0x90, 0xff]
+                        .into_iter()
+                        .cycle()
+                        .take(64 * 64 * 4)
+                        .collect(),
+                )
+                .unwrap();
+        assert!(decoder.unprotect_and_decode(&unauthorized).is_err());
     }
 
     #[test]

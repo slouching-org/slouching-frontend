@@ -2,7 +2,7 @@ use cpal::{
     FromSample, Sample, SampleFormat,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU32, Ordering},
@@ -61,14 +61,35 @@ pub struct AudioCapture {
 /// silence instead of blocking the WebRTC receive task.
 pub struct AudioPlayback {
     _stream: cpal::Stream,
-    samples: Arc<Mutex<VecDeque<f32>>>,
+    samples: Arc<Mutex<AudioPlaybackBuffer>>,
     error: tokio::sync::watch::Receiver<Option<String>>,
     sample_rate: u32,
 }
 
+#[derive(Default)]
+struct AudioPlaybackBuffer {
+    members: HashMap<u64, VecDeque<f32>>,
+}
+
+impl AudioPlaybackBuffer {
+    fn mix_next(&mut self) -> f32 {
+        let mixed = self
+            .members
+            .values_mut()
+            .filter_map(VecDeque::pop_front)
+            .sum::<f32>();
+        self.members.retain(|_, samples| !samples.is_empty());
+        mixed.clamp(-1.0, 1.0)
+    }
+}
+
 impl crate::call_audio::AudioSink for AudioPlayback {
     fn push_mono(&self, incoming: &[f32]) {
-        AudioPlayback::push_mono(self, incoming);
+        self.push_member_mono(u64::MAX, incoming);
+    }
+
+    fn push_member_mono(&self, member_index: u64, incoming: &[f32]) {
+        AudioPlayback::push_member_mono(self, member_index, incoming);
     }
 }
 
@@ -86,7 +107,7 @@ impl AudioPlayback {
         let sample_rate = supported.sample_rate();
         let channels = usize::from(supported.channels());
         let format = supported.sample_format();
-        let samples = Arc::new(Mutex::new(VecDeque::with_capacity(48_000)));
+        let samples = Arc::new(Mutex::new(AudioPlaybackBuffer::default()));
         let callback_samples = Arc::clone(&samples);
         let (error_tx, error) = tokio::sync::watch::channel(None);
         let stream = device
@@ -112,9 +133,14 @@ impl AudioPlayback {
     }
 
     pub fn push_mono(&self, incoming: &[f32]) {
+        self.push_member_mono(u64::MAX, incoming);
+    }
+
+    pub fn push_member_mono(&self, member_index: u64, incoming: &[f32]) {
         let resampled = resample_mono(incoming, self.sample_rate);
         const MAX_QUEUED_SAMPLES: usize = 96_000;
-        if let Ok(mut samples) = self.samples.lock() {
+        if let Ok(mut buffer) = self.samples.lock() {
+            let samples = buffer.members.entry(member_index).or_default();
             if samples.len().saturating_add(resampled.len()) > MAX_QUEUED_SAMPLES {
                 let excess = samples
                     .len()
@@ -157,7 +183,7 @@ fn write_output_data(
     data: &mut cpal::Data,
     format: SampleFormat,
     channels: usize,
-    samples: &Arc<Mutex<VecDeque<f32>>>,
+    samples: &Arc<Mutex<AudioPlaybackBuffer>>,
 ) {
     if channels == 0 {
         return;
@@ -167,10 +193,7 @@ fn write_output_data(
             if let Some(output) = data.as_slice_mut::<$sample>() {
                 let mut queued = samples.try_lock().ok();
                 for frame in output.chunks_exact_mut(channels) {
-                    let mono = queued
-                        .as_mut()
-                        .and_then(|queued| queued.pop_front())
-                        .unwrap_or(0.0);
+                    let mono = queued.as_mut().map_or(0.0, |queued| queued.mix_next());
                     for channel in frame {
                         *channel = <$sample>::from_sample(mono);
                     }
@@ -461,6 +484,16 @@ mod tests {
         let resampled = resample_mono(&frame, 44_100);
         assert_eq!(resampled.len(), 882);
         assert_eq!(resample_mono(&frame, 48_000), frame);
+    }
+
+    #[test]
+    fn playback_mixes_remote_members_and_clamps_the_combined_sample() {
+        let mut buffer = AudioPlaybackBuffer::default();
+        buffer.members.insert(1, VecDeque::from([0.4, 0.8]));
+        buffer.members.insert(2, VecDeque::from([0.5, 0.6]));
+        assert_eq!(buffer.mix_next(), 0.9);
+        assert_eq!(buffer.mix_next(), 1.0);
+        assert!(buffer.members.is_empty());
     }
 
     #[test]

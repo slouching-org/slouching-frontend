@@ -108,17 +108,19 @@ The helper contract and limits are in
 [`docs/fichas/identity/pairing-rendezvous-v1.md`](../../docs/fichas/identity/pairing-rendezvous-v1.md).
 
 The local development WebSocket gateway proves possession of the same device
-key with a fresh Ed25519 challenge. The Rust client also has an experimental
-two-device SFU signaling mode. On both clients, open **Configurações → Rede &
+key with a fresh Ed25519 challenge. The Rust client also has experimental SFU
+group-call signaling for call MLS rosters of two to 16 devices. On each device,
+open **Configurações → Rede &
 P2P → Chamadas por SFU**, enter the same helper URL (for example
-`wss://helper.example/ws`), enable it, and save. Load the same two-member call
-MLS group; each participant can then enter from the **Chamada** panel without
-an active direct P2P connection. **Testar conexão com o helper** verifies the
+`wss://helper.example/ws`), enable it, and save. Select the same call MLS group
+on each device. Each group member can then enter from the **Chamada** panel
+without an active direct P2P connection. **Testar conexão com o helper** verifies the
 WSS endpoint, device challenge, and advertised SFU capability; it does not test
 the media UDP route. The helper checks device-signed roster consistency but
-cannot verify MLS membership independently. A smoke test covers two software
-clients and protected audio forwarded by a local helper; physical audio
-devices and different networks have not been tested.
+cannot verify MLS membership independently. The live-helper smoke test covers
+three software clients and protected audio forwarded by a local helper.
+Multiparty call chat/video, physical audio devices, and different networks
+have not been tested.
 For a remote helper, expose its signaling as WSS and set
 `SLOUCHING_SFU_PUBLIC_IP` plus `SLOUCHING_SFU_UDP_PORT_RANGE` on the Elixir
 service when its public address is behind one-to-one NAT. Open and forward
@@ -129,7 +131,7 @@ an active direct P2P connection once they share the call MLS group.
 project root, `./scripts/smoke-gateway-auth-e2e.sh` starts an isolated
 SQLite-backed Elixir helper and verifies device authentication, Ping/Pong,
 signed roster admission, SDP negotiation, ICE/DTLS, and protected audio
-forwarding between two Rust software clients. The fixed test keys are used
+forwarding between three Rust software clients. The fixed test keys are used
 only by this smoke test; the desktop client
 signs with the key in Secret Service.
 
@@ -262,12 +264,13 @@ trial, but have only been verified with two local WebRTC peers so far. Both devi
 manually pinned direct peer session and membership in the **same dedicated call
 MLS group**.
 
-The call UI currently supports one remote peer per device. The MLS call group
-can have multiple members, but three-or-more-party media and the Elixir SFU are
-not implemented; the sample characters in the call artwork are decorative.
-The audio receive pipeline now has a separate Opus decoder and SFrame replay
-window per remote MLS member, selected by the frame's sender index. This is
-internal groundwork; it does not enable multi-party calls by itself.
+The direct call UI supports one remote peer per device. The experimental SFU
+call UI accepts call MLS groups of two to 16 devices and creates one remote
+audio track per other member. Its live-helper smoke test covers three software
+clients and protected audio forwarding. Call chat and video maintain
+per-member receive state, but their multiparty exchange has not been exercised
+through the live helper. Physical-device and cross-network calls remain
+unverified; the sample characters in the call artwork are decorative.
 
 1. On one device, open **Chamada**, create a protected call group, then use
    **Convidar participantes** to admit the other device through the MLS flow.
@@ -693,7 +696,9 @@ display.
 The SFU entry action was added to the call view, but its screenshot could not
 be captured in this checkout because neither `WAYLAND_DISPLAY` nor `DISPLAY`
 is available; run the `--capture-call-sfu` command above in a graphical
-session to refresh it.
+session to refresh it. The multi-member SFU change alters call capabilities
+without changing the view layout; refresh this capture when a graphical
+session is available.
 The **Rede & P2P** settings view now includes the saved SFU URL, opt-in,
 connectivity test, and status controls. Refresh `02-settings.png` with the `--capture-delivery-mailbox`
 capture command above in a graphical session; this headless checkout cannot

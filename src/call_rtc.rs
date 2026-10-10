@@ -221,20 +221,37 @@ impl CallRtcSession {
         input_device_id: String,
         output_device_id: String,
     ) -> Result<Self, String> {
+        Self::new_for_call_group_members(
+            group_id,
+            vec![remote_device],
+            input_device_id,
+            output_device_id,
+        )
+        .await
+    }
+
+    /// Build a media session that accepts protected media from each listed
+    /// remote member in the current call MLS group.
+    pub async fn new_for_call_group_members(
+        group_id: [u8; 16],
+        remote_devices: Vec<[u8; 32]>,
+        input_device_id: String,
+        output_device_id: String,
+    ) -> Result<Self, String> {
         let (encoder, decoder, video_encoder, video_decoder, chat_sender, chat_receiver) =
             tokio::task::spawn_blocking(move || {
                 Ok::<_, String>((
                     crate::call_audio::CallAudioEncoder::for_call_group(&group_id)?,
                     crate::call_audio::CallAudioDecoderSet::for_call_group(&group_id)?,
                     crate::call_video::CallVideoEncoder::for_call_group(&group_id)?,
-                    crate::call_video::CallVideoDecoder::for_call_group_member(
+                    crate::call_video::CallVideoDecoder::for_call_group_members(
                         &group_id,
-                        &remote_device,
+                        &remote_devices,
                     )?,
                     crate::call_chat::CallChatSender::for_call_group(&group_id)?,
-                    crate::call_chat::CallChatReceiver::for_call_group_member(
+                    crate::call_chat::CallChatReceiver::for_call_group_members(
                         &group_id,
-                        &remote_device,
+                        &remote_devices,
                     )?,
                 ))
             })
@@ -310,19 +327,24 @@ impl CallRtcSession {
         self.create_offer_inner(false).await
     }
 
-    /// Create a raw-SDP offer for the Elixir SFU, including one receive-only
-    /// audio section for the other member of a two-device call group.
-    pub async fn create_sfu_offer(&self) -> Result<Vec<u8>, String> {
-        self.peer_connection
-            .add_transceiver_from_kind(
-                RtpCodecKind::Audio,
-                Some(RTCRtpTransceiverInit {
-                    direction: RTCRtpTransceiverDirection::Recvonly,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .map_err(|error| format!("could not add SFU receive audio track: {error}"))?;
+    /// Create a raw-SDP offer for the Elixir SFU with one receive-only audio
+    /// section for each remote call member.
+    pub async fn create_sfu_offer(&self, remote_members: usize) -> Result<Vec<u8>, String> {
+        if !(1..=15).contains(&remote_members) {
+            return Err("SFU call requires 1 to 15 remote members".to_owned());
+        }
+        for _ in 0..remote_members {
+            self.peer_connection
+                .add_transceiver_from_kind(
+                    RtpCodecKind::Audio,
+                    Some(RTCRtpTransceiverInit {
+                        direction: RTCRtpTransceiverDirection::Recvonly,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map_err(|error| format!("could not add SFU receive audio track: {error}"))?;
+        }
         self.create_offer_inner(true).await
     }
 
@@ -1048,7 +1070,7 @@ impl CallRtcSession {
                                     match event {
                                         TrackRemoteEvent::OnRtpPacket(packet) => {
                                             match audio.decoder.lock().await.unprotect_and_decode(&packet.payload) {
-                                                Ok(pcm) => audio.sink.push_mono(&pcm),
+                                                Ok((member_index, pcm)) => audio.sink.push_member_mono(member_index, &pcm),
                                                 Err(error) => {
                                                     audio_status.send_replace(format!("Quadro SFrame de áudio rejeitado: {error}"));
                                                 }
@@ -1231,151 +1253,111 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a live Elixir gateway; run scripts/smoke-gateway-auth-e2e.sh"]
-    async fn two_rust_clients_exchange_protected_audio_through_the_live_elixir_sfu() {
+    async fn three_rust_clients_exchange_protected_audio_through_the_live_elixir_sfu() {
         const EXPORTER_KEY: &[u8] = b"0123456789abcdef";
+        const MEMBER_COUNT: usize = 3;
         let ws_url = std::env::var("SLOUCHING_GATEWAY_WS_URL")
             .expect("smoke script supplies the local Elixir WebSocket URL");
-        let first_signer = iroh::SecretKey::from_bytes(&[0x31; 32]);
-        let second_signer = iroh::SecretKey::from_bytes(&[0x32; 32]);
-        let first_device = *first_signer.public().as_bytes();
-        let second_device = *second_signer.public().as_bytes();
+        let signers = [
+            iroh::SecretKey::from_bytes(&[0x31; 32]),
+            iroh::SecretKey::from_bytes(&[0x32; 32]),
+            iroh::SecretKey::from_bytes(&[0x33; 32]),
+        ];
+        let roster = signers
+            .iter()
+            .map(|signer| *signer.public().as_bytes())
+            .collect::<Vec<_>>();
         let mut group_id = [0_u8; 16];
         getrandom::fill(&mut group_id).unwrap();
-        let roster = [first_device, second_device];
-        let (first_sink_tx, mut first_sink_rx) = mpsc::unbounded_channel();
-        let (second_sink_tx, mut second_sink_rx) = mpsc::unbounded_channel();
-        let first = Arc::new(
-            CallRtcSession::new_with_audio_codecs(
-                crate::call_audio::CallAudioEncoder::new(
-                    crate::media::MediaFrameSender::new(1, 0, EXPORTER_KEY).unwrap(),
+        let mut sessions = Vec::with_capacity(MEMBER_COUNT);
+        let mut transports = Vec::with_capacity(MEMBER_COUNT);
+        let mut sinks = Vec::with_capacity(MEMBER_COUNT);
+
+        for (local_index, signer) in signers.iter().enumerate() {
+            let remote_indices = (0..MEMBER_COUNT)
+                .filter(|index| *index != local_index)
+                .collect::<Vec<_>>();
+            let decoders = remote_indices
+                .iter()
+                .map(|index| {
+                    crate::call_audio::CallAudioDecoder::new(
+                        crate::media::MediaFrameReceiver::new(1, *index as u64, EXPORTER_KEY)
+                            .unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let (sink_tx, sink_rx) = mpsc::unbounded_channel();
+            let session = Arc::new(
+                CallRtcSession::new_with_audio_codecs(
+                    crate::call_audio::CallAudioEncoder::new(
+                        crate::media::MediaFrameSender::new(1, local_index as u64, EXPORTER_KEY)
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                    crate::call_audio::CallAudioDecoderSet::new(1, decoders).unwrap(),
+                    String::new(),
+                    Arc::new(TestSink(sink_tx)),
                 )
+                .await
                 .unwrap(),
-                crate::call_audio::CallAudioDecoderSet::new(
-                    1,
-                    vec![
-                        crate::call_audio::CallAudioDecoder::new(
-                            crate::media::MediaFrameReceiver::new(1, 1, EXPORTER_KEY).unwrap(),
-                        )
-                        .unwrap(),
-                    ],
-                )
-                .unwrap(),
-                String::new(),
-                Arc::new(TestSink(first_sink_tx)),
+            );
+            let transport = crate::sfu_call::SfuCallTransport::connect_and_join(
+                &ws_url,
+                group_id,
+                group_id,
+                1,
+                &roster,
+                signer.clone(),
             )
             .await
-            .unwrap(),
-        );
-        let second = Arc::new(
-            CallRtcSession::new_with_audio_codecs(
-                crate::call_audio::CallAudioEncoder::new(
-                    crate::media::MediaFrameSender::new(1, 1, EXPORTER_KEY).unwrap(),
-                )
-                .unwrap(),
-                crate::call_audio::CallAudioDecoderSet::new(
-                    1,
-                    vec![
-                        crate::call_audio::CallAudioDecoder::new(
-                            crate::media::MediaFrameReceiver::new(1, 0, EXPORTER_KEY).unwrap(),
-                        )
-                        .unwrap(),
-                    ],
-                )
-                .unwrap(),
-                String::new(),
-                Arc::new(TestSink(second_sink_tx)),
-            )
-            .await
-            .unwrap(),
-        );
+            .expect("each Rust device should authenticate and join the signed three-member roster");
+            sessions.push(session);
+            transports.push(transport);
+            sinks.push(sink_rx);
+        }
 
-        let mut first_transport = crate::sfu_call::SfuCallTransport::connect_and_join(
-            &ws_url,
-            group_id,
-            group_id,
-            1,
-            &roster,
-            first_signer,
-        )
-        .await
-        .expect("first Rust client should authenticate and join the signed SFU roster");
-        let mut second_transport = crate::sfu_call::SfuCallTransport::connect_and_join(
-            &ws_url,
-            group_id,
-            group_id,
-            1,
-            &roster,
-            second_signer,
-        )
-        .await
-        .expect("second Rust client should authenticate and join the signed SFU roster");
-        let first_offer = first
-            .create_sfu_offer()
-            .await
-            .expect("first client should create a protected microphone and receive-audio offer");
-        let second_offer = second
-            .create_sfu_offer()
-            .await
-            .expect("second client should create a protected microphone and receive-audio offer");
-        first_transport
-            .send_offer(first_offer)
-            .await
-            .expect("first client should send its SFU offer");
-        second_transport
-            .send_offer(second_offer)
-            .await
-            .expect("second client should send its SFU offer");
+        for (session, transport) in sessions.iter().zip(transports.iter()) {
+            let offer = session
+                .create_sfu_offer(MEMBER_COUNT - 1)
+                .await
+                .expect("each client should offer one receive track per remote member");
+            transport
+                .send_offer(offer)
+                .await
+                .expect("each client should send its SFU offer");
+        }
 
-        let mut first_events = first_transport
-            .take_events()
-            .expect("first call event stream should be available once");
-        let mut second_events = second_transport
-            .take_events()
-            .expect("second call event stream should be available once");
-        let first_for_events = Arc::clone(&first);
-        let first_event_task = tokio::spawn(async move {
-            while let Some(event) = first_events.recv().await {
-                match event {
-                    crate::sfu_call::SfuCallEvent::Answer(sdp) => {
-                        first_for_events.accept_sfu_answer_sdp(&sdp).await?;
-                    }
-                    crate::sfu_call::SfuCallEvent::IceCandidate(candidate) => {
-                        first_for_events.add_ice_candidate_init(candidate).await?;
-                    }
-                    crate::sfu_call::SfuCallEvent::Rejected { code, message } => {
-                        return Err(format!("SFU rejected client offer ({code}): {message}"));
-                    }
-                    crate::sfu_call::SfuCallEvent::Disconnected(reason) => {
-                        return Err(format!("SFU signaling disconnected: {reason}"));
+        let mut event_tasks = Vec::with_capacity(MEMBER_COUNT);
+        for (transport, session) in transports.iter_mut().zip(sessions.iter()) {
+            let mut events = transport
+                .take_events()
+                .expect("each call event stream should be available once");
+            let session = Arc::clone(session);
+            event_tasks.push(tokio::spawn(async move {
+                while let Some(event) = events.recv().await {
+                    match event {
+                        crate::sfu_call::SfuCallEvent::Answer(sdp) => {
+                            session.accept_sfu_answer_sdp(&sdp).await?;
+                        }
+                        crate::sfu_call::SfuCallEvent::IceCandidate(candidate) => {
+                            session.add_ice_candidate_init(candidate).await?;
+                        }
+                        crate::sfu_call::SfuCallEvent::Rejected { code, message } => {
+                            return Err(format!("SFU rejected client offer ({code}): {message}"));
+                        }
+                        crate::sfu_call::SfuCallEvent::Disconnected(reason) => {
+                            return Err(format!("SFU signaling disconnected: {reason}"));
+                        }
                     }
                 }
-            }
-            Ok::<(), String>(())
-        });
-        let second_for_events = Arc::clone(&second);
-        let second_event_task = tokio::spawn(async move {
-            while let Some(event) = second_events.recv().await {
-                match event {
-                    crate::sfu_call::SfuCallEvent::Answer(sdp) => {
-                        second_for_events.accept_sfu_answer_sdp(&sdp).await?;
-                    }
-                    crate::sfu_call::SfuCallEvent::IceCandidate(candidate) => {
-                        second_for_events.add_ice_candidate_init(candidate).await?;
-                    }
-                    crate::sfu_call::SfuCallEvent::Rejected { code, message } => {
-                        return Err(format!("SFU rejected client offer ({code}): {message}"));
-                    }
-                    crate::sfu_call::SfuCallEvent::Disconnected(reason) => {
-                        return Err(format!("SFU signaling disconnected: {reason}"));
-                    }
-                }
-            }
-            Ok::<(), String>(())
-        });
+                Ok::<(), String>(())
+            }));
+        }
 
-        for session in [&first, &second] {
+        for session in &sessions {
             let mut connection_state = session.connection_state();
-            timeout(Duration::from_secs(15), async {
+            timeout(Duration::from_secs(20), async {
                 loop {
                     if connection_state.borrow().as_str() == "Connected" {
                         break;
@@ -1384,7 +1366,7 @@ mod tests {
                 }
             })
             .await
-            .expect("both Rust clients should establish ICE and DTLS with the local SFU");
+            .expect("all three Rust clients should establish ICE and DTLS with the local SFU");
         }
 
         let frame = (0..crate::call_audio::FRAME_SAMPLES)
@@ -1395,40 +1377,35 @@ mod tests {
                     * 0.2
             })
             .collect::<Vec<_>>();
-        first
-            .audio
-            .as_ref()
-            .unwrap()
-            .send_audio_frame(&frame)
-            .await
-            .unwrap();
-        second
-            .audio
-            .as_ref()
-            .unwrap()
-            .send_audio_frame(&frame)
-            .await
-            .unwrap();
-        for received in [
-            timeout(Duration::from_secs(5), first_sink_rx.recv())
+        for session in &sessions {
+            session
+                .audio
+                .as_ref()
+                .unwrap()
+                .send_audio_frame(&frame)
                 .await
-                .expect("first client should receive RTP forwarded by the SFU")
-                .expect("first audio sink remains open"),
-            timeout(Duration::from_secs(5), second_sink_rx.recv())
-                .await
-                .expect("second client should receive RTP forwarded by the SFU")
-                .expect("second audio sink remains open"),
-        ] {
-            assert_eq!(received.len(), crate::call_audio::FRAME_SAMPLES);
-            assert!(received.iter().any(|sample| sample.abs() > 0.01));
+                .unwrap();
+        }
+        for sink in &mut sinks {
+            for _ in 0..MEMBER_COUNT - 1 {
+                let received = timeout(Duration::from_secs(5), sink.recv())
+                    .await
+                    .expect("each participant should receive audio from both other members")
+                    .expect("audio sink remains open");
+                assert_eq!(received.len(), crate::call_audio::FRAME_SAMPLES);
+                assert!(received.iter().any(|sample| sample.abs() > 0.01));
+            }
         }
 
-        first_transport.leave().await.unwrap();
-        second_transport.leave().await.unwrap();
-        first.close().await.unwrap();
-        second.close().await.unwrap();
-        first_event_task.abort();
-        second_event_task.abort();
+        for transport in &transports {
+            transport.leave().await.unwrap();
+        }
+        for session in &sessions {
+            session.close().await.unwrap();
+        }
+        for task in event_tasks {
+            task.abort();
+        }
     }
 
     #[tokio::test]

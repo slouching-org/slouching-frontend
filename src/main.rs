@@ -7046,10 +7046,9 @@ async fn prepare_call_offer_task(
         .map_err(|error| format!("call MLS context task failed: {error}"))??;
     let epoch = context.epoch;
     if let Some(ws_url) = sfu_url {
-        if context.members.len() != 2 {
+        if !(2..=16).contains(&context.members.len()) {
             return Err(
-                "o modo SFU inicial requer um grupo de chamada com exatamente dois dispositivos"
-                    .to_owned(),
+                "o modo SFU requer um grupo MLS de chamada com 2 a 16 dispositivos".to_owned(),
             );
         }
 
@@ -7062,35 +7061,35 @@ async fn prepare_call_offer_task(
             .await
             .map_err(|error| format!("device identity task failed: {error}"))??;
         let local_device = *signer.public().as_bytes();
-        let remote_device = context
+        let remote_devices = context
             .members
             .iter()
             .map(|member| member.device_public_key)
-            .find(|device| *device != local_device)
-            .ok_or_else(|| "o grupo MLS não contém outro dispositivo".to_owned())?;
-        if !roster.contains(&local_device)
-            || peer_device.is_some_and(|expected| expected != remote_device)
-        {
-            return Err(
-                "a identidade local ou o peer pinado não corresponde ao grupo MLS de chamada"
-                    .to_owned(),
-            );
+            .filter(|device| *device != local_device)
+            .collect::<Vec<_>>();
+        if !roster.contains(&local_device) || remote_devices.is_empty() {
+            return Err("a identidade local não corresponde ao grupo MLS de chamada".to_owned());
         }
+        if peer_device.is_some_and(|expected| !remote_devices.contains(&expected)) {
+            return Err("o peer pinado não pertence ao grupo MLS de chamada".to_owned());
+        }
+        let remote_device = remote_devices[0];
+        let remote_member_count = remote_devices.len();
         let transport = sfu_call::SfuCallTransport::connect_and_join(
             &ws_url, group_id, group_id, epoch, &roster, signer,
         )
         .await?;
         let transport = std::sync::Arc::new(tokio::sync::Mutex::new(transport));
         let rtc = std::sync::Arc::new(
-            call_rtc::CallRtcSession::new_for_call_group(
+            call_rtc::CallRtcSession::new_for_call_group_members(
                 group_id,
-                remote_device,
+                remote_devices,
                 input_device,
                 output_device,
             )
             .await?,
         );
-        let offer = rtc.create_sfu_offer().await?;
+        let offer = rtc.create_sfu_offer(remote_member_count).await?;
         transport.lock().await.send_offer(offer.clone()).await?;
 
         return Ok(CallOfferReady {

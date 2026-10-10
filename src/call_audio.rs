@@ -15,6 +15,10 @@ const MAX_OPUS_FRAME_SAMPLES: usize = 5_760;
 
 pub trait AudioSink: Send + Sync + 'static {
     fn push_mono(&self, samples: &[f32]);
+
+    fn push_member_mono(&self, _member_index: u64, samples: &[f32]) {
+        self.push_mono(samples);
+    }
 }
 
 pub struct CallAudioEncoder {
@@ -157,12 +161,14 @@ impl CallAudioDecoderSet {
 
     /// The SFrame member index selects the decoder, preserving per-speaker
     /// replay protection and Opus state while rejecting unknown senders.
-    pub fn unprotect_and_decode(&mut self, protected: &[u8]) -> Result<Vec<f32>, String> {
+    pub fn unprotect_and_decode(&mut self, protected: &[u8]) -> Result<(u64, Vec<f32>), String> {
         let member_index = MediaFrameReceiver::sender_member_index(self.epoch, protected)?;
-        self.decoders
+        let pcm = self
+            .decoders
             .get_mut(&member_index)
             .ok_or_else(|| "SFrame sender is not a remote member of this call".to_owned())?
-            .unprotect_and_decode(protected)
+            .unprotect_and_decode(protected)?;
+        Ok((member_index, pcm))
     }
 }
 
@@ -260,15 +266,13 @@ mod tests {
         let frame_b = sender_b.encode_and_protect(&pcm).unwrap();
         let unauthorized_frame = unauthorized_sender.encode_and_protect(&pcm).unwrap();
 
-        assert_eq!(
-            receivers.unprotect_and_decode(&frame_a).unwrap().len(),
-            FRAME_SAMPLES
-        );
+        let (sender_a_index, decoded_a) = receivers.unprotect_and_decode(&frame_a).unwrap();
+        assert_eq!(sender_a_index, 2);
+        assert_eq!(decoded_a.len(), FRAME_SAMPLES);
         assert!(receivers.unprotect_and_decode(&frame_a).is_err());
-        assert_eq!(
-            receivers.unprotect_and_decode(&frame_b).unwrap().len(),
-            FRAME_SAMPLES
-        );
+        let (sender_b_index, decoded_b) = receivers.unprotect_and_decode(&frame_b).unwrap();
+        assert_eq!(sender_b_index, 3);
+        assert_eq!(decoded_b.len(), FRAME_SAMPLES);
         assert!(receivers.unprotect_and_decode(&unauthorized_frame).is_err());
     }
 
