@@ -412,10 +412,11 @@ in the operating system credential store. PNG import is explicit, limited to
 512 KiB bound. Selecting a supplied familiar removes the custom avatar.
 Saving fails closed when that store is unavailable. The
 screen can also explicitly create and retain an Ed25519 device signing key in
-the system credential store. The connection screen can search for active Slouching listeners on the LAN via
-mDNS and fill a discovered route into direct chat. Discovery is an untrusted
-route hint: it does not publish a device key or replace manual identity
-verification. mDNS discovery across VPNs is not supported. The direct-text trust screen creates a signed
+the system credential store. The connection screen can search for active Slouching listeners on the LAN via mDNS and fill
+a discovered route into direct chat. Discovery is an untrusted route hint: it
+does not publish a device key or replace manual identity verification. mDNS
+discovery across VPNs is not supported. The direct-text trust screen creates a
+signed
 10-minute QR invitation containing the public key and optional listener
 addresses, then imports it from PNG and lets the user choose a route. The QR
 does not auto-verify human identity; a changed key has no inherited trust.
