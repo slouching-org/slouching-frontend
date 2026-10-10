@@ -2977,7 +2977,10 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 PeerListenEvent::SessionCommands(commands) => {
                     state.peer_session_commands = Some(commands);
                 }
-                PeerListenEvent::Session(peer::PeerEvent::Connected { peer_id }) => {
+                PeerListenEvent::Session(peer::PeerEvent::Connected {
+                    peer_id,
+                    direct_address,
+                }) => {
                     state.active_peer_device = Some(*peer_id.as_bytes());
                     if let Some(commands) = state.peer_session_commands.as_ref() {
                         let _ = commands.try_send(peer::PeerCommand::RequestDelegatedMlsCopies);
@@ -2990,7 +2993,19 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     let remember_route = !state.helper_listener_active
                         && ((initiated_connection && !state.peer_address.trim().is_empty())
                             || relay_configured);
-                    let route_task = if remember_route {
+                    let route_task = if !state.helper_listener_active
+                        && let Some(address) = direct_address
+                    {
+                        Task::perform(
+                            save_peer_route_task(
+                                *peer_id.as_bytes(),
+                                address.to_string(),
+                                false,
+                                false,
+                            ),
+                            Message::PeerRouteSaved,
+                        )
+                    } else if remember_route {
                         Task::perform(
                             save_peer_route_task(
                                 *peer_id.as_bytes(),
@@ -3003,7 +3018,13 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     } else {
                         Task::none()
                     };
-                    apply_peer_event(state, peer::PeerEvent::Connected { peer_id });
+                    apply_peer_event(
+                        state,
+                        peer::PeerEvent::Connected {
+                            peer_id,
+                            direct_address,
+                        },
+                    );
                     let Some(group_id) = state.mls_history_group.clone() else {
                         return route_task;
                     };
@@ -7212,7 +7233,8 @@ async fn fanout_mls_commits_to_peer(
     let (commands, receiver) = tokio::sync::mpsc::channel(8);
     let mut events = Box::pin(session.run(receiver));
     match tokio::time::timeout(Duration::from_secs(8), events.next()).await {
-        Ok(Some(peer::PeerEvent::Connected { peer_id })) if *peer_id.as_bytes() == peer_device => {}
+        Ok(Some(peer::PeerEvent::Connected { peer_id, .. }))
+            if *peer_id.as_bytes() == peer_device => {}
         Ok(Some(event)) => {
             outcome.failure = Some(format!("unexpected session start event: {event:?}"));
             return outcome;
@@ -7546,7 +7568,7 @@ async fn fanout_mls_copies_to_helper(
     let (commands, receiver) = tokio::sync::mpsc::channel(8);
     let mut stream = Box::pin(session.run(receiver));
     match tokio::time::timeout(Duration::from_secs(8), stream.next()).await {
-        Ok(Some(peer::PeerEvent::Connected { peer_id }))
+        Ok(Some(peer::PeerEvent::Connected { peer_id, .. }))
             if *peer_id.as_bytes() == helper_device => {}
         Ok(Some(event)) => {
             return (
@@ -7730,7 +7752,8 @@ async fn fanout_mls_events_to_peer(
     let (commands, receiver) = tokio::sync::mpsc::channel(8);
     let mut stream = Box::pin(session.run(receiver));
     match tokio::time::timeout(Duration::from_secs(8), stream.next()).await {
-        Ok(Some(peer::PeerEvent::Connected { peer_id })) if *peer_id.as_bytes() == peer_device => {}
+        Ok(Some(peer::PeerEvent::Connected { peer_id, .. }))
+            if *peer_id.as_bytes() == peer_device => {}
         Ok(Some(event)) => {
             return (
                 acked,

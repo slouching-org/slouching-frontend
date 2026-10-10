@@ -183,9 +183,13 @@ addresses, but a VPN connection between separate machines remains unverified.
 The invite format, signature, limits, and trust boundary are documented in the
 [project's v1 invite spec](https://github.com/slouching-org/slouching/blob/main/docs/fichas/identity/pairing-invite-v1.md).
 
-A successful connection saves the pinned device key and its direct socket or
-relay-only route in the encrypted local route book. The chat screen lists these
-routes, and MLS fan-out can use the saved route plus the configured relay to
+A successful direct QUIC connection records the active IP route Iroh observed
+for the authenticated pinned device, whether this device initiated or accepted
+the session. This can refresh a stale route for the next reconnect. Relay
+connections do not masquerade as direct socket addresses; the explicitly
+configured relay-only route stays separate. The encrypted local route book
+feeds the chat route list and MLS fan-out, which can use a saved direct route
+plus the configured relay to
 retry pending Commits and messages. LAN addresses can become stale; peers
 without a saved route remain pending. Relay-assisted MLS fan-out is implemented
 but has not yet had a separate end-to-end test. The listener stays

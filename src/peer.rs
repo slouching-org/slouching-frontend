@@ -243,6 +243,7 @@ pub enum PeerCommand {
 pub enum PeerEvent {
     Connected {
         peer_id: EndpointId,
+        direct_address: Option<SocketAddr>,
     },
     AttachmentBlobSent {
         request_id: u64,
@@ -825,7 +826,34 @@ impl DirectPeerSession {
                     }
                 }
             });
-            yield PeerEvent::Connected { peer_id: self.peer_id };
+            let direct_address = self
+                .endpoint
+                .remote_info(self.peer_id)
+                .await
+                .and_then(|info| {
+                    info.addrs().find_map(|address| {
+                        if !matches!(
+                            address.usage(),
+                            iroh::endpoint::TransportAddrUsage::Active
+                        ) {
+                            return None;
+                        }
+                        match address.addr() {
+                            iroh::TransportAddr::Ip(address)
+                                if address.port() != 0
+                                    && !address.ip().is_unspecified()
+                                    && !address.ip().is_multicast() =>
+                            {
+                                Some(*address)
+                            }
+                            _ => None,
+                        }
+                    })
+                });
+            yield PeerEvent::Connected {
+                peer_id: self.peer_id,
+                direct_address,
+            };
 
             let disconnect_reason = 'session: loop {
                 tokio::select! {
@@ -3395,8 +3423,14 @@ mod tests {
             let mut retained = None;
             while let Some(event) = stream.next().await {
                 match event {
-                    PeerEvent::Connected { peer_id } => {
-                        assert_eq!(*peer_id.as_bytes(), author_device)
+                    PeerEvent::Connected {
+                        peer_id,
+                        direct_address,
+                    } => {
+                        assert_eq!(*peer_id.as_bytes(), author_device);
+                        let address = direct_address.expect("direct route should be observed");
+                        assert!(address.ip().is_loopback());
+                        assert_ne!(address.port(), 0);
                     }
                     PeerEvent::DelegatedMlsCopyReceived {
                         sequence,
@@ -3423,7 +3457,7 @@ mod tests {
             let mut stream = Box::pin(recipient_session.run(receiver));
             while let Some(event) = stream.next().await {
                 match event {
-                    PeerEvent::Connected { peer_id } => {
+                    PeerEvent::Connected { peer_id, .. } => {
                         assert_eq!(*peer_id.as_bytes(), recipient_device)
                     }
                     PeerEvent::DelegatedMlsCopiesRequested { peer_id } => {
