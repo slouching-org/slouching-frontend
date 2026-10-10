@@ -11,9 +11,9 @@ use tokio::{
 };
 
 /// Direct-only protocol version used for persistent paired-device text sessions.
-pub const PEER_ALPN: &[u8] = b"org.slouching.peer/8";
+pub const PEER_ALPN: &[u8] = b"org.slouching.peer/9";
 const FRAME_MAGIC: &[u8; 4] = b"SLCH";
-const FRAME_VERSION: u16 = 8;
+const FRAME_VERSION: u16 = 9;
 const FRAME_DATA: u8 = 1;
 const FRAME_ACK: u8 = 2;
 const FRAME_CLOSE: u8 = 3;
@@ -39,7 +39,7 @@ const MLS_PROPOSAL_VERSION: u16 = 1;
 const MLS_KEY_PACKAGE_MAGIC: &[u8; 4] = b"SLKP";
 const MLS_KEY_PACKAGE_VERSION: u16 = 1;
 const MLS_WELCOME_MAGIC: &[u8; 4] = b"SLMW";
-const MLS_WELCOME_VERSION: u16 = 1;
+const MLS_WELCOME_VERSION: u16 = 2;
 const MLS_DELEGATED_COPY_MAGIC: &[u8; 4] = b"SLDG";
 const MLS_DELEGATED_COPY_VERSION: u16 = 1;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
@@ -110,8 +110,30 @@ pub struct MlsWelcomeEnvelope {
     pub event_id: [u8; 16],
     pub invitee_device: [u8; 32],
     pub group_id: Vec<u8>,
+    pub purpose: MlsGroupPurpose,
     pub welcome: Vec<u8>,
     pub ratchet_tree: Vec<u8>,
+}
+
+/// The application-level use of an MLS group. Call media keys are never
+/// exported from conversation groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MlsGroupPurpose {
+    Conversation = 0,
+    Call = 1,
+}
+
+impl TryFrom<u8> for MlsGroupPurpose {
+    type Error = String;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Conversation),
+            1 => Ok(Self::Call),
+            _ => Err("MLS group purpose is invalid".to_owned()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1808,12 +1830,13 @@ fn encode_mls_welcome(envelope: &MlsWelcomeEnvelope) -> Result<Vec<u8>, String> 
     {
         return Err("MLS Welcome has an invalid or oversized envelope".to_owned());
     }
-    let mut output = Vec::with_capacity(78 + total_artifact_len);
+    let mut output = Vec::with_capacity(79 + total_artifact_len);
     output.extend_from_slice(MLS_WELCOME_MAGIC);
     output.extend_from_slice(&MLS_WELCOME_VERSION.to_be_bytes());
     output.extend_from_slice(&envelope.event_id);
     output.extend_from_slice(&envelope.invitee_device);
     output.extend_from_slice(&envelope.group_id);
+    output.push(envelope.purpose as u8);
     output.extend_from_slice(&(envelope.welcome.len() as u32).to_be_bytes());
     output.extend_from_slice(&envelope.welcome);
     output.extend_from_slice(&(envelope.ratchet_tree.len() as u32).to_be_bytes());
@@ -1825,7 +1848,7 @@ fn encode_mls_welcome(envelope: &MlsWelcomeEnvelope) -> Result<Vec<u8>, String> 
 }
 
 fn decode_mls_welcome(bytes: &[u8]) -> Result<MlsWelcomeEnvelope, String> {
-    const FIXED: usize = 4 + 2 + 16 + 32 + 16 + 4 + 4;
+    const FIXED: usize = 4 + 2 + 16 + 32 + 16 + 1 + 4 + 4;
     if bytes.len() < FIXED
         || bytes.len() > MAX_MLS_WELCOME_BYTES
         || &bytes[..4] != MLS_WELCOME_MAGIC
@@ -1845,6 +1868,8 @@ fn decode_mls_welcome(bytes: &[u8]) -> Result<MlsWelcomeEnvelope, String> {
     cursor += 32;
     let group_id = bytes[cursor..cursor + 16].to_vec();
     cursor += 16;
+    let purpose = MlsGroupPurpose::try_from(bytes[cursor])?;
+    cursor += 1;
     let welcome_len = u32::from_be_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
     cursor += 4;
     if welcome_len == 0
@@ -1866,6 +1891,7 @@ fn decode_mls_welcome(bytes: &[u8]) -> Result<MlsWelcomeEnvelope, String> {
         event_id,
         invitee_device,
         group_id,
+        purpose,
         welcome,
         ratchet_tree,
     };
@@ -2642,7 +2668,7 @@ mod tests {
         let (mut writer, mut reader) = duplex(128);
         writer
             .write_all(&[
-                b'S', b'L', b'C', b'H', 0, 9, FRAME_DATA, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, b'x',
+                b'S', b'L', b'C', b'H', 0, 8, FRAME_DATA, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, b'x',
             ])
             .await
             .unwrap();
@@ -2793,6 +2819,7 @@ mod tests {
             event_id,
             invitee_device: [0x72; 32],
             group_id: [0x73; 16].to_vec(),
+            purpose: MlsGroupPurpose::Call,
             welcome,
             ratchet_tree,
         };
@@ -2823,6 +2850,7 @@ mod tests {
             event_id,
             invitee_device: [0x82; 32],
             group_id: [0x83; 16].to_vec(),
+            purpose: MlsGroupPurpose::Conversation,
             welcome,
             ratchet_tree,
         };

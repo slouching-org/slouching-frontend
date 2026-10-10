@@ -29,7 +29,7 @@ only bounded deduplication tombstones. Network & P2P settings expose the
 persisted opt-in and bounded policy.
 The control is unavailable while the OS credential store cannot unlock the
 local encrypted profile. Peer transport and recipient fetch are now present in
-QUIC v8. On connect, the client requests up to 16
+QUIC v9. On connect, the client requests up to 16
 copies addressed to its device; the holder requires its opt-in and ACKs only
 after durable storage, while the recipient verifies the author's grant and
 persists the MLS event before ACK. The helper deletes its copy after that ACK.
@@ -121,5 +121,5 @@ contact discovery, QR pairing, and guaranteed offline delivery are not
 implemented. The older web UI under
 `prototypes/web/` is a design benchmark, not the product runtime.
 
-See [direct peer transport v8](../transport/lan-peer-v8.md) for the direct session
+See [direct peer transport v9](../transport/lan-peer-v9.md) for the direct session
 contract and [the Iced design plan](iced-design.md) for visual references.

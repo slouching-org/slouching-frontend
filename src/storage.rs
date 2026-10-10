@@ -1,5 +1,8 @@
-use crate::file_transfer::{FileAttachmentOffer, FileOffer, MAX_FILE_BYTES};
 use crate::identity::MlsSigningKeyBinding;
+use crate::{
+    file_transfer::{FileAttachmentOffer, FileOffer, MAX_FILE_BYTES},
+    peer::MlsGroupPurpose,
+};
 use directories::ProjectDirs;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use keyring::{Entry, Error as KeyringError};
@@ -26,7 +29,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 22;
+const PROFILE_SCHEMA_VERSION: u32 = 23;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 const MAX_DELEGATED_COPY_BYTES: usize = 32 * 1024;
@@ -310,6 +313,7 @@ pub struct StoredMlsGroup {
     pub group_id: [u8; 16],
     pub epoch: u64,
     pub quarantined: bool,
+    pub purpose: MlsGroupPurpose,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -781,7 +785,7 @@ fn set_mls_proposal_approval_in(
 
 fn list_mls_groups_in(connection: &Connection) -> Result<Vec<StoredMlsGroup>, String> {
     let mut statement = connection
-        .prepare("SELECT group_id, epoch, quarantined FROM local_mls_groups ORDER BY rowid DESC")
+        .prepare("SELECT group_id, epoch, quarantined, purpose FROM local_mls_groups ORDER BY rowid DESC")
         .map_err(|error| format!("could not prepare local MLS group list: {error}"))?;
     let rows = statement
         .query_map([], |row| {
@@ -789,16 +793,18 @@ fn list_mls_groups_in(connection: &Connection) -> Result<Vec<StoredMlsGroup>, St
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         })
         .map_err(|error| format!("could not query local MLS groups: {error}"))?;
     rows.map(|row| {
-        let (group_id, epoch, quarantined) =
+        let (group_id, epoch, quarantined, purpose) =
             row.map_err(|error| format!("could not read local MLS group: {error}"))?;
         Ok(StoredMlsGroup {
             group_id: fixed_bytes(group_id, "MLS group ID")?,
             epoch: u64::try_from(epoch).map_err(|_| "MLS group has invalid epoch".to_owned())?,
             quarantined: quarantined != 0,
+            purpose: MlsGroupPurpose::try_from(u8::try_from(purpose).unwrap_or(u8::MAX))?,
         })
     })
     .collect()
@@ -1042,6 +1048,7 @@ pub struct CreatedMlsGroup {
 pub struct AddedMlsMember {
     pub group_id: Vec<u8>,
     pub epoch: u64,
+    pub purpose: MlsGroupPurpose,
     pub commit_event_id: [u8; 16],
     pub invited_device: [u8; 32],
     /// Public MLS Commit bytes to distribute alongside the Welcome.
@@ -1058,6 +1065,7 @@ pub struct StoredMlsWelcome {
     pub group_id: Vec<u8>,
     pub commit_event_id: [u8; 16],
     pub invitee_device: [u8; 32],
+    pub purpose: MlsGroupPurpose,
     pub welcome: Vec<u8>,
     pub ratchet_tree: Vec<u8>,
 }
@@ -1091,10 +1099,12 @@ fn list_queued_mls_welcomes_for_peer_in(
 ) -> Result<Vec<StoredMlsWelcome>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT event_id, group_id, commit_event_id, invitee_device, welcome_bytes, ratchet_tree
-             FROM local_mls_welcome_outbox
-             WHERE group_id = ?1 AND invitee_device = ?2 AND delivery_state = 'queued'
-             ORDER BY rowid",
+            "SELECT w.event_id, w.group_id, w.commit_event_id, w.invitee_device,
+                    w.welcome_bytes, w.ratchet_tree, g.purpose
+             FROM local_mls_welcome_outbox w
+             JOIN local_mls_groups g ON g.group_id = w.group_id
+             WHERE w.group_id = ?1 AND w.invitee_device = ?2 AND w.delivery_state = 'queued'
+             ORDER BY w.rowid",
         )
         .map_err(|error| format!("could not prepare MLS Welcome outbox query: {error}"))?;
     let rows = statement
@@ -1106,12 +1116,20 @@ fn list_queued_mls_welcomes_for_peer_in(
                 row.get::<_, Vec<u8>>(3)?,
                 row.get::<_, Vec<u8>>(4)?,
                 row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })
         .map_err(|error| format!("could not query MLS Welcome outbox: {error}"))?;
     rows.map(|row| {
-        let (event_id, stored_group, commit_event_id, stored_invitee, welcome, ratchet_tree) =
-            row.map_err(|error| format!("could not read MLS Welcome outbox: {error}"))?;
+        let (
+            event_id,
+            stored_group,
+            commit_event_id,
+            stored_invitee,
+            welcome,
+            ratchet_tree,
+            purpose,
+        ) = row.map_err(|error| format!("could not read MLS Welcome outbox: {error}"))?;
         let event_id = fixed_bytes(event_id, "MLS Welcome event ID")?;
         if event_id != mls_welcome_event_id(&welcome, &ratchet_tree) {
             return Err("saved MLS Welcome bundle failed its digest check".to_owned());
@@ -1121,6 +1139,7 @@ fn list_queued_mls_welcomes_for_peer_in(
             group_id: fixed_bytes::<16>(stored_group, "MLS Welcome group ID")?.to_vec(),
             commit_event_id: fixed_bytes(commit_event_id, "MLS Welcome Commit ID")?,
             invitee_device: fixed_bytes(stored_invitee, "MLS Welcome invitee")?,
+            purpose: MlsGroupPurpose::try_from(u8::try_from(purpose).unwrap_or(u8::MAX))?,
             welcome,
             ratchet_tree,
         })
@@ -1200,7 +1219,14 @@ pub enum ProcessedMlsProposal {
 }
 
 type StoredMlsCommitRow = (Vec<u8>, Vec<u8>, i64, i64, Vec<u8>, Vec<u8>, Vec<u8>);
-type StoredMlsWelcomeReceiptRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64);
+type StoredMlsWelcomeReceiptRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64, i64);
+
+struct MlsWelcomeJoinPins {
+    committer_device: Option<[u8; 32]>,
+    group_id: Option<[u8; 16]>,
+    event_id: Option<[u8; 16]>,
+    purpose: MlsGroupPurpose,
+}
 
 #[derive(Serialize, serde::Deserialize)]
 struct MlsEpochSnapshot {
@@ -1631,6 +1657,7 @@ pub struct JoinedMlsGroup {
     pub ciphersuite: u16,
     pub epoch: u64,
     pub designated_committer_device: [u8; 32],
+    pub purpose: MlsGroupPurpose,
 }
 
 #[derive(Debug, Clone)]
@@ -3877,13 +3904,69 @@ fn create_mls_key_package_in(
 /// it is recorded as its designated committer; no invitation or network message
 /// is produced by this operation.
 pub fn create_mls_group(ciphersuite: Ciphersuite) -> Result<CreatedMlsGroup, String> {
+    create_mls_group_with_purpose(ciphersuite, MlsGroupPurpose::Conversation)
+}
+
+/// Creates a dedicated single-member MLS group for one call. Call media
+/// exporters are only available from groups created with this purpose.
+pub fn create_call_mls_group(ciphersuite: Ciphersuite) -> Result<CreatedMlsGroup, String> {
+    create_mls_group_with_purpose(ciphersuite, MlsGroupPurpose::Call)
+}
+
+fn create_mls_group_with_purpose(
+    ciphersuite: Ciphersuite,
+    purpose: MlsGroupPurpose,
+) -> Result<CreatedMlsGroup, String> {
     let entry = identity_key_entry()?;
     let secret = entry
         .get_secret()
         .map_err(|error| format!("could not load the device identity key: {error}"))?;
     let device_identity = signing_key_from_secret(secret)?;
     let mut connection = open_local_database()?;
-    create_mls_group_in(&mut connection, ciphersuite, &device_identity)
+    create_mls_group_in_with_purpose(&mut connection, ciphersuite, &device_identity, purpose)
+}
+
+/// Exports the RFC 9420 MLS exporter secret used as the input to SFrame for a
+/// call group. The result stays zeroizing and is never persisted.
+pub fn export_call_media_base_key(group_id: &[u8]) -> Result<(u64, Zeroizing<Vec<u8>>), String> {
+    let mut connection = open_local_database()?;
+    export_call_media_base_key_in(&mut connection, group_id)
+}
+
+fn export_call_media_base_key_in(
+    connection: &mut Connection,
+    group_id: &[u8],
+) -> Result<(u64, Zeroizing<Vec<u8>>), String> {
+    if group_id.len() != 16 {
+        return Err("MLS group ID must contain 16 bytes".to_owned());
+    }
+    ensure_mls_group_not_quarantined(connection, group_id)?;
+    let (purpose, indexed_epoch, indexed_suite): (i64, i64, i64) = connection
+        .query_row(
+            "SELECT purpose, epoch, ciphersuite FROM local_mls_groups WHERE group_id = ?1",
+            [group_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| format!("could not load call MLS group index: {error}"))?;
+    if MlsGroupPurpose::try_from(u8::try_from(purpose).unwrap_or(u8::MAX))? != MlsGroupPurpose::Call
+    {
+        return Err("media keys can only be exported from a call MLS group".to_owned());
+    }
+    let group_id = GroupId::from_slice(group_id);
+    let provider = LocalOpenMlsProvider::new(connection);
+    let group = MlsGroup::load(provider.storage(), &group_id)
+        .map_err(|error| format!("could not load call MLS state: {error}"))?
+        .ok_or_else(|| "call MLS state is missing".to_owned())?;
+    if !group.is_active()
+        || u64::try_from(indexed_epoch).ok() != Some(group.epoch().as_u64())
+        || u16::try_from(indexed_suite).ok() != Some(group.ciphersuite() as u16)
+    {
+        return Err("call MLS index does not match its authenticated state".to_owned());
+    }
+    let key = group
+        .export_secret(provider.crypto(), "SFrame 1.0 Base Key", b"", 16)
+        .map_err(|error| format!("could not export call media base key: {error:?}"))?;
+    Ok((group.epoch().as_u64(), Zeroizing::new(key)))
 }
 
 /// Admit one device-bound KeyPackage to a local MLS group. The local creator
@@ -4006,6 +4089,14 @@ fn add_mls_group_member_with_peer_in(
                 |row| row.get(0),
             )
             .map_err(|error| format!("could not load MLS snapshot epoch: {error}"))?;
+        let purpose_value: i64 = connection
+            .query_row(
+                "SELECT purpose FROM local_mls_groups WHERE group_id = ?1",
+                [group_id.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("could not load MLS group purpose: {error}"))?;
+        let purpose = MlsGroupPurpose::try_from(u8::try_from(purpose_value).unwrap_or(u8::MAX))?;
         capture_mls_epoch_snapshot_in(connection, group_id.as_slice(), predecessor_epoch as u64)?;
         let (added, epoch) = {
             let provider = LocalOpenMlsProvider::new(connection);
@@ -4066,6 +4157,7 @@ fn add_mls_group_member_with_peer_in(
             let added = AddedMlsMember {
                 group_id: group.group_id().to_vec(),
                 epoch: group.epoch().as_u64(),
+                purpose,
                 commit_event_id,
                 invited_device: candidate_device,
                 commit: commit_bytes.clone(),
@@ -4399,6 +4491,7 @@ pub fn join_mls_group_from_pinned_peer_event(
     serialized_ratchet_tree: &[u8],
     expected_committer_device: [u8; 32],
     expected_group_id: [u8; 16],
+    purpose: MlsGroupPurpose,
 ) -> Result<JoinedMlsGroup, String> {
     let entry = identity_key_entry()?;
     let secret = entry
@@ -4406,14 +4499,17 @@ pub fn join_mls_group_from_pinned_peer_event(
         .map_err(|error| format!("could not load the device identity key: {error}"))?;
     let device_identity = signing_key_from_secret(secret)?;
     let mut connection = open_local_database()?;
-    join_mls_group_from_welcome_in(
+    join_mls_group_from_welcome_with_purpose_in(
         &mut connection,
         serialized_welcome,
         serialized_ratchet_tree,
         &device_identity,
-        Some(expected_committer_device),
-        Some(expected_group_id),
-        Some(event_id),
+        MlsWelcomeJoinPins {
+            committer_device: Some(expected_committer_device),
+            group_id: Some(expected_group_id),
+            event_id: Some(event_id),
+            purpose,
+        },
     )
 }
 
@@ -4426,33 +4522,63 @@ fn join_mls_group_from_welcome_in(
     expected_group_id: Option<[u8; 16]>,
     expected_event_id: Option<[u8; 16]>,
 ) -> Result<JoinedMlsGroup, String> {
+    join_mls_group_from_welcome_with_purpose_in(
+        connection,
+        serialized_welcome,
+        serialized_ratchet_tree,
+        device_identity,
+        MlsWelcomeJoinPins {
+            committer_device: expected_committer_device,
+            group_id: expected_group_id,
+            event_id: expected_event_id,
+            purpose: MlsGroupPurpose::Conversation,
+        },
+    )
+}
+
+fn join_mls_group_from_welcome_with_purpose_in(
+    connection: &mut Connection,
+    serialized_welcome: &[u8],
+    serialized_ratchet_tree: &[u8],
+    device_identity: &SigningKey,
+    pins: MlsWelcomeJoinPins,
+) -> Result<JoinedMlsGroup, String> {
     use openmls::prelude::tls_codec::Deserialize as TlsCodecDeserialize;
 
     connection
         .execute_batch("BEGIN IMMEDIATE")
         .map_err(|error| format!("could not begin MLS Welcome transaction: {error}"))?;
     let result = (|| {
-        if let Some(event_id) = expected_event_id {
+        if let Some(event_id) = pins.event_id {
             if event_id != mls_welcome_event_id(serialized_welcome, serialized_ratchet_tree) {
                 return Err("Welcome event ID does not match its payload".to_owned());
             }
             let receipt: Option<StoredMlsWelcomeReceiptRow> = connection
                 .query_row(
-                    "SELECT group_id, committer_device, invitee_device, epoch
+                    "SELECT group_id, committer_device, invitee_device, epoch, purpose
                      FROM local_mls_welcome_receipts WHERE event_id = ?1",
                     [event_id.as_slice()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(|error| format!("could not query MLS Welcome receipt: {error}"))?;
-            if let Some((group_id, committer, invitee, epoch)) = receipt {
+            if let Some((group_id, committer, invitee, epoch, receipt_purpose)) = receipt {
                 let local_device = device_identity.verifying_key().to_bytes();
                 let group_id = fixed_bytes::<16>(group_id, "MLS Welcome receipt group")?;
                 let committer = fixed_bytes::<32>(committer, "MLS Welcome receipt committer")?;
                 let invitee = fixed_bytes::<32>(invitee, "MLS Welcome receipt invitee")?;
-                if Some(group_id) != expected_group_id
-                    || Some(committer) != expected_committer_device
+                if Some(group_id) != pins.group_id
+                    || Some(committer) != pins.committer_device
                     || invitee != local_device
+                    || u8::try_from(receipt_purpose).ok() != Some(pins.purpose as u8)
                 {
                     return Err("duplicate Welcome event does not match its original pins".into());
                 }
@@ -4469,6 +4595,7 @@ fn join_mls_group_from_welcome_in(
                     epoch: u64::try_from(epoch)
                         .map_err(|_| "MLS Welcome receipt has invalid epoch".to_owned())?,
                     designated_committer_device: committer,
+                    purpose: pins.purpose,
                 });
             }
         }
@@ -4517,7 +4644,8 @@ fn join_mls_group_from_welcome_in(
             ) {
                 return Err("Welcome sender MLS key does not match its device binding".to_owned());
             }
-            if expected_committer_device
+            if pins
+                .committer_device
                 .is_some_and(|expected| sender_binding.device_public_key != expected)
             {
                 return Err("Welcome sender does not match the pinned committer device".to_owned());
@@ -4525,7 +4653,10 @@ fn join_mls_group_from_welcome_in(
             let group = staged
                 .into_group(&provider)
                 .map_err(|error| format!("could not persist joined MLS group: {error:?}"))?;
-            if expected_group_id.is_some_and(|expected| group.group_id().as_slice() != expected) {
+            if pins
+                .group_id
+                .is_some_and(|expected| group.group_id().as_slice() != expected)
+            {
                 return Err("Welcome MLS group ID does not match its transport envelope".to_owned());
             }
             JoinedMlsGroup {
@@ -4533,34 +4664,37 @@ fn join_mls_group_from_welcome_in(
                 ciphersuite: group.ciphersuite() as u16,
                 epoch: group.epoch().as_u64(),
                 designated_committer_device: sender_binding.device_public_key,
+                purpose: pins.purpose,
             }
         };
         connection
             .execute(
                 "INSERT INTO local_mls_groups
-                    (group_id, ciphersuite, designated_committer_device, epoch)
-                 VALUES (?1, ?2, ?3, ?4)",
+                    (group_id, ciphersuite, designated_committer_device, epoch, purpose)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     joined.group_id,
                     joined.ciphersuite,
                     joined.designated_committer_device.as_slice(),
-                    joined.epoch as i64
+                    joined.epoch as i64,
+                    joined.purpose as u8
                 ],
             )
             .map_err(|error| format!("could not index joined MLS group: {error}"))?;
         capture_mls_epoch_snapshot_in(connection, &joined.group_id, joined.epoch)?;
-        if let Some(event_id) = expected_event_id {
+        if let Some(event_id) = pins.event_id {
             connection
                 .execute(
                     "INSERT INTO local_mls_welcome_receipts
-                        (event_id, group_id, committer_device, invitee_device, epoch)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                        (event_id, group_id, committer_device, invitee_device, epoch, purpose)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         event_id.as_slice(),
                         joined.group_id.as_slice(),
                         joined.designated_committer_device.as_slice(),
                         device_identity.verifying_key().to_bytes().as_slice(),
-                        joined.epoch as i64
+                        joined.epoch as i64,
+                        joined.purpose as u8
                     ],
                 )
                 .map_err(|error| format!("could not persist MLS Welcome receipt: {error}"))?;
@@ -4904,10 +5038,25 @@ fn authenticate_mls_commit_from_epoch_snapshot(
     }
 }
 
+#[cfg(test)]
 fn create_mls_group_in(
     connection: &mut Connection,
     ciphersuite: Ciphersuite,
     device_identity: &SigningKey,
+) -> Result<CreatedMlsGroup, String> {
+    create_mls_group_in_with_purpose(
+        connection,
+        ciphersuite,
+        device_identity,
+        MlsGroupPurpose::Conversation,
+    )
+}
+
+fn create_mls_group_in_with_purpose(
+    connection: &mut Connection,
+    ciphersuite: Ciphersuite,
+    device_identity: &SigningKey,
+    purpose: MlsGroupPurpose,
 ) -> Result<CreatedMlsGroup, String> {
     let binding =
         create_or_load_mls_signing_key_binding_in(connection, ciphersuite, device_identity)?;
@@ -4955,13 +5104,14 @@ fn create_mls_group_in(
         connection
             .execute(
                 "INSERT INTO local_mls_groups
-                    (group_id, ciphersuite, designated_committer_device, epoch)
-                 VALUES (?1, ?2, ?3, ?4)",
+                    (group_id, ciphersuite, designated_committer_device, epoch, purpose)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     group_id,
                     ciphersuite as u16,
                     binding.device_public_key.as_slice(),
-                    created_group.epoch as i64
+                    created_group.epoch as i64,
+                    purpose as u8
                 ],
             )
             .map_err(|error| format!("could not index local MLS group: {error}"))?;
@@ -5559,6 +5709,17 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
             .execute_batch("PRAGMA user_version = 22;")
             .map_err(|error| format!("could not finish attachment quota migration: {error}"))?;
     }
+    if version < 23 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE local_mls_groups
+                     ADD COLUMN purpose INTEGER NOT NULL DEFAULT 0 CHECK (purpose IN (0, 1));
+                 ALTER TABLE local_mls_welcome_receipts
+                     ADD COLUMN purpose INTEGER NOT NULL DEFAULT 0 CHECK (purpose IN (0, 1));
+                 PRAGMA user_version = 23;",
+            )
+            .map_err(|error| format!("could not add MLS group purpose: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -5710,6 +5871,8 @@ mod tests {
             .execute_batch(
                 "DROP TABLE local_verified_peers;
                  DROP TABLE local_file_attachments;
+                 ALTER TABLE local_mls_groups DROP COLUMN purpose;
+                 ALTER TABLE local_mls_welcome_receipts DROP COLUMN purpose;
                  PRAGMA user_version = 19;",
             )
             .expect("test should restore the previous schema version");
@@ -6078,6 +6241,7 @@ mod tests {
                     .expect("created group ID should be 16 bytes"),
                 epoch: 0,
                 quarantined: false,
+                purpose: MlsGroupPurpose::Conversation,
             }]
         );
 
@@ -6112,6 +6276,150 @@ mod tests {
         }
 
         drop(connection);
+        fs::remove_dir_all(directory).expect("temporary database files should be removed");
+    }
+
+    #[test]
+    fn call_media_exporter_only_accepts_a_dedicated_call_group() {
+        use openmls::prelude::Ciphersuite;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-call-group-purpose-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary database directory should be created");
+        let path = directory.join("profile.sqlite3");
+        let database_key = [0x2e; PROFILE_DB_KEY_LEN];
+        let device_identity = SigningKey::from_bytes(&[0x50; 32]);
+        let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+        let mut connection = open_database(&path, &database_key)
+            .expect("temporary database should initialize with SQLCipher and OpenMLS");
+
+        let conversation = create_mls_group_in(&mut connection, ciphersuite, &device_identity)
+            .expect("conversation group should be created");
+        let call = create_mls_group_in_with_purpose(
+            &mut connection,
+            ciphersuite,
+            &device_identity,
+            MlsGroupPurpose::Call,
+        )
+        .expect("dedicated call group should be created");
+
+        assert_eq!(
+            export_call_media_base_key_in(&mut connection, &conversation.group_id)
+                .expect_err("conversation group must not export call media keys"),
+            "media keys can only be exported from a call MLS group"
+        );
+        let (epoch, first_key) = export_call_media_base_key_in(&mut connection, &call.group_id)
+            .expect("call group should export its epoch media key");
+        let (same_epoch, second_key) =
+            export_call_media_base_key_in(&mut connection, &call.group_id)
+                .expect("call group should export the same epoch key consistently");
+        assert_eq!(epoch, 0);
+        assert_eq!(same_epoch, epoch);
+        assert_eq!(first_key.len(), 16);
+        assert_eq!(first_key.as_slice(), second_key.as_slice());
+        let groups = list_mls_groups_in(&connection).expect("group purposes should persist");
+        assert_eq!(groups[0].purpose, MlsGroupPurpose::Call);
+        assert_eq!(groups[1].purpose, MlsGroupPurpose::Conversation);
+
+        drop(connection);
+        fs::remove_dir_all(directory).expect("temporary database files should be removed");
+    }
+
+    #[test]
+    fn call_group_purpose_survives_welcome_and_cannot_change_on_retry() {
+        use openmls::prelude::Ciphersuite;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-call-welcome-purpose-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary database directory should be created");
+        let suite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+        let creator_identity = SigningKey::from_bytes(&[0x61; 32]);
+        let invitee_identity = SigningKey::from_bytes(&[0x62; 32]);
+        let mut creator = open_database(
+            &directory.join("creator.sqlite3"),
+            &[0x63; PROFILE_DB_KEY_LEN],
+        )
+        .expect("creator profile should initialize");
+        let mut invitee = open_database(
+            &directory.join("invitee.sqlite3"),
+            &[0x64; PROFILE_DB_KEY_LEN],
+        )
+        .expect("invitee profile should initialize");
+        let group = create_mls_group_in_with_purpose(
+            &mut creator,
+            suite,
+            &creator_identity,
+            MlsGroupPurpose::Call,
+        )
+        .expect("creator should create a call group");
+        let package = create_mls_key_package_in(&mut invitee, suite, &invitee_identity)
+            .expect("invitee should create a device-bound KeyPackage");
+        let admission = add_mls_group_member_in(
+            &mut creator,
+            &group.group_id,
+            &package.public_bytes,
+            &creator_identity,
+        )
+        .expect("creator should admit the invitee into the call group");
+        assert_eq!(admission.purpose, MlsGroupPurpose::Call);
+        let saved_welcome = list_queued_mls_welcomes_for_peer_in(
+            &creator,
+            &group.group_id,
+            invitee_identity.verifying_key().to_bytes(),
+        )
+        .expect("call Welcome should be queued")
+        .remove(0);
+        assert_eq!(saved_welcome.purpose, MlsGroupPurpose::Call);
+        let event_id = saved_welcome.event_id;
+        let joined = join_mls_group_from_welcome_with_purpose_in(
+            &mut invitee,
+            &saved_welcome.welcome,
+            &saved_welcome.ratchet_tree,
+            &invitee_identity,
+            MlsWelcomeJoinPins {
+                committer_device: Some(creator_identity.verifying_key().to_bytes()),
+                group_id: Some(group.group_id.as_slice().try_into().unwrap()),
+                event_id: Some(event_id),
+                purpose: saved_welcome.purpose,
+            },
+        )
+        .expect("invitee should persist the call group purpose with its Welcome receipt");
+        assert_eq!(joined.purpose, MlsGroupPurpose::Call);
+        let (_, sender_key) = export_call_media_base_key_in(&mut creator, &group.group_id)
+            .expect("creator should export the call media base key");
+        let (_, receiver_key) = export_call_media_base_key_in(&mut invitee, &group.group_id)
+            .expect("invitee should export the same call media base key");
+        assert_eq!(sender_key.as_slice(), receiver_key.as_slice());
+        assert!(
+            join_mls_group_from_welcome_with_purpose_in(
+                &mut invitee,
+                &saved_welcome.welcome,
+                &saved_welcome.ratchet_tree,
+                &invitee_identity,
+                MlsWelcomeJoinPins {
+                    committer_device: Some(creator_identity.verifying_key().to_bytes()),
+                    group_id: Some(group.group_id.as_slice().try_into().unwrap()),
+                    event_id: Some(event_id),
+                    purpose: MlsGroupPurpose::Conversation,
+                },
+            )
+            .is_err()
+        );
+
+        drop(invitee);
+        drop(creator);
         fs::remove_dir_all(directory).expect("temporary database files should be removed");
     }
 
@@ -6986,6 +7294,7 @@ mod tests {
                     .expect("group ID should be 16 bytes"),
                 epoch: 2,
                 quarantined: true,
+                purpose: MlsGroupPurpose::Conversation,
             }]
         );
 
@@ -7780,6 +8089,12 @@ mod tests {
                 ],
             )
             .expect("legacy attachment should be inserted");
+        connection
+            .execute_batch(
+                "ALTER TABLE local_mls_groups DROP COLUMN purpose;
+                 ALTER TABLE local_mls_welcome_receipts DROP COLUMN purpose;",
+            )
+            .expect("test should restore the version 21 MLS schema");
         connection
             .pragma_update(None, "user_version", 21)
             .expect("test should set version 21");

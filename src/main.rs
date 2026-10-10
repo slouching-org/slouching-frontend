@@ -157,7 +157,15 @@ impl Screen {
 }
 
 type PendingPeerKeyPackage = (u64, [u8; 32], Vec<u8>, Vec<u8>);
-type PendingPeerWelcome = (u64, [u8; 32], [u8; 16], Vec<u8>, Vec<u8>, Vec<u8>);
+type PendingPeerWelcome = (
+    u64,
+    [u8; 32],
+    [u8; 16],
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    peer::MlsGroupPurpose,
+);
 
 #[derive(Debug, Clone, Copy)]
 struct PendingMlsAttachmentBlob {
@@ -1897,6 +1905,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                                 welcome.group_id,
                                 welcome.welcome,
                                 welcome.ratchet_tree,
+                                welcome.purpose,
                             ));
                             state.mls_status = "Welcome recebido do committer fixado. Revise o convite e clique em Validar Welcome e entrar para salvar antes do ACK.".into();
                         }
@@ -2475,6 +2484,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                                 event_id,
                                 invitee_device: admission.invited_device,
                                 group_id: admission.group_id.clone(),
+                                purpose: admission.purpose,
                                 welcome: admission.welcome.clone(),
                                 ratchet_tree: admission.ratchet_tree.clone(),
                             };
@@ -2553,6 +2563,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 group_id,
                 expected_welcome,
                 expected_tree,
+                purpose,
             )) = state.mls_pending_peer_welcome.as_ref()
             {
                 if &welcome != expected_welcome
@@ -2575,6 +2586,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                             .as_slice()
                             .try_into()
                             .expect("group ID is 16 bytes"),
+                        *purpose,
                     ),
                     move |result| Message::JoinMlsGroupFromPeer(sequence, result),
                 );
@@ -3163,6 +3175,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                             event_id: stored.event_id,
                             invitee_device: stored.invitee_device,
                             group_id: stored.group_id,
+                            purpose: stored.purpose,
                             welcome: stored.welcome,
                             ratchet_tree: stored.ratchet_tree,
                         };
@@ -4755,6 +4768,7 @@ async fn join_mls_group_from_peer_task(
     event_id: [u8; 16],
     expected_committer_device: [u8; 32],
     expected_group_id: [u8; 16],
+    purpose: peer::MlsGroupPurpose,
 ) -> Result<storage::JoinedMlsGroup, String> {
     tokio::task::spawn_blocking(move || {
         storage::join_mls_group_from_pinned_peer_event(
@@ -4763,6 +4777,7 @@ async fn join_mls_group_from_peer_task(
             &tree,
             expected_committer_device,
             expected_group_id,
+            purpose,
         )
     })
     .await

@@ -804,6 +804,7 @@ fn mls_welcome_for(role: &str, id: u8) -> peer::MlsWelcomeEnvelope {
         event_id,
         invitee_device: SigningKey::from_bytes(&seed).verifying_key().to_bytes(),
         group_id: [0x36; 16].to_vec(),
+        purpose: peer::MlsGroupPurpose::Conversation,
         welcome,
         ratchet_tree,
     }
