@@ -1,6 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use iced::{Element, Task, Theme, task::Handle};
 
+pub mod audio;
 pub mod blob_store;
 pub mod file_transfer;
 pub mod identity;
@@ -280,6 +281,11 @@ struct Slouching {
     mls_sending_key_packages: std::collections::HashSet<u64>,
     mls_sending_welcomes: std::collections::HashMap<u64, [u8; 16]>,
     mls_next_request_id: u64,
+    audio_input_devices: Vec<audio::AudioDevice>,
+    audio_output_devices: Vec<audio::AudioDevice>,
+    audio_input_selected: Option<String>,
+    audio_output_selected: Option<String>,
+    audio_devices_status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -442,6 +448,11 @@ impl Default for Slouching {
             mls_sending_key_packages: std::collections::HashSet::new(),
             mls_sending_welcomes: std::collections::HashMap::new(),
             mls_next_request_id: 1,
+            audio_input_devices: Vec::new(),
+            audio_output_devices: Vec::new(),
+            audio_input_selected: None,
+            audio_output_selected: None,
+            audio_devices_status: "Carregando dispositivos de áudio…".to_owned(),
         }
     }
 }
@@ -457,6 +468,10 @@ enum Message {
     ChooseFamiliar(&'static str),
     ToggleGallery,
     SettingsTab(u8),
+    RefreshAudioDevices,
+    AudioDevicesLoaded(Result<audio::AudioDevices, String>),
+    AudioInputSelected(String),
+    AudioOutputSelected(String),
     ShareTab(u8),
     SelectSource(u8),
     DraftChanged(String),
@@ -800,6 +815,58 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         Message::ChooseFamiliar(value) => state.familiar = value,
         Message::ToggleGallery => state.show_gallery = !state.show_gallery,
         Message::SettingsTab(value) => state.settings_tab = value,
+        Message::RefreshAudioDevices => {
+            state.audio_devices_status = "Atualizando dispositivos…".to_owned();
+            return Task::perform(load_audio_devices_task(), Message::AudioDevicesLoaded);
+        }
+        Message::AudioDevicesLoaded(Ok(devices)) => {
+            state.audio_input_devices = devices.inputs;
+            state.audio_output_devices = devices.outputs;
+            state.audio_input_selected = audio::choose_device_id(
+                state.audio_input_selected.as_deref(),
+                devices.default_input.as_deref(),
+                &state.audio_input_devices,
+            );
+            state.audio_output_selected = audio::choose_device_id(
+                state.audio_output_selected.as_deref(),
+                devices.default_output.as_deref(),
+                &state.audio_output_devices,
+            );
+            state.audio_devices_status = format!(
+                "{} entrada(s) · {} saída(s). Seleções ainda não alimentam chamadas.",
+                state.audio_input_devices.len(),
+                state.audio_output_devices.len()
+            );
+        }
+        Message::AudioDevicesLoaded(Err(error)) => {
+            state.audio_devices_status = format!("Falha ao enumerar áudio: {error}");
+        }
+        Message::AudioInputSelected(name) => {
+            if let Some(device) = state
+                .audio_input_devices
+                .iter()
+                .find(|device| device.id == name)
+            {
+                state.audio_input_selected = Some(name);
+                state.audio_devices_status = format!(
+                    "Microfone selecionado: {} · seleção local ainda não usada em chamadas.",
+                    device.name
+                );
+            }
+        }
+        Message::AudioOutputSelected(name) => {
+            if let Some(device) = state
+                .audio_output_devices
+                .iter()
+                .find(|device| device.id == name)
+            {
+                state.audio_output_selected = Some(name);
+                state.audio_devices_status = format!(
+                    "Saída selecionada: {} · seleção local ainda não usada em chamadas.",
+                    device.name
+                );
+            }
+        }
         Message::ShareTab(value) => {
             state.share_tab = value;
             state.selected_source = 0;
@@ -4021,6 +4088,7 @@ fn boot() -> (Slouching, Task<Message>) {
             ),
             load_mls_groups(),
             Task::perform(load_peer_routes_task(), Message::PeerRoutesLoaded),
+            Task::perform(load_audio_devices_task(), Message::AudioDevicesLoaded),
             transport,
             capture,
         ]),
@@ -4037,6 +4105,12 @@ async fn load_peer_relay_config_task() -> Result<storage::PeerRelayConfig, Strin
     tokio::task::spawn_blocking(storage::load_peer_relay_config)
         .await
         .map_err(|error| format!("local relay-settings load failed: {error}"))?
+}
+
+async fn load_audio_devices_task() -> Result<audio::AudioDevices, String> {
+    tokio::task::spawn_blocking(audio::enumerate_devices)
+        .await
+        .map_err(|error| format!("audio device task failed: {error}"))?
 }
 
 async fn save_peer_relay_config_task(config: storage::PeerRelayConfig) -> Result<(), String> {

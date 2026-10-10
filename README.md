@@ -307,9 +307,12 @@ are not implemented. OpenMLS credentials
 include a versioned binding signed by the durable device key. One-use
 KeyPackages and private MLS state are stored in SQLCipher. The direct-chat
 screen separately pins device public keys. Character scenes and call views
-remain visual previews. No camera, microphone, or screen is captured. **Rede &
-P2P** in Settings retains the Elixir HTTP/WebSocket diagnostics and manual
-refresh. On Linux, this uses Secret Service, so a desktop password vault must
+remain visual previews. **Áudio & vídeo** enumerates real audio inputs and
+outputs, and lets the user choose a device for the current app session. That
+choice is not persisted or used by calls yet; no microphone stream is opened.
+Camera and screen capture are also inactive. **Rede & P2P** in Settings retains
+the Elixir HTTP/WebSocket diagnostics and manual refresh. On Linux, this uses
+Secret Service, so a desktop password vault must
 be installed and available in the user session.
 
 ![Actual refreshed 1280 × 800 native Iced familiar screen from this transport milestone; Secret Service is unavailable in this capture](docs/design/runtime/native-vhs/01-familiar.png)
@@ -327,6 +330,8 @@ be installed and available in the user session.
 ![Actual native Iced MLS screen with an encrypted attachment card and save action; attachment and connected state are capture fixtures](docs/design/runtime/native-vhs/12-mls-attachments.png)
 
 ![Actual native Iced Network and P2P settings with delegated MLS copy consent and helper-listener guidance; Secret Service is unavailable in this capture, so the local policy cannot load](docs/design/runtime/native-vhs/02-settings.png)
+
+![Actual native Iced audio settings enumerating this session's input and output devices; names are machine-specific and the selections do not feed a call yet](docs/design/runtime/native-vhs/13-audio-devices.png)
 
 The Network and P2P settings expose persisted opt-in for delegated encrypted
 MLS copies, with the local quota and expiry policy beside the control. QUIC v8
@@ -365,6 +370,7 @@ SLOUCHING_WINDOW_SIZE=960x640 cargo run -- --capture-dir /tmp/slouching-captures
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 06-chat --capture-peer-addresses
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 11-mls --capture-mls-review
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 11-mls --capture-mls-attachment
+SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 02-settings --settings-tab 1
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-verification
 ```
 
@@ -381,6 +387,9 @@ default is a compact 1100 × 720 window.
 illustrate the review controls; they are fixtures, not live MLS state.
 `--capture-mls-attachment` adds a sample attachment card and connected state;
 they are fixtures, not a transferred file or live peer session.
+The audio-settings capture uses real device enumeration from the current
+session; device names vary by machine, and selected devices are not yet used by
+live calls.
 `--capture-peer-verification` supplies sample local and peer keys for the trust
 screen capture; they are fixtures, not identities from the keyring.
 

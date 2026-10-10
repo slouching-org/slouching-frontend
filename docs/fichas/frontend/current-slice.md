@@ -111,9 +111,12 @@ Service available in the user session. The settings **Rede & P2P** screen
 separately shows local Elixir HTTP/WebSocket diagnostics; it does not carry
 chat traffic.
 
-Character scenes and call views remain visual previews. Camera, microphone,
-screen capture, contact discovery, QR pairing, and guaranteed offline delivery
-are not implemented. The older web UI under
+The audio settings enumerate the host's real input/output devices and let the
+user choose one in the running app. That choice is not persisted or used by a
+call yet; no microphone stream is opened. Character scenes and call views
+remain visual previews. Camera capture, live microphone/audio transport, screen
+capture, contact discovery, QR pairing, and guaranteed offline delivery are
+not implemented. The older web UI under
 `prototypes/web/` is a design benchmark, not the product runtime.
 
 See [direct peer transport v8](../transport/lan-peer-v8.md) for the direct session

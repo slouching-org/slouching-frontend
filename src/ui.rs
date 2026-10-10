@@ -717,19 +717,50 @@ fn settings(state: &Slouching, l: Layout) -> Element<'_, Message> {
     }
     let body: Element<'_, Message> = match state.settings_tab {
         1 => {
+            let mut input_choices = column![].spacing(l.px(4.0));
+            for device in &state.audio_input_devices {
+                let selected = state.audio_input_selected.as_ref() == Some(&device.id);
+                input_choices = input_choices.push(
+                    button(l.label(device.name.clone(), 11.0, PAPER))
+                        .on_press(Message::AudioInputSelected(device.id.clone()))
+                        .padding([l.px(5.0), l.px(8.0)])
+                        .width(Fill)
+                        .style(move |_, status| button_style(status, selected, false)),
+                );
+            }
+            if state.audio_input_devices.is_empty() {
+                input_choices = input_choices.push(l.label("Nenhuma entrada de áudio", 11.0, MUTED));
+            }
+            let mut output_choices = column![].spacing(l.px(4.0));
+            for device in &state.audio_output_devices {
+                let selected = state.audio_output_selected.as_ref() == Some(&device.id);
+                output_choices = output_choices.push(
+                    button(l.label(device.name.clone(), 11.0, PAPER))
+                        .on_press(Message::AudioOutputSelected(device.id.clone()))
+                        .padding([l.px(5.0), l.px(8.0)])
+                        .width(Fill)
+                        .style(move |_, status| button_style(status, selected, false)),
+                );
+            }
+            if state.audio_output_devices.is_empty() {
+                output_choices = output_choices.push(l.label("Nenhuma saída de áudio", 11.0, MUTED));
+            }
             let audio = column![
                 l.label("Á U D I O", 11.0, GOLD),
                 l.label("Microfone", 13.0, PAPER),
-                field(l, "Nenhum dispositivo enumerado"),
-                rule(LINE, l.px(10.0)),
-                l.label("Captura de áudio indisponível", 11.0, MUTED),
+                container(scrollable(input_choices).height(l.px(54.0))).height(l.px(58.0)),
                 l.label("Saída", 13.0, PAPER),
-                field(l, "Nenhuma saída enumerada"),
+                container(scrollable(output_choices).height(l.px(54.0))).height(l.px(58.0)),
+                button(l.label("Atualizar dispositivos", 11.0, PAPER))
+                    .on_press(Message::RefreshAudioDevices)
+                    .padding([l.px(7.0), l.px(10.0)])
+                    .style(|_, status| button_style(status, false, false)),
+                l.label(state.audio_devices_status.clone(), 10.0, MUTED),
                 option(l, "Supressão de ruído (RNNoise)", false),
                 option(l, "Cancelamento de eco", false),
                 option(l, "Push-to-talk", false)
             ]
-            .spacing(l.px(16.0));
+            .spacing(l.px(7.0));
             let video = column![
                 l.label("V Í D E O", 11.0, GOLD),
                 container(tile(l, "reading", "ILUSTRAÇÃO · câmera não aberta")).height(l.px(205.0)),
