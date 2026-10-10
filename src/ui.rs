@@ -1056,11 +1056,17 @@ fn settings(state: &Slouching, l: Layout) -> Element<'_, Message> {
                     l.control("close", "Descartar", Some(Message::DiscardCallHelperConfig), false)
                 ]
                 .spacing(l.px(6.0)),
+                l.control(
+                    "check",
+                    "Testar conexão com o helper",
+                    Some(Message::TestCallHelper),
+                    false
+                ),
                 l.label(state.call_helper_status.clone(), 10.0, MUTED),
                 if let Some(error) = &state.call_helper_config_error {
                     l.label(error.clone(), 10.0, RED)
                 } else {
-                    l.label("Remoto exige WSS. Configure também o IP público e a faixa UDP no servidor; não há fallback TURN.", 10.0, MUTED)
+                    l.label("O teste verifica WSS, identidade e suporte SFU. A mídia ainda exige UDP liberado no servidor e só é confirmada durante a chamada; não há fallback TURN.", 10.0, MUTED)
                 },
                 rule(LINE, l.px(8.0)),
                 l.label("MAILBOX ELIXIR · OPCIONAL", 11.0, GOLD),

@@ -716,6 +716,8 @@ enum Message {
     SaveCallHelperConfig,
     DiscardCallHelperConfig,
     CallHelperConfigSaved(storage::CallHelperConfig, Result<(), String>),
+    TestCallHelper,
+    CallHelperTested(Result<(), String>),
     DelegatedCopyStored(
         u64,
         [u8; 16],
@@ -1143,6 +1145,27 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         }
         Message::CallHelperConfigSaved(_, Err(error)) => {
             state.call_helper_status = "Falha ao salvar a configuração do SFU.".into();
+            state.call_helper_config_error = Some(error);
+        }
+        Message::TestCallHelper => {
+            let url = match sfu_call::normalize_ws_url(&state.call_helper_config.websocket_url) {
+                Ok(url) => url,
+                Err(error) => {
+                    state.call_helper_config_error = Some(error);
+                    return Task::none();
+                }
+            };
+            state.call_helper_config_error = None;
+            state.call_helper_status =
+                "Testando WSS, autenticação do dispositivo e suporte SFU…".into();
+            return Task::perform(test_call_helper_task(url), Message::CallHelperTested);
+        }
+        Message::CallHelperTested(Ok(())) => {
+            state.call_helper_config_error = None;
+            state.call_helper_status = "Sinalização WSS e autenticação SFU disponíveis. A mídia UDP só pode ser confirmada durante uma chamada.".into();
+        }
+        Message::CallHelperTested(Err(error)) => {
+            state.call_helper_status = "Não foi possível validar o helper SFU.".into();
             state.call_helper_config_error = Some(error);
         }
         Message::DelegatedCopyStored(sequence, event_id, result) => match result {
@@ -6712,6 +6735,28 @@ async fn save_call_helper_config_task(config: storage::CallHelperConfig) -> Resu
         .map_err(|error| format!("SFU helper settings save failed: {error}"))?
 }
 
+async fn test_call_helper_task(ws_url: String) -> Result<(), String> {
+    let device_key = tokio::task::spawn_blocking(storage::load_device_peer_secret_key)
+        .await
+        .map_err(|error| format!("could not load device identity: {error}"))?
+        .map_err(|error| format!("could not load device identity: {error}"))?;
+    probe_call_helper(&ws_url, device_key).await
+}
+
+async fn probe_call_helper(ws_url: &str, device_key: iroh::SecretKey) -> Result<(), String> {
+    let (mut socket, hello) = connect_transport_with_key(ws_url, device_key)
+        .await
+        .map_err(|error| format!("SFU helper connection failed: {error:?}"))?;
+    let _ = socket.close(None).await;
+    if !hello.calls_available {
+        return Err(
+            "the helper authenticated this device but does not advertise SFU call support"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 async fn fetch_delivery_mailbox_task(
     helper_url: String,
     recipient_device: [u8; 32],
@@ -9650,6 +9695,9 @@ mod tests {
         let ws_url = std::env::var("SLOUCHING_GATEWAY_WS_URL")
             .expect("smoke script provides the temporary gateway URL");
         let device_key = iroh::SecretKey::from_bytes(&[0x63; 32]);
+        probe_call_helper(&ws_url, device_key.clone())
+            .await
+            .expect("SFU settings probe authenticates and checks advertised support");
         let (mut socket, hello) = connect_transport_with_key(&ws_url, device_key)
             .await
             .expect("Elixir gateway authenticates the Rust device proof");

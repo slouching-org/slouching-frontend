@@ -113,7 +113,9 @@ two-device SFU signaling mode. On both clients, open **Configurações → Rede 
 P2P → Chamadas por SFU**, enter the same helper URL (for example
 `wss://helper.example/ws`), enable it, and save. Load the same two-member call
 MLS group; each participant can then enter from the **Chamada** panel without
-an active direct P2P connection. The helper checks device-signed roster consistency but
+an active direct P2P connection. **Testar conexão com o helper** verifies the
+WSS endpoint, device challenge, and advertised SFU capability; it does not test
+the media UDP route. The helper checks device-signed roster consistency but
 cannot verify MLS membership independently. A smoke test covers two software
 clients and protected audio forwarded by a local helper; physical audio
 devices and different networks have not been tested.
@@ -692,8 +694,8 @@ The SFU entry action was added to the call view, but its screenshot could not
 be captured in this checkout because neither `WAYLAND_DISPLAY` nor `DISPLAY`
 is available; run the `--capture-call-sfu` command above in a graphical
 session to refresh it.
-The **Rede & P2P** settings view now includes the saved SFU URL and opt-in
-controls. Refresh `02-settings.png` with the `--capture-delivery-mailbox`
+The **Rede & P2P** settings view now includes the saved SFU URL, opt-in,
+connectivity test, and status controls. Refresh `02-settings.png` with the `--capture-delivery-mailbox`
 capture command above in a graphical session; this headless checkout cannot
 open an Iced window to save the updated PNG.
 `SLOUCHING_WINDOW_SIZE` only requests an initial size. The normal
