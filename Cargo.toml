@@ -43,6 +43,7 @@ webrtc = { version = "=0.21.0", default-features = false, features = ["crypto-ri
 qrcodegen = "=1.8.0"
 rqrr = "=0.10.1"
 xcap = "=0.9.8"
+nokhwa = { version = "=0.10.11", default-features = false, features = ["decoding", "input-native"] }
 
 [build-dependencies]
 prost-build = "=0.14.4"

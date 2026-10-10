@@ -129,7 +129,8 @@ pub struct CallRtcSession {
     received_screen_frames_tx: mpsc::UnboundedSender<Vec<u8>>,
     screen_video_encoder: AsyncMutex<Option<crate::call_video::CallVideoEncoder>>,
     screen_video_decoder: Arc<AsyncMutex<Option<crate::call_video::CallVideoDecoder>>>,
-    screen_share_active: AtomicBool,
+    screen_share_active: Arc<AtomicBool>,
+    camera_capture_stop: Arc<AtomicBool>,
     screen_share_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     remote_screen_frame: watch::Sender<Option<Arc<crate::call_video::DecodedVideoFrame>>>,
     screen_share_status: watch::Sender<String>,
@@ -192,7 +193,8 @@ impl CallRtcSession {
             received_screen_frames_tx,
             screen_video_encoder: AsyncMutex::new(None),
             screen_video_decoder: Arc::new(AsyncMutex::new(None)),
-            screen_share_active: AtomicBool::new(false),
+            screen_share_active: Arc::new(AtomicBool::new(false)),
+            camera_capture_stop: Arc::new(AtomicBool::new(true)),
             screen_share_task: Mutex::new(None),
             remote_screen_frame,
             screen_share_status,
@@ -548,7 +550,108 @@ impl CallRtcSession {
         Ok(())
     }
 
+    /// Capture a selected camera and send bounded H.264/SFrame frames over the
+    /// same reliable channel used for call video. Camera opening waits for the
+    /// OS permission/device result before this action reports success.
+    pub async fn start_camera_sharing(
+        self: &Arc<Self>,
+        camera_index: nokhwa::utils::CameraIndex,
+    ) -> Result<(), String> {
+        if self.screen_video_encoder.lock().await.is_none() {
+            return Err("esta chamada não tem um codec de vídeo associado ao grupo MLS".to_owned());
+        }
+        let channel = self
+            .screen_data_channel
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| "o canal de vídeo ainda não foi negociado com o peer".to_owned())?;
+        if channel
+            .ready_state()
+            .await
+            .map_err(|error| error.to_string())?
+            != RTCDataChannelState::Open
+        {
+            return Err("aguarde a conexão WebRTC antes de compartilhar a câmera".to_owned());
+        }
+        if self.screen_share_active.swap(true, Ordering::AcqRel) {
+            return Err("já existe um compartilhamento de vídeo nesta chamada".to_owned());
+        }
+        let stop = Arc::clone(&self.camera_capture_stop);
+        stop.store(false, Ordering::Release);
+        let mut frames = match crate::camera_capture::stream(camera_index, Arc::clone(&stop)).await
+        {
+            Ok(frames) => frames,
+            Err(error) => {
+                stop.store(true, Ordering::Release);
+                self.screen_share_active.store(false, Ordering::Release);
+                return Err(error);
+            }
+        };
+        self.screen_share_status.send_replace(
+            "Câmera ativa · captura local e proteção SFrame do grupo da chamada.".to_owned(),
+        );
+        let session = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            let mut frame_id = 0_u32;
+            while let Some(frame) = frames.recv().await {
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        session
+                            .screen_share_status
+                            .send_replace(format!("Captura da câmera falhou: {error}"));
+                        break;
+                    }
+                };
+                let protected = {
+                    let mut encoder = session.screen_video_encoder.lock().await;
+                    let Some(encoder) = encoder.as_mut() else {
+                        break;
+                    };
+                    encoder.encode_and_protect(frame.width, frame.height, frame.rgba)
+                };
+                let protected = match protected {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        session.screen_share_status.send_replace(format!(
+                            "Quadro de câmera H.264/SFrame rejeitado: {error}"
+                        ));
+                        continue;
+                    }
+                };
+                match session
+                    .send_protected_screen_frame(frame_id, &protected)
+                    .await
+                {
+                    Ok(()) => {
+                        session.screen_share_status.send_replace(format!(
+                            "Câmera compartilhada · quadro {frame_id} · H.264/SFrame."
+                        ));
+                        frame_id = frame_id.wrapping_add(1);
+                    }
+                    Err(error) if error.contains("peer is behind") => {
+                        frame_id = frame_id.wrapping_add(1);
+                    }
+                    Err(error) => {
+                        session
+                            .screen_share_status
+                            .send_replace(format!("Compartilhamento interrompido: {error}"));
+                        break;
+                    }
+                }
+            }
+            stop.store(true, Ordering::Release);
+            session.screen_share_active.store(false, Ordering::Release);
+        });
+        if let Ok(mut active_task) = self.screen_share_task.lock() {
+            *active_task = Some(task);
+        }
+        Ok(())
+    }
+
     pub async fn stop_screen_sharing(&self) {
+        self.camera_capture_stop.store(true, Ordering::Release);
         if let Ok(mut task) = self.screen_share_task.lock()
             && let Some(task) = task.take()
         {

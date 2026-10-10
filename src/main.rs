@@ -7,6 +7,7 @@ pub mod call_audio;
 pub mod call_chat;
 pub mod call_rtc;
 pub mod call_video;
+pub mod camera_capture;
 pub mod file_transfer;
 pub mod identity;
 pub mod media;
@@ -243,6 +244,9 @@ struct Slouching {
     share_tab: u8,
     screen_sources: Vec<screen_capture::ScreenSource>,
     selected_source: Option<u32>,
+    camera_sources: Vec<camera_capture::CameraSource>,
+    selected_camera: Option<nokhwa::utils::CameraIndex>,
+    camera_preview: Option<iced::widget::image::Handle>,
     screen_capture_status: String,
     screen_preview: Option<iced::widget::image::Handle>,
     screen_share_status: String,
@@ -436,6 +440,9 @@ impl Default for Slouching {
             share_tab: 0,
             screen_sources: Vec::new(),
             selected_source: None,
+            camera_sources: Vec::new(),
+            selected_camera: None,
+            camera_preview: None,
             screen_capture_status: "As telas só serão acessadas após sua ação.".to_owned(),
             screen_preview: None,
             screen_share_status: "Entre em uma chamada para compartilhar sua tela.".to_owned(),
@@ -560,13 +567,23 @@ enum Message {
     StartAudioMonitor,
     StopAudioMonitor,
     AudioMonitorEvent(AudioMonitorEvent),
+    OpenCameraShare,
+    RefreshCameras,
     ShareTab(u8),
     RefreshScreens,
     ScreenSourcesLoaded(Result<Vec<screen_capture::ScreenSource>, String>),
+    CameraSourcesLoaded(Result<Vec<camera_capture::CameraSource>, String>),
     SelectScreen(u32),
+    SelectCamera(nokhwa::utils::CameraIndex),
     CaptureScreen(u32),
     ScreenCaptured(u32, Result<screen_capture::CapturedScreen, String>),
+    CaptureCamera(nokhwa::utils::CameraIndex),
+    CameraCaptured(
+        nokhwa::utils::CameraIndex,
+        Result<camera_capture::CapturedCameraFrame, String>,
+    ),
     StartScreenShare,
+    StartCameraShare,
     StopScreenShare,
     ScreenShareStarted(Result<(), String>),
     ScreenShareStopped,
@@ -1056,6 +1073,23 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 Message::ScreenShareStarted,
             );
         }
+        Message::StartCameraShare => {
+            let Some(session) = state.call_rtc_session.as_ref().cloned() else {
+                state.screen_share_status =
+                    "Inicie ou aceite uma chamada antes de compartilhar a câmera.".into();
+                return Task::none();
+            };
+            let Some(camera_index) = state.selected_camera.clone() else {
+                state.screen_share_status =
+                    "Selecione uma câmera antes de iniciar o compartilhamento.".into();
+                return Task::none();
+            };
+            state.screen_share_status = "Solicitando acesso à câmera…".into();
+            return Task::perform(
+                async move { session.start_camera_sharing(camera_index).await },
+                Message::ScreenShareStarted,
+            );
+        }
         Message::StopScreenShare => {
             let stop = state.call_rtc_session.as_ref().cloned().map(|session| {
                 Task::perform(async move { session.stop_screen_sharing().await }, |_| {
@@ -1484,16 +1518,35 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             | AudioMonitorEvent::Level(_, _)
             | AudioMonitorEvent::Failed(_, _) => {}
         },
+        Message::OpenCameraShare => {
+            state.screen = Screen::Share;
+            state.share_tab = 2;
+            state.screen_preview = None;
+            state.screen_capture_status = "Buscando câmeras disponíveis…".to_owned();
+            return Task::perform(enumerate_cameras_task(), Message::CameraSourcesLoaded);
+        }
+        Message::RefreshCameras => {
+            state.screen_capture_status = "Buscando câmeras disponíveis…".to_owned();
+            return Task::perform(enumerate_cameras_task(), Message::CameraSourcesLoaded);
+        }
         Message::ShareTab(value) => {
             state.share_tab = value;
             state.screen_preview = None;
             state.screen_capture_status = match value {
                 0 => "Selecione uma tela e capture uma prévia local.".to_owned(),
                 1 => "Captura de janelas ainda não implementada.".to_owned(),
-                _ => "Captura de câmera ainda não implementada.".to_owned(),
+                _ => "Selecione uma câmera para prévia local ou compartilhamento.".to_owned(),
             };
+            if value == 2 {
+                state.screen_capture_status = "Buscando câmeras disponíveis…".to_owned();
+                return Task::perform(enumerate_cameras_task(), Message::CameraSourcesLoaded);
+            }
         }
         Message::RefreshScreens => {
+            if state.share_tab == 2 {
+                state.screen_capture_status = "Buscando câmeras disponíveis…".to_owned();
+                return Task::perform(enumerate_cameras_task(), Message::CameraSourcesLoaded);
+            }
             state.screen_capture_status = "Buscando telas disponíveis…".to_owned();
             return Task::perform(enumerate_screens_task(), Message::ScreenSourcesLoaded);
         }
@@ -1518,9 +1571,38 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 state.screen_capture_status = error;
             }
         },
+        Message::CameraSourcesLoaded(result) => match result {
+            Ok(sources) => {
+                state.selected_camera = state
+                    .selected_camera
+                    .take()
+                    .filter(|selected| sources.iter().any(|source| &source.id == selected))
+                    .or_else(|| sources.first().map(|source| source.id.clone()));
+                state.screen_capture_status = if sources.is_empty() {
+                    "Nenhuma câmera encontrada ou permitida pelo sistema.".to_owned()
+                } else {
+                    format!(
+                        "{} câmera(s) disponível(is). A prévia abre a câmera apenas quando solicitada.",
+                        sources.len()
+                    )
+                };
+                state.camera_sources = sources;
+                state.camera_preview = None;
+            }
+            Err(error) => {
+                state.camera_sources.clear();
+                state.selected_camera = None;
+                state.camera_preview = None;
+                state.screen_capture_status = error;
+            }
+        },
         Message::SelectScreen(id) => {
             state.selected_source = Some(id);
             state.screen_preview = None;
+        }
+        Message::SelectCamera(id) => {
+            state.selected_camera = Some(id);
+            state.camera_preview = None;
         }
         Message::CaptureScreen(id) => {
             state.screen_capture_status = "Capturando prévia local…".to_owned();
@@ -1543,6 +1625,31 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     }
                     Err(error) => {
                         state.screen_preview = None;
+                        state.screen_capture_status = error;
+                    }
+                }
+            }
+        }
+        Message::CaptureCamera(id) => {
+            state.screen_capture_status = "Abrindo a câmera para prévia local…".to_owned();
+            return Task::perform(capture_camera_task(id.clone()), move |result| {
+                Message::CameraCaptured(id, result)
+            });
+        }
+        Message::CameraCaptured(id, result) => {
+            if state.selected_camera.as_ref() == Some(&id) {
+                match result {
+                    Ok(frame) => {
+                        state.camera_preview = Some(iced::widget::image::Handle::from_rgba(
+                            frame.width,
+                            frame.height,
+                            frame.rgba,
+                        ));
+                        state.screen_capture_status =
+                            "Prévia local capturada. Nenhum quadro foi enviado ao peer.".to_owned();
+                    }
+                    Err(error) => {
+                        state.camera_preview = None;
                         state.screen_capture_status = error;
                     }
                 }
@@ -4899,6 +5006,7 @@ fn decode_server_hello(bytes: &[u8]) -> Result<protocol::ServerHello, HandshakeE
 fn boot() -> (Slouching, Task<Message>) {
     let mut state = Slouching::default();
     let args: Vec<String> = std::env::args().collect();
+    let capture_share_camera = args.iter().any(|arg| arg == "--capture-share-camera");
     let capture_peer_verification = args.iter().any(|arg| arg == "--capture-peer-verification");
     if let Some(pos) = args.iter().position(|s| s == "--screen")
         && let Some(name) = args.get(pos + 1)
@@ -4912,6 +5020,9 @@ fn boot() -> (Slouching, Task<Message>) {
     {
         state.screen = screen;
         state.capture_once = true;
+    }
+    if capture_share_camera {
+        state.share_tab = 2;
     }
     if let Some(pos) = args.iter().position(|s| s == "--settings-tab")
         && let Some(value) = args.get(pos + 1).and_then(|value| value.parse::<u8>().ok())
@@ -4993,7 +5104,7 @@ fn boot() -> (Slouching, Task<Message>) {
         state.peer_public_key = hex_encode_key(&[0x22; 32]);
         state.call_group_id = "5f8d4d2a7c314e6a9b0f123456789abc".to_owned();
         state.call_group_status =
-            "Pronto para negociar com o peer MLS fixado · áudio Opus/SFrame; vídeo ainda indisponível."
+            "Pronto para negociar com o peer MLS fixado · áudio Opus/SFrame e vídeo H.264/SFrame."
                 .to_owned();
     }
     if capture_peer_verification {
@@ -5086,6 +5197,11 @@ fn boot() -> (Slouching, Task<Message>) {
             load_mls_groups(),
             Task::perform(load_peer_routes_task(), Message::PeerRoutesLoaded),
             Task::perform(load_audio_devices_task(), Message::AudioDevicesLoaded),
+            if capture_share_camera {
+                Task::perform(enumerate_cameras_task(), Message::CameraSourcesLoaded)
+            } else {
+                Task::none()
+            },
             transport,
             capture,
         ]),
@@ -6993,6 +7109,20 @@ async fn capture_screen_task(id: u32) -> Result<screen_capture::CapturedScreen, 
         .map_err(|error| format!("tarefa de captura de tela falhou: {error}"))?
 }
 
+async fn enumerate_cameras_task() -> Result<Vec<camera_capture::CameraSource>, String> {
+    tokio::task::spawn_blocking(camera_capture::enumerate)
+        .await
+        .map_err(|error| format!("tarefa de enumeração de câmeras falhou: {error}"))?
+}
+
+async fn capture_camera_task(
+    index: nokhwa::utils::CameraIndex,
+) -> Result<camera_capture::CapturedCameraFrame, String> {
+    tokio::task::spawn_blocking(move || camera_capture::capture(index))
+        .await
+        .map_err(|error| format!("tarefa de captura da câmera falhou: {error}"))?
+}
+
 async fn load_peer_secret_key_task() -> Result<iroh::SecretKey, String> {
     tokio::task::spawn_blocking(storage::load_device_peer_secret_key)
         .await
@@ -7038,6 +7168,21 @@ fn capture_after(delay: Duration) -> Task<Message> {
 
 fn main() -> iced::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--list-cameras") {
+        match camera_capture::enumerate() {
+            Ok(cameras) if cameras.is_empty() => println!("Nenhuma câmera disponível."),
+            Ok(cameras) => {
+                for camera in cameras {
+                    println!("{}\t{}", camera.id, camera.name);
+                }
+            }
+            Err(error) => {
+                eprintln!("Falha ao enumerar câmeras: {error}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     if args
         .first()
         .is_some_and(|arg| arg == "--lan-listen" || arg == "--lan-send")

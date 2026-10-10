@@ -74,6 +74,28 @@ not establish a peer session. The UI shows connection and protocol errors
 separately. **Refresh backend** repeats both
 the HTTP diagnostic and WebSocket handshake.
 
+## Camera video in a call
+
+The **Câmera** tab in **Escolher tela** enumerates native camera devices. Use
+**Capturar prévia local** to request access and check one frame without sending
+it. During a connected call, select the camera and choose **Compartilhar câmera
+na chamada**; incoming H.264 frames are authenticated with the call group's
+SFrame key before display. The camera and screen share the same video slot, so
+only one source can be sent at a time. **Parar compartilhamento** closes the
+camera stream. Device and permission errors appear in the picker.
+
+List available cameras without opening a window:
+
+```sh
+cargo run -- --list-cameras
+```
+
+Capture currently targets Linux V4L2, Windows Media Foundation, and macOS
+AVFoundation. Frames are bounded to 1920 × 1080 at capture and scaled for the
+protected call-video limit. Window capture, system-audio capture, noise
+suppression, echo cancellation, push-to-talk, and an SFU remain unimplemented.
+Camera permission and cross-machine video still need runtime validation.
+
 ## Direct peer messages
 
 The **chat** button in the Iced app opens a persistent direct-text screen. This
@@ -150,8 +172,8 @@ rejection, and verifies a pending send is reported as unknown on disconnect.
 
 ## Direct voice call with another device
 
-Voice and screen sharing are ready for the first physical-device trial, but
-have only been verified with two local WebRTC peers so far. Both devices need an active,
+Voice, camera video and screen sharing are ready for the first physical-device
+trial, but have only been verified with two local WebRTC peers so far. Both devices need an active,
 manually pinned direct peer session and membership in the **same dedicated call
 MLS group**.
 
@@ -173,8 +195,9 @@ MLS group**.
 5. To share a monitor during the call, open **Escolher tela**, select a screen,
    and click **Compartilhar tela na chamada**. The remote call stage displays
    authenticated frames after H.264 decoding. Click **Parar compartilhamento**
-   to stop capture and clear the remote image. Window and camera sharing are
-   not implemented.
+   to stop capture and clear the remote image. For camera video, use the
+   **Câmera** tab, choose a device, and click **Compartilhar câmera na chamada**.
+   Only one video source can be active at a time.
 
 Voice uses direct WebRTC host candidates over UDP. The manually selected UDP
 port in **Texto direto** carries QUIC signaling; WebRTC also chooses its own
@@ -397,11 +420,14 @@ enumerates real monitors, captures a still preview on demand, and can share the
 selected monitor during an active call. The capture loop encodes bounded H.264
 frames, protects them with the call-group SFrame key, and sends bounded
 fragments over a WebRTC DataChannel; the receiver authenticates, decodes, and
-renders complete frames. Local tests cover codec replay rejection, bounded
-fragmentation, a protected H.264 frame over loopback, remote decode, and stop
-signaling. Physical-device capture, permissions, and VPN delivery remain
-unverified. Window and camera capture, noise suppression, echo cancellation,
-and push-to-talk remain inactive.
+renders complete frames. The camera tab enumerates native devices, opens the
+selected camera only for a local preview or explicit in-call share, and sends
+H.264/SFrame frames through the same bounded video channel. Screen and camera
+cannot be sent simultaneously yet. Local tests cover codec replay rejection,
+bounded fragmentation, a protected H.264 frame over loopback, remote decode,
+and stop signaling. Physical-device capture, camera permission prompts, and VPN
+delivery remain unverified. Window capture, noise suppression, echo
+cancellation, and push-to-talk remain inactive.
 **Rede & P2P** in Settings retains
 the Elixir HTTP/WebSocket diagnostics and manual refresh. On Linux, this uses
 Secret Service, so a desktop password vault must
@@ -450,10 +476,11 @@ ends quarantined at its accepted epoch without a transient lock failure.
 The eleven design-board views and additional MLS screen are captured in [native-vhs](docs/design/runtime/native-vhs/).
 These are a first implementation of the visual direction, with comparison
 at 1280 × 800 and a compact 960 × 640 window. Exact visual parity and
-accessibility remain to be completed; the local Opus/SFrame RTP media path is
-implemented, while physical-device calls and screen sharing still need
-validation. The latest `05-share` and `10-call` screenshots could not be
-captured in this environment because no Wayland or X11 display is available.
+accessibility remain to be completed; local Opus/SFrame voice, camera video,
+screen sharing, and call chat are implemented, while physical-device media
+still needs validation. The updated `05-share` camera-tab screenshot could not
+be captured here: the environment has no Wayland or X11 display. Reproduce it
+with the camera capture command below in a graphical session.
 The current direct transport, delegated-copy frames, call-group Welcome purpose,
 and bounded call-signaling frames are specified in the [v10 peer protocol](docs/fichas/transport/lan-peer-v10.md). Version 9 remains as the prior compatibility contract.
 
@@ -471,6 +498,7 @@ SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-capture
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-invite
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-invite-imported
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 10-call --capture-call-negotiation
+SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 05-share --capture-share-camera
 ```
 
 The capture command renders all twelve screens, saves screenshots through
@@ -497,6 +525,8 @@ in the identity screen; its keys and address are fixtures.
 after QR import; all values are fixtures.
 `--capture-call-negotiation` shows call controls with sample identity, peer, and
 group values; they do not represent a live MLS group or WebRTC session.
+`--capture-share-camera` shows the camera tab with real enumerated device names;
+it does not open a camera or display a live image.
 The protected-audio update could not refresh `10-call.png` in this headless
 environment: Iced/winit requires `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, or
 `DISPLAY`. Run the capture command in a graphical session to render the current

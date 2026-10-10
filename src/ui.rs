@@ -842,14 +842,56 @@ fn settings(state: &Slouching, l: Layout) -> Element<'_, Message> {
                     true,
                 ));
             }
+            let mut camera_choices = column![].spacing(l.px(4.0));
+            for device in &state.camera_sources {
+                let id = device.id.clone();
+                let selected = state.selected_camera.as_ref() == Some(&id);
+                camera_choices = camera_choices.push(
+                    button(l.label(format!("{} · {}", device.name, id), 11.0, PAPER))
+                        .on_press(Message::SelectCamera(id))
+                        .padding([l.px(5.0), l.px(8.0)])
+                        .width(Fill)
+                        .style(move |_, status| button_style(status, selected, false)),
+                );
+            }
+            if state.camera_sources.is_empty() {
+                camera_choices = camera_choices.push(l.label(
+                    "Nenhuma câmera enumerada. Atualize a lista.",
+                    11.0,
+                    MUTED,
+                ));
+            }
+            let camera_preview: Element<'_, Message> = if let Some(handle) = state.camera_preview.clone() {
+                image(handle)
+                    .content_fit(ContentFit::Contain)
+                    .width(Fill)
+                    .height(l.px(150.0))
+                    .into()
+            } else {
+                container(tile(l, "reading", "PRÉVIA LOCAL · câmera fechada"))
+                    .height(l.px(150.0))
+                    .into()
+            };
             let video = column![
                 l.label("V Í D E O", 11.0, GOLD),
-                container(tile(l, "reading", "ILUSTRAÇÃO · câmera não aberta")).height(l.px(205.0)),
-                l.label("Câmera", 13.0, PAPER),
-                field(l, "Nenhuma câmera enumerada"),
+                camera_preview,
+                l.label("Câmera · prévia local não é enviada", 12.0, PAPER),
+                container(scrollable(camera_choices).height(l.px(70.0))).height(l.px(74.0)),
+                row![
+                    button(l.label("Atualizar câmeras", 11.0, PAPER))
+                        .on_press(Message::RefreshCameras)
+                        .padding([l.px(7.0), l.px(10.0)])
+                        .style(|_, status| button_style(status, false, false)),
+                    button(l.label("Prévia local", 11.0, PAPER))
+                        .on_press_maybe(state.selected_camera.clone().map(Message::CaptureCamera))
+                        .padding([l.px(7.0), l.px(10.0)])
+                        .style(|_, status| button_style(status, false, false)),
+                ]
+                .spacing(l.px(8.0)),
+                l.label(state.screen_capture_status.clone(), 10.0, MUTED),
                 option(l, "Filtro VHS na câmera", false)
             ]
-            .spacing(l.px(16.0));
+            .spacing(l.px(8.0));
             let topology = row![
                 column![l.label("T O P O L O G I A", 11.0, GOLD),
                     l.label("Rotas diretas quando possíveis; relay ou SFU opcional operado por um membro.", 12.0, PAPER),
@@ -1124,6 +1166,16 @@ fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
         boxed(tile(l, "hat", "Você · câmera indisponível"))
     ]
     .spacing(l.px(12.0));
+    let video_control: Element<'_, Message> = if state.screen_sharing_active {
+        l.control(
+            "close",
+            "Parar compartilhamento",
+            Some(Message::StopScreenShare),
+            false,
+        )
+    } else {
+        l.icon_button("camera", Message::OpenCameraShare)
+    };
     let controls = row![
         l.control(
             if state.call_mic_muted {
@@ -1142,10 +1194,7 @@ fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 .then_some(Message::ToggleCallMic),
             state.call_rtc_session.is_some()
         ),
-        l.icon_button(
-            "camera-off",
-            Message::PreviewAction("Captura de câmera ainda não implementada.")
-        ),
+        video_control,
         l.icon_button("screen", Message::Navigate(Screen::Share)),
         button(l.label("Leave", 14.0, PAPER))
             .on_press(if state.call_rtc_session.is_some() {
@@ -1271,19 +1320,26 @@ fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
         .spacing(l.px(5.0))
         .into()
     };
+    let share_status: Element<'_, Message> = if state.screen_sharing_active {
+        l.label(state.screen_share_status.clone(), 9.0, GREEN)
+            .into()
+    } else {
+        space().height(l.px(0.0)).into()
+    };
     let camp = column![
         l.label("GRUPO MLS DA CHAMADA", 11.0, GOLD),
         call_group_controls,
         l.label(&state.call_group_status, 10.0, MUTED),
         l.label(
             if state.call_rtc_session.is_some() {
-                "WEBRTC · voz, chat temporário e tela protegida"
+                "WEBRTC · voz, chat temporário e vídeo protegido"
             } else {
                 "ÁUDIO · Opus/SFrame · grupo MLS dedicado"
             },
             9.0,
             VIOLET
         ),
+        share_status,
         rule(LINE, 1.0),
         l.label("CHAT TEMPORÁRIO · SÓ ESTA CHAMADA", 10.0, MUTED),
         scrollable(room_messages).height(l.px(155.0)),
@@ -1409,11 +1465,7 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
             Message::ShareTab(1),
             state.share_tab == 1
         ),
-        l.nav(
-            "Câmera · em breve",
-            Message::ShareTab(2),
-            state.share_tab == 2
-        )
+        l.nav("Câmera", Message::ShareTab(2), state.share_tab == 2)
     ]
     .spacing(l.px(8.0));
     let mut sources = column![].spacing(l.px(8.0));
@@ -1448,7 +1500,40 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
             .style(move |_, s| button_style(s, false, selected)),
         );
     }
-    let preview: Element<'_, Message> = if let Some(handle) = state.screen_preview.clone() {
+    let mut cameras = column![].spacing(l.px(8.0));
+    for source in &state.camera_sources {
+        let id = source.id.clone();
+        let selected = state.selected_camera.as_ref() == Some(&id);
+        cameras = cameras.push(
+            button(
+                row![
+                    l.label(format!("{} · {}", source.name, id), 13.0, PAPER),
+                    space().width(Fill),
+                    l.label(
+                        if selected {
+                            "SELECIONADA"
+                        } else {
+                            "Selecionar"
+                        },
+                        10.0,
+                        if selected { GOLD } else { MUTED }
+                    )
+                ]
+                .align_y(iced::Alignment::Center)
+                .spacing(l.px(10.0)),
+            )
+            .width(Fill)
+            .padding(l.px(12.0))
+            .on_press(Message::SelectCamera(id))
+            .style(move |_, s| button_style(s, false, selected)),
+        );
+    }
+    let preview_handle = if state.share_tab == 2 {
+        state.camera_preview.clone()
+    } else {
+        state.screen_preview.clone()
+    };
+    let preview: Element<'_, Message> = if let Some(handle) = preview_handle {
         image(handle)
             .content_fit(ContentFit::Contain)
             .width(Fill)
@@ -1473,13 +1558,20 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
         } else {
             sources.into()
         }
+    } else if state.share_tab == 2 {
+        if state.camera_sources.is_empty() {
+            l.label(
+                "Nenhuma câmera enumerada. Confira a conexão e a permissão de câmera do sistema.",
+                12.0,
+                MUTED,
+            )
+            .into()
+        } else {
+            cameras.into()
+        }
     } else {
         l.label(
-            if state.share_tab == 1 {
-                "Seleção e captura de janelas ainda não estão implementadas."
-            } else {
-                "Seleção e captura de câmera ainda não estão implementadas."
-            },
+            "Seleção e captura de janelas ainda não estão implementadas.",
             12.0,
             MUTED,
         )
@@ -1487,14 +1579,24 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
     };
     let share_action = if state.screen_sharing_active {
         Some(Message::StopScreenShare)
-    } else if state.call_rtc_session.is_some() && state.selected_source.is_some() {
+    } else if state.call_rtc_session.is_some()
+        && state.share_tab == 0
+        && state.selected_source.is_some()
+    {
         Some(Message::StartScreenShare)
+    } else if state.call_rtc_session.is_some()
+        && state.share_tab == 2
+        && state.selected_camera.is_some()
+    {
+        Some(Message::StartCameraShare)
     } else {
         None
     };
     let share_disabled = share_action.is_none();
     let share_label = if state.screen_sharing_active {
         "Parar compartilhamento"
+    } else if state.share_tab == 2 {
+        "Compartilhar câmera na chamada"
     } else {
         "Compartilhar tela na chamada"
     };
@@ -1523,24 +1625,55 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 row![
                     l.control(
                         "refresh",
-                        "Atualizar telas",
+                        if state.share_tab == 2 {
+                            "Atualizar câmeras"
+                        } else {
+                            "Atualizar telas"
+                        },
                         Some(Message::RefreshScreens),
                         false
                     ),
                     l.control(
-                        "screen",
-                        "Capturar prévia",
-                        state.selected_source.map(Message::CaptureScreen),
-                        state.selected_source.is_none() || state.share_tab != 0
+                        if state.share_tab == 2 {
+                            "camera"
+                        } else {
+                            "screen"
+                        },
+                        if state.share_tab == 2 {
+                            "Capturar prévia local"
+                        } else {
+                            "Capturar prévia"
+                        },
+                        if state.share_tab == 2 {
+                            state.selected_camera.clone().map(Message::CaptureCamera)
+                        } else {
+                            state.selected_source.map(Message::CaptureScreen)
+                        },
+                        if state.share_tab == 2 {
+                            state.selected_camera.is_none()
+                        } else {
+                            state.selected_source.is_none() || state.share_tab != 0
+                        }
                     )
                 ]
                 .spacing(l.px(10.0))
             ]
             .spacing(l.px(12.0))
             .width(Fill),
-            column![l.label("PRÉVIA DA TELA", 11.0, GOLD), preview]
-                .spacing(l.px(10.0))
-                .width(Fill)
+            column![
+                l.label(
+                    if state.share_tab == 2 {
+                        "PRÉVIA DA CÂMERA"
+                    } else {
+                        "PRÉVIA DA TELA"
+                    },
+                    11.0,
+                    GOLD
+                ),
+                preview
+            ]
+            .spacing(l.px(10.0))
+            .width(Fill)
         ]
         .spacing(l.px(20.0)),
         row![

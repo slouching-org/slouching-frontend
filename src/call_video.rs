@@ -39,7 +39,7 @@ impl CallVideoEncoder {
             EncoderConfig::new()
                 .usage_type(UsageType::ScreenContentRealTime)
                 .bitrate(BitRate::from_bps(300_000))
-                .max_frame_rate(FrameRate::from_hz(5.0))
+                .max_frame_rate(FrameRate::from_hz(15.0))
                 .skip_frames(true),
         )
         .map_err(|error| format!("could not create H.264 screen encoder: {error}"))?;
