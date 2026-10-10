@@ -363,21 +363,26 @@ fn save_file_attachment_in(
     offer: &FileOffer,
 ) -> Result<(), String> {
     let encoded_offer = offer.encode()?;
+    let (member_devices, group_epoch) = load_mls_group_member_devices_in(connection, &group_id)?;
+    if !member_devices.contains(&author_device) {
+        return Err("file attachment author is not a member of this MLS group".to_owned());
+    }
     let transaction = connection
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| format!("could not begin file attachment save: {error}"))?;
-    let group_state: Option<i64> = transaction
+    let indexed_group: Option<(i64, i64)> = transaction
         .query_row(
-            "SELECT quarantined FROM local_mls_groups WHERE group_id = ?1",
+            "SELECT epoch, quarantined FROM local_mls_groups WHERE group_id = ?1",
             params![group_id.as_slice()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
-        .map_err(|error| format!("could not validate attachment group: {error}"))?;
-    match group_state {
-        Some(0) => {}
-        Some(_) => return Err("cannot attach a file to a quarantined group".to_owned()),
-        None => return Err("cannot attach a file to an unknown local group".to_owned()),
+        .map_err(|error| format!("could not recheck attachment group state: {error}"))?;
+    match indexed_group {
+        Some((epoch, 0)) if u64::try_from(epoch).ok() == Some(group_epoch) => {}
+        Some((_, 0)) => return Err("MLS group changed while validating the attachment".to_owned()),
+        Some(_) => return Err("MLS group is quarantined".to_owned()),
+        None => return Err("MLS group is not present on this device".to_owned()),
     }
     let prior: Option<StoredPriorFileAttachment> = transaction
         .query_row(
@@ -610,6 +615,67 @@ pub fn list_mls_messages(group_id: &[u8], limit: usize) -> Result<Vec<StoredMlsM
 pub fn list_mls_groups() -> Result<Vec<StoredMlsGroup>, String> {
     let connection = open_local_database()?;
     list_mls_groups_in(&connection)
+}
+
+/// Loads device keys from the active, non-quarantined MLS group after verifying
+/// every member's device-bound credential.
+pub fn list_mls_group_member_devices(group_id: [u8; 16]) -> Result<Vec<[u8; 32]>, String> {
+    let mut connection = open_local_database()?;
+    list_mls_group_member_devices_in(&mut connection, &group_id)
+}
+
+fn list_mls_group_member_devices_in(
+    connection: &mut Connection,
+    group_id: &[u8],
+) -> Result<Vec<[u8; 32]>, String> {
+    Ok(load_mls_group_member_devices_in(connection, group_id)?.0)
+}
+
+fn load_mls_group_member_devices_in(
+    connection: &mut Connection,
+    group_id: &[u8],
+) -> Result<(Vec<[u8; 32]>, u64), String> {
+    if group_id.len() != 16 {
+        return Err("MLS group ID must contain 16 bytes".to_owned());
+    }
+    ensure_mls_group_not_quarantined(connection, group_id)?;
+    let indexed_group: (i64, i64) = connection
+        .query_row(
+            "SELECT epoch, ciphersuite FROM local_mls_groups WHERE group_id = ?1",
+            [group_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| format!("could not verify the MLS group index: {error}"))?;
+    let group_id = GroupId::from_slice(group_id);
+    let provider = LocalOpenMlsProvider::new(connection);
+    let group = MlsGroup::load(provider.storage(), &group_id)
+        .map_err(|error| format!("could not load MLS membership state: {error}"))?
+        .ok_or_else(|| "MLS membership state is missing".to_owned())?;
+    if !group.is_active() {
+        return Err("MLS group is inactive on this device".to_owned());
+    }
+    if u64::try_from(indexed_group.0).ok() != Some(group.epoch().as_u64())
+        || u16::try_from(indexed_group.1).ok() != Some(group.ciphersuite() as u16)
+    {
+        return Err("MLS group index does not match its authenticated state".to_owned());
+    }
+    let ciphersuite = group.ciphersuite();
+    let mut devices = Vec::new();
+    for member in group.members() {
+        let binding = MlsSigningKeyBinding::from_bytes(member.credential.serialized_content())
+            .ok_or_else(|| "MLS member has no device identity binding".to_owned())?;
+        if !binding.verifies_mls_credential(
+            &binding.device_public_key,
+            ciphersuite.signature_algorithm() as u16,
+            member.signature_key.as_slice(),
+        ) {
+            return Err("MLS member has an invalid device binding".to_owned());
+        }
+        if !devices.contains(&binding.device_public_key) {
+            devices.push(binding.device_public_key);
+        }
+    }
+    Ok((devices, group.epoch().as_u64()))
 }
 
 /// Lists authenticated proposals awaiting a Commit for the selected group epoch.
@@ -7448,8 +7514,8 @@ mod tests {
         fs::create_dir_all(&directory).expect("temporary attachment directory should exist");
         let path = directory.join("profile.sqlite3");
         let key = [0x6b; PROFILE_DB_KEY_LEN];
-        let group_id = [0x21; 16];
-        let author = [0x42; 32];
+        let device_identity = SigningKey::from_bytes(&[0x42; 32]);
+        let author = device_identity.verifying_key().to_bytes();
         let digest = [0x63; 32];
         let secrets = FileTransferSecrets::from_parts([0x84; 16], [0x95; 32]);
         let offer = FileOffer::from_secrets(
@@ -7460,14 +7526,22 @@ mod tests {
         .expect("file offer should validate");
 
         let mut connection = open_database(&path, &key).expect("encrypted profile should migrate");
-        connection
-            .execute(
-                "INSERT INTO local_mls_groups
-                     (group_id, ciphersuite, designated_committer_device, epoch)
-                 VALUES (?1, 1, ?2, 0)",
-                params![group_id.as_slice(), author.as_slice()],
-            )
-            .expect("test group should be indexed");
+        let created = create_mls_group_in(
+            &mut connection,
+            Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519,
+            &device_identity,
+        )
+        .expect("test MLS group should be created");
+        let group_id: [u8; 16] = created
+            .group_id
+            .as_slice()
+            .try_into()
+            .expect("MLS group ID should contain 16 bytes");
+        assert_eq!(
+            list_mls_group_member_devices_in(&mut connection, &group_id)
+                .expect("bound member keys should be derived from MLS state"),
+            vec![author]
+        );
         save_file_attachment_in(&mut connection, group_id, author, digest, &offer)
             .expect("attachment manifest should save");
         save_file_attachment_in(&mut connection, group_id, author, digest, &offer)
@@ -7476,6 +7550,21 @@ mod tests {
             save_file_attachment_in(&mut connection, group_id, author, [0x64; 32], &offer)
                 .expect_err("a transfer ID cannot be rebound to a different digest")
                 .contains("already bound")
+        );
+        let nonmember_secrets = FileTransferSecrets::from_parts([0x89; 16], [0x9a; 32]);
+        let nonmember_offer =
+            FileOffer::from_secrets(&nonmember_secrets, 1, "forged.bin".to_owned())
+                .expect("test offer should validate");
+        assert!(
+            save_file_attachment_in(
+                &mut connection,
+                group_id,
+                [0xde; 32],
+                [0x65; 32],
+                &nonmember_offer
+            )
+            .expect_err("nonmembers cannot author group attachments")
+            .contains("not a member")
         );
         let listed = list_file_attachments_in(&connection, group_id)
             .expect("attachment should be listed from the encrypted profile");
@@ -7520,6 +7609,17 @@ mod tests {
             save_file_attachment_in(&mut reopened, group_id, author, [0x67; 32], &excess_offer)
                 .expect_err("the 200 MiB local quota should prevent unbounded storage")
                 .contains("200 MiB")
+        );
+        reopened
+            .execute(
+                "UPDATE local_mls_groups SET quarantined = 1 WHERE group_id = ?1",
+                params![group_id.as_slice()],
+            )
+            .expect("test should quarantine the group");
+        assert!(
+            list_mls_group_member_devices_in(&mut reopened, &group_id)
+                .expect_err("quarantined MLS state cannot authorize peer blob access")
+                .contains("quarantined")
         );
         drop(persisted);
         drop(reopened);
