@@ -1406,10 +1406,29 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             Some(Message::DistributeMlsCommitsToAll),
             state.mls_quarantine_reason.is_none()
                 && !state.mls_fanout_running
+                && !state.mls_event_fanout_running
                 && state.peer_listener_handle.is_none()
         ),
         l.label(
             "Usa rotas pinadas salvas; encerre o listener/sessão atual. Cada próximo Commit aguarda o ACK durável do anterior.",
+            10.0,
+            MUTED
+        ),
+        l.control(
+            "chat",
+            if state.mls_event_fanout_running {
+                "Distribuindo mensagens…"
+            } else {
+                "Distribuir mensagens MLS aos peers salvos"
+            },
+            Some(Message::DistributeMlsEventsToAll),
+            state.mls_quarantine_reason.is_none()
+                && !state.mls_fanout_running
+                && !state.mls_event_fanout_running
+                && state.peer_listener_handle.is_none()
+        ),
+        l.label(
+            "Envia mensagens pendentes pela rota de cada membro e espera o ACK. Entregue antes os Commits pendentes de cada peer.",
             10.0,
             MUTED
         ),

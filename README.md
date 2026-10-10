@@ -104,8 +104,14 @@ pinned-key and LAN-address flow. In **Grupo MLS**, select the same group ID on
 both devices; MLS messages are encrypted and sent over that active direct
 Iroh/QUIC session. The receiver validates the MLS event and stores its
 ciphertext, ratchet update, and plaintext transcript in SQLCipher before
-sending the transport ACK. The sender marks the outbox event held by the peer
-only after that ACK. Membership Commits are also saved atomically with the
+sending the transport ACK. Each message atomically snapshots this epoch's peer
+devices with the ciphertext and ratchet update. The sender records ACKs per
+device and leaves other recipients queued; the outbox event closes only after
+all snapshot members confirm. Direct send checks that the pinned peer belongs
+to the snapshot. The MLS screen can retry messages for the connected peer or
+distribute them to all peers with saved routes. A peer with pending Commits is
+skipped until its group epoch is current; unavailable peers remain queued.
+Membership Commits are also saved atomically with the
 group epoch in a separate local outbox; the latest pending Commit is restored
 from SQLCipher and can be sent from the MLS screen over an active direct
 session. The sender matches the pinned peer key to the device snapshot taken
@@ -239,7 +245,8 @@ Assets and font license/provenance notes are in [assets/README.md](assets/README
   are implemented. A pinned-device Iroh/QUIC LAN text exchange is available
   from the Iced UI with a persistent bidirectional session and per-peer history
   in SQLCipher. MLS application messages use the direct pinned Iroh/QUIC session with a
-  local SQLCipher transcript and retryable outbox. Membership Commit bytes are
+  local SQLCipher transcript, predecessor-epoch recipient snapshot, per-device
+  ACK ledger, and retryable outbox. Membership Commit bytes are
   atomically journaled with group state; ordered direct delivery, per-device
   ACKs, predecessor recovery, and sequential multi-member fan-out over saved
   pinned routes are available. Helper delivery, offline delivery, and media

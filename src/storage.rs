@@ -25,7 +25,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 14;
+const PROFILE_SCHEMA_VERSION: u32 = 15;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 type StoredEventEnvelope = (
@@ -728,6 +728,13 @@ pub fn list_queued_mls_commit_recipients(group_id: &[u8]) -> Result<Vec<[u8; 32]
         return Err("MLS group ID must be 16 bytes".to_owned());
     }
     let connection = open_local_database()?;
+    list_queued_mls_commit_recipients_in(&connection, group_id)
+}
+
+fn list_queued_mls_commit_recipients_in(
+    connection: &Connection,
+    group_id: &[u8],
+) -> Result<Vec<[u8; 32]>, String> {
     let mut statement = connection
         .prepare(
             "SELECT DISTINCT r.device_public_key
@@ -1271,7 +1278,7 @@ fn create_mls_application_event_in(
         .map_err(|error| format!("could not begin MLS outbox transaction: {error}"))?;
     let result = (|| {
         ensure_mls_group_not_quarantined(connection, group_id.as_slice())?;
-        let (event, wire_message) = {
+        let (event, wire_message, recipients) = {
             let provider = LocalOpenMlsProvider::new(connection);
             let mut group = MlsGroup::load(provider.storage(), &group_id)
                 .map_err(|error| format!("could not load MLS group: {error}"))?
@@ -1296,6 +1303,26 @@ fn create_mls_application_event_in(
                 )
             {
                 return Err("MLS group is not bound to this device identity".to_owned());
+            }
+            let mut recipients = Vec::new();
+            for member in group.members() {
+                let member_binding =
+                    MlsSigningKeyBinding::from_bytes(member.credential.serialized_content())
+                        .ok_or_else(|| "MLS member has no device identity binding".to_owned())?;
+                if !member_binding.verifies_mls_credential(
+                    &member_binding.device_public_key,
+                    ciphersuite.signature_algorithm() as u16,
+                    member.signature_key.as_slice(),
+                ) {
+                    return Err("MLS member has an invalid device binding".to_owned());
+                }
+                let peer = member_binding.device_public_key;
+                if peer != author_device && !recipients.contains(&peer) {
+                    recipients.push(peer);
+                }
+            }
+            if recipients.is_empty() {
+                return Err("MLS group has no other device to receive this message".to_owned());
             }
             let signer = SignatureKeyPair::read(
                 provider.storage(),
@@ -1327,7 +1354,7 @@ fn create_mls_application_event_in(
                 ciphertext: wire_message.clone(),
                 ..event
             };
-            (event, wire_message)
+            (event, wire_message, recipients)
         };
         let digest = blake3::hash(&event.ciphertext);
         connection
@@ -1349,6 +1376,16 @@ fn create_mls_application_event_in(
             .map_err(|error| {
                 format!("could not persist MLS ciphertext in local outbox: {error}")
             })?;
+        for recipient in recipients {
+            connection
+                .execute(
+                    "INSERT INTO local_mls_event_recipients
+                        (event_id, device_public_key, delivery_state)
+                     VALUES (?1, ?2, 'queued')",
+                    params![event.event_id.as_slice(), recipient.as_slice()],
+                )
+                .map_err(|error| format!("could not persist MLS event recipient: {error}"))?;
+        }
         insert_mls_history_in(
             connection,
             &event.group_id,
@@ -2227,6 +2264,173 @@ pub fn list_outbound_events(
         });
     }
     Ok(events)
+}
+
+pub fn list_queued_mls_event_recipients(group_id: &[u8]) -> Result<Vec<[u8; 32]>, String> {
+    if group_id.len() != 16 {
+        return Err("MLS group ID must be 16 bytes".to_owned());
+    }
+    let connection = open_local_database()?;
+    list_queued_mls_event_recipients_in(&connection, group_id)
+}
+
+fn list_queued_mls_event_recipients_in(
+    connection: &Connection,
+    group_id: &[u8],
+) -> Result<Vec<[u8; 32]>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT r.device_public_key
+             FROM local_mls_event_recipients r
+             JOIN local_events e ON e.event_id = r.event_id
+             WHERE e.group_id = ?1 AND r.delivery_state = 'queued'
+               AND e.delivery_state = 'queued'
+             ORDER BY r.device_public_key",
+        )
+        .map_err(|error| format!("could not prepare MLS event recipients: {error}"))?;
+    let rows = statement
+        .query_map(params![group_id], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(|error| format!("could not query MLS event recipients: {error}"))?;
+    rows.map(|row| {
+        fixed_bytes(
+            row.map_err(|error| format!("could not read MLS event recipient: {error}"))?,
+            "MLS event recipient device key",
+        )
+    })
+    .collect()
+}
+
+pub fn list_queued_mls_events_for_peer(
+    group_id: &[u8],
+    peer_device: [u8; 32],
+    limit: usize,
+) -> Result<Vec<StoredOutboundEvent>, String> {
+    if group_id.len() != 16 || !(1..=500).contains(&limit) {
+        return Err("MLS event query requires a 16-byte group ID and limit 1..500".to_owned());
+    }
+    let connection = open_local_database()?;
+    list_queued_mls_events_for_peer_in(&connection, group_id, peer_device, limit)
+}
+
+fn list_queued_mls_events_for_peer_in(
+    connection: &Connection,
+    group_id: &[u8],
+    peer_device: [u8; 32],
+    limit: usize,
+) -> Result<Vec<StoredOutboundEvent>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT e.rowid, e.event_id, e.author_device, e.group_id, e.epoch,
+                    e.checkpoint, e.expires_at_unix, e.ciphertext, e.delivery_state
+             FROM local_events e
+             JOIN local_mls_event_recipients r ON r.event_id = e.event_id
+             JOIN local_mls_groups g ON g.group_id = e.group_id
+             WHERE e.group_id = ?1 AND e.direction = 'outbound'
+               AND r.device_public_key = ?2 AND r.delivery_state = 'queued'
+               AND e.delivery_state = 'queued' AND g.quarantined = 0
+             ORDER BY e.rowid LIMIT ?3",
+        )
+        .map_err(|error| format!("could not prepare peer MLS event query: {error}"))?;
+    let rows = statement
+        .query_map(
+            params![group_id, peer_device.as_slice(), limit as i64],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
+        )
+        .map_err(|error| format!("could not query peer MLS events: {error}"))?;
+    rows.map(|row| {
+        let (sequence, event_id, author, group, epoch, checkpoint, expires, ciphertext, state) =
+            row.map_err(|error| format!("could not read peer MLS event: {error}"))?;
+        Ok(StoredOutboundEvent {
+            sequence,
+            event: EncryptedEvent {
+                event_id: fixed_bytes(event_id, "MLS application event ID")?,
+                author_device: fixed_bytes(author, "MLS application author")?,
+                group_id: fixed_bytes::<16>(group, "MLS application group ID")?.to_vec(),
+                epoch: u64::try_from(epoch)
+                    .map_err(|_| "saved MLS event has an invalid epoch".to_owned())?,
+                checkpoint,
+                expires_at_unix: expires,
+                ciphertext,
+            },
+            state: OutboundDeliveryState::try_from(state.as_str())?,
+        })
+    })
+    .collect()
+}
+
+pub fn mark_mls_event_delivered_to_peer(
+    event_id: [u8; 16],
+    peer_device: [u8; 32],
+) -> Result<(), String> {
+    let mut connection = open_local_database()?;
+    mark_mls_event_delivered_to_peer_in(&mut connection, event_id, peer_device)
+}
+
+fn mark_mls_event_delivered_to_peer_in(
+    connection: &mut Connection,
+    event_id: [u8; 16],
+    peer_device: [u8; 32],
+) -> Result<(), String> {
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("could not begin MLS event delivery transaction: {error}"))?;
+    let delivered_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock is invalid: {error}"))?
+        .as_secs() as i64;
+    let changed = transaction
+        .execute(
+            "UPDATE local_mls_event_recipients SET delivery_state = 'delivered', delivered_at = ?1
+             WHERE event_id = ?2 AND device_public_key = ?3 AND delivery_state = 'queued'",
+            params![delivered_at, event_id.as_slice(), peer_device.as_slice()],
+        )
+        .map_err(|error| format!("could not save MLS event peer ACK: {error}"))?;
+    if changed == 0 {
+        let already_delivered: Option<String> = transaction
+            .query_row(
+                "SELECT delivery_state FROM local_mls_event_recipients
+                 WHERE event_id = ?1 AND device_public_key = ?2",
+                params![event_id.as_slice(), peer_device.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("could not verify MLS event peer ACK: {error}"))?;
+        if already_delivered.as_deref() != Some("delivered") {
+            return Err("ACK does not match a queued MLS event recipient".to_owned());
+        }
+    }
+    let queued: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM local_mls_event_recipients
+             WHERE event_id = ?1 AND delivery_state = 'queued'",
+            [event_id.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("could not check MLS event recipients: {error}"))?;
+    if queued == 0 {
+        transaction
+            .execute(
+                "UPDATE local_events SET delivery_state = 'held_by_peer'
+                 WHERE event_id = ?1 AND direction = 'outbound' AND delivery_state = 'queued'",
+                [event_id.as_slice()],
+            )
+            .map_err(|error| format!("could not finish MLS event outbox state: {error}"))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("could not commit MLS event delivery ACK: {error}"))
 }
 
 /// Loads locally persisted inbound ciphertext in bounded cursor pages.
@@ -4083,6 +4287,23 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
             )
             .map_err(|error| format!("could not create durable MLS Welcome outbox: {error}"))?;
     }
+    if version < 15 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE local_mls_event_recipients (
+                     event_id BLOB NOT NULL CHECK (length(event_id) = 16),
+                     device_public_key BLOB NOT NULL CHECK (length(device_public_key) = 32),
+                     delivery_state TEXT NOT NULL DEFAULT 'queued'
+                         CHECK (delivery_state IN ('queued', 'delivered')),
+                     delivered_at INTEGER,
+                     PRIMARY KEY (event_id, device_public_key)
+                 );
+                 CREATE INDEX local_mls_event_recipients_by_peer
+                     ON local_mls_event_recipients(device_public_key, delivery_state);
+                 PRAGMA user_version = 15;",
+            )
+            .map_err(|error| format!("could not create MLS event recipient ledger: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -5489,6 +5710,40 @@ mod tests {
             None,
         )
         .expect("receiver should join group");
+        let second_identity = SigningKey::from_bytes(&[0x35; 32]);
+        let mut second_receiver =
+            open_database(&directory.join("second-receiver.sqlite3"), &[0x36; 32])
+                .expect("second receiver database should initialize");
+        let second_package =
+            create_mls_key_package_in(&mut second_receiver, suite, &second_identity)
+                .expect("second receiver should prepare its KeyPackage");
+        let second_admission = add_mls_group_member_in(
+            &mut sender,
+            &group.group_id,
+            &second_package.public_bytes,
+            &sender_identity,
+        )
+        .expect("sender should add the second receiver");
+        assert_eq!(
+            process_inbound_mls_commit_in(
+                &mut receiver,
+                &group.group_id,
+                &second_admission.commit,
+                &receiver_identity,
+            )
+            .expect("first receiver should apply the second admission Commit"),
+            ProcessedMlsCommit::Applied { epoch: 2 }
+        );
+        join_mls_group_from_welcome_in(
+            &mut second_receiver,
+            &second_admission.welcome,
+            &second_admission.ratchet_tree,
+            &second_identity,
+            None,
+            None,
+            None,
+        )
+        .expect("second receiver should join from its Welcome");
 
         let payload = b"MLS application payload";
         let prepared = create_mls_application_event_in(
@@ -5499,7 +5754,7 @@ mod tests {
             &sender_identity,
         )
         .expect("application payload should encrypt and persist");
-        assert_eq!(prepared.event.epoch, 1);
+        assert_eq!(prepared.event.epoch, 2);
         assert_eq!(prepared.event.ciphertext, prepared.wire_message);
         let queued: (String, Vec<u8>) = sender
             .query_row(
@@ -5510,11 +5765,82 @@ mod tests {
             .expect("ciphertext should be saved in the outbox");
         assert_eq!(queued.0, "queued");
         assert_eq!(queued.1, prepared.wire_message);
+        let recipients = list_queued_mls_event_recipients_in(&sender, &group.group_id)
+            .expect("group application event should snapshot peer recipients");
+        assert_eq!(recipients.len(), 2);
+        assert!(recipients.contains(&receiver_identity.verifying_key().to_bytes()));
+        assert!(recipients.contains(&second_identity.verifying_key().to_bytes()));
+        let receiver_queue = list_queued_mls_events_for_peer_in(
+            &sender,
+            &group.group_id,
+            receiver_identity.verifying_key().to_bytes(),
+            100,
+        )
+        .expect("recipient should see its queued MLS event");
+        assert_eq!(receiver_queue.len(), 1);
+        assert_eq!(receiver_queue[0].event.event_id, prepared.event.event_id);
+        assert!(
+            list_queued_mls_events_for_peer_in(&sender, &group.group_id, [0x98; 32], 100)
+                .expect("unrelated peer queue should be queryable")
+                .is_empty()
+        );
         let sender_history = list_mls_messages_in(&sender, &group.group_id, 20)
             .expect("outbound plaintext should persist in encrypted local history");
         assert_eq!(sender_history.len(), 1);
         assert_eq!(sender_history[0].direction, DirectMessageDirection::Sent);
         assert_eq!(sender_history[0].text, "MLS application payload");
+        mark_mls_event_delivered_to_peer_in(
+            &mut sender,
+            prepared.event.event_id,
+            receiver_identity.verifying_key().to_bytes(),
+        )
+        .expect("ACK should clear only the acknowledging recipient queue");
+        mark_mls_event_delivered_to_peer_in(
+            &mut sender,
+            prepared.event.event_id,
+            receiver_identity.verifying_key().to_bytes(),
+        )
+        .expect("duplicate event ACK should be idempotent");
+        let remaining = list_queued_mls_events_for_peer_in(
+            &sender,
+            &group.group_id,
+            second_identity.verifying_key().to_bytes(),
+            100,
+        )
+        .expect("the other recipient should remain queued after a partial ACK");
+        assert_eq!(remaining.len(), 1);
+        let state_after_partial_ack: String = sender
+            .query_row(
+                "SELECT delivery_state FROM local_events WHERE event_id = ?1",
+                [prepared.event.event_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("global event should remain queued while one recipient is pending");
+        assert_eq!(state_after_partial_ack, "queued");
+        mark_mls_event_delivered_to_peer_in(
+            &mut sender,
+            prepared.event.event_id,
+            second_identity.verifying_key().to_bytes(),
+        )
+        .expect("second recipient ACK should finish the event outbox");
+        let final_state: String = sender
+            .query_row(
+                "SELECT delivery_state FROM local_events WHERE event_id = ?1",
+                [prepared.event.event_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("global event should leave the outbox after all ACKs");
+        assert_eq!(final_state, "held_by_peer");
+        assert!(
+            list_queued_mls_events_for_peer_in(
+                &sender,
+                &group.group_id,
+                receiver_identity.verifying_key().to_bytes(),
+                100
+            )
+            .expect("recipient event queue should reload")
+            .is_empty()
+        );
 
         let mut forged = prepared.event.clone();
         forged.event_id = [0x91; 16];
@@ -5569,6 +5895,7 @@ mod tests {
         );
         assert_eq!(receiver_history[0].text, "MLS application payload");
         drop(receiver);
+        drop(second_receiver);
         drop(sender);
         fs::remove_dir_all(directory).expect("temporary databases should be removed");
     }
