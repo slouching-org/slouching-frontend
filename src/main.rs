@@ -8,6 +8,7 @@ pub mod call_chat;
 pub mod call_rtc;
 pub mod call_video;
 pub mod camera_capture;
+pub mod delivery_client;
 pub mod familiar_image;
 pub mod file_transfer;
 pub mod identity;
@@ -233,6 +234,7 @@ struct MlsEventFanoutReport {
     recipients: usize,
     events_acked: usize,
     copies_held: usize,
+    mailbox_copies_held: usize,
     events_expired: usize,
     failures: Vec<String>,
 }
@@ -272,6 +274,9 @@ struct Slouching {
     identity_status: IdentityStatus,
     delegated_mls_storage: Option<storage::DelegatedMlsStorageStatus>,
     delegated_mls_storage_error: Option<String>,
+    delivery_mailbox_config: storage::DeliveryMailboxConfig,
+    delivery_mailbox_config_error: Option<String>,
+    delivery_mailbox_status: String,
     peer_public_key: String,
     peer_invite_addresses: Vec<String>,
     peer_verification_loaded_for: Option<String>,
@@ -486,6 +491,9 @@ impl Default for Slouching {
             identity_status: IdentityStatus::Loading,
             delegated_mls_storage: None,
             delegated_mls_storage_error: None,
+            delivery_mailbox_config: storage::DeliveryMailboxConfig::default(),
+            delivery_mailbox_config_error: None,
+            delivery_mailbox_status: "Mailbox remoto desativado.".to_owned(),
             peer_public_key: String::new(),
             peer_invite_addresses: Vec::new(),
             peer_verification_loaded_for: None,
@@ -667,6 +675,14 @@ enum Message {
     DelegatedMlsStorageLoaded(Result<storage::DelegatedMlsStorageStatus, String>),
     SetDelegatedMlsStorage(bool),
     DelegatedMlsStorageSaved(bool, Result<storage::DelegatedMlsStorageStatus, String>),
+    DeliveryMailboxConfigLoaded(Result<storage::DeliveryMailboxConfig, String>),
+    DeliveryMailboxUrlChanged(String),
+    ToggleDeliveryMailbox(bool),
+    SaveDeliveryMailboxConfig,
+    DiscardDeliveryMailboxConfig,
+    DeliveryMailboxConfigSaved(storage::DeliveryMailboxConfig, Result<(), String>),
+    FetchDeliveryMailbox,
+    DeliveryMailboxFetched(Result<(usize, usize), String>),
     DelegatedCopyStored(
         u64,
         [u8; 16],
@@ -938,6 +954,97 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 }
             }
         },
+        Message::DeliveryMailboxConfigLoaded(Ok(config)) => {
+            state.delivery_mailbox_config = config;
+            state.delivery_mailbox_config_error = None;
+            state.delivery_mailbox_status = if state.delivery_mailbox_config.enabled {
+                "Mailbox remoto ativado; cópias só serão enviadas após falha de rota direta.".into()
+            } else {
+                "Mailbox remoto desativado.".into()
+            };
+        }
+        Message::DeliveryMailboxConfigLoaded(Err(error)) => {
+            state.delivery_mailbox_config_error = Some(error);
+        }
+        Message::DeliveryMailboxUrlChanged(url) => {
+            state.delivery_mailbox_config.url = url;
+            state.delivery_mailbox_config_error = None;
+        }
+        Message::ToggleDeliveryMailbox(enabled) => {
+            state.delivery_mailbox_config.enabled = enabled;
+            state.delivery_mailbox_config_error = None;
+        }
+        Message::SaveDeliveryMailboxConfig => {
+            if state.delivery_mailbox_config.enabled
+                && let Err(error) =
+                    delivery_client::validate_helper_url(&state.delivery_mailbox_config.url)
+            {
+                state.delivery_mailbox_config_error = Some(error);
+                return Task::none();
+            }
+            let config = state.delivery_mailbox_config.clone();
+            state.delivery_mailbox_status = "Salvando configuração local cifrada…".into();
+            return Task::perform(
+                save_delivery_mailbox_config_task(config.clone()),
+                move |result| Message::DeliveryMailboxConfigSaved(config, result),
+            );
+        }
+        Message::DiscardDeliveryMailboxConfig => {
+            return Task::perform(
+                load_delivery_mailbox_config_task(),
+                Message::DeliveryMailboxConfigLoaded,
+            );
+        }
+        Message::DeliveryMailboxConfigSaved(config, Ok(())) => {
+            state.delivery_mailbox_config = config;
+            state.delivery_mailbox_status = if state.delivery_mailbox_config.enabled {
+                "Mailbox remoto ativado; mensagens só serão copiadas após falha direta.".into()
+            } else {
+                "Mailbox remoto desativado.".into()
+            };
+            state.delivery_mailbox_config_error = None;
+        }
+        Message::DeliveryMailboxConfigSaved(_, Err(error)) => {
+            state.delivery_mailbox_status = "Falha ao salvar mailbox remoto.".into();
+            state.delivery_mailbox_config_error = Some(error);
+        }
+        Message::FetchDeliveryMailbox => {
+            let Some(device) = (match state.identity_status {
+                IdentityStatus::Ready(device) => Some(device),
+                _ => None,
+            }) else {
+                state.delivery_mailbox_status =
+                    "Crie ou carregue a identidade antes de buscar cópias.".into();
+                return Task::none();
+            };
+            if !state.delivery_mailbox_config.enabled {
+                state.delivery_mailbox_status =
+                    "Ative e salve o mailbox remoto antes de buscar.".into();
+                return Task::none();
+            }
+            let helper_url = state.delivery_mailbox_config.url.clone();
+            state.delivery_mailbox_status = "Buscando cópias cifradas…".into();
+            return Task::perform(
+                fetch_delivery_mailbox_task(helper_url, device),
+                Message::DeliveryMailboxFetched,
+            );
+        }
+        Message::DeliveryMailboxFetched(Ok((received, duplicates))) => {
+            state.delivery_mailbox_status = format!(
+                "Mailbox: {received} evento(s) salvo(s) localmente e confirmado(s); {duplicates} duplicata(s) já estavam salvas."
+            );
+            let group_id = hex_decode_bytes(&state.mls_group_id)
+                .ok()
+                .filter(|bytes| bytes.len() == 16);
+            if let Some(group_id) = group_id {
+                return load_mls_history(state, group_id);
+            }
+        }
+        Message::DeliveryMailboxFetched(Err(error)) => {
+            state.delivery_mailbox_status =
+                "Busca no mailbox falhou; cópias não confirmadas permanecem disponíveis.".into();
+            state.delivery_mailbox_config_error = Some(error);
+        }
         Message::DelegatedCopyStored(sequence, event_id, result) => match result {
             Ok(_) => {
                 if let Some(commands) = state.peer_session_commands.as_ref() {
@@ -4388,28 +4495,35 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.mls_event_fanout_running = true;
             state.mls_status =
                 "Distribuindo eventos MLS salvos aos membros com rotas pinadas…".into();
-            return Task::perform(fanout_mls_events_task(group_id.clone()), move |result| {
-                Message::MlsEventFanoutFinished(group_id, result)
-            });
+            let mailbox_url = state
+                .delivery_mailbox_config
+                .enabled
+                .then(|| state.delivery_mailbox_config.url.clone());
+            return Task::perform(
+                fanout_mls_events_task(group_id.clone(), mailbox_url),
+                move |result| Message::MlsEventFanoutFinished(group_id, result),
+            );
         }
         Message::MlsEventFanoutFinished(group_id, result) => {
             state.mls_event_fanout_running = false;
             match result {
                 Ok(report) if report.failures.is_empty() => {
                     state.mls_status = format!(
-                        "Fan-out MLS: {} evento(s) recebidos em {} peer(s), {} cópia(s) guardadas por ajudantes; {} expirado(s).",
+                        "Fan-out MLS: {} evento(s) recebidos em {} peer(s), {} cópia(s) em peers ajudantes e {} no helper Elixir; {} expirado(s).",
                         report.events_acked,
                         report.recipients,
                         report.copies_held,
+                        report.mailbox_copies_held,
                         report.events_expired
                     );
                 }
                 Ok(report) => {
                     state.mls_status = format!(
-                        "Fan-out MLS parcial: {} evento(s) recebidos em {} peer(s), {} cópia(s) guardadas; {} peer(s) pendente(s), {} expirado(s). {}",
+                        "Fan-out MLS parcial: {} evento(s) recebidos em {} peer(s), {} cópia(s) em peers ajudantes e {} no helper Elixir; {} peer(s) pendente(s), {} expirado(s). {}",
                         report.events_acked,
                         report.recipients,
                         report.copies_held,
+                        report.mailbox_copies_held,
                         report.failures.len(),
                         report.events_expired,
                         report.failures.join(" · ")
@@ -5604,6 +5718,17 @@ fn boot() -> (Slouching, Task<Message>) {
     {
         state.settings_tab = value.min(7);
     }
+    let capture_delivery_mailbox = args.iter().any(|arg| arg == "--capture-delivery-mailbox");
+    if capture_delivery_mailbox {
+        state.screen = Screen::Settings;
+        state.settings_tab = 2;
+        state.delivery_mailbox_config = storage::DeliveryMailboxConfig {
+            url: "https://mailbox.crew.example".to_owned(),
+            enabled: true,
+        };
+        state.delivery_mailbox_status =
+            "Helper remoto ativo · upload somente após falha direta.".to_owned();
+    }
     if args.iter().any(|arg| arg == "--capture-peer-addresses") {
         state.screen = Screen::Chat;
         let addresses = ["192.168.1.20:45873", "100.64.0.20:45873"]
@@ -5813,6 +5938,14 @@ fn boot() -> (Slouching, Task<Message>) {
                 load_delegated_mls_storage_task(),
                 Message::DelegatedMlsStorageLoaded,
             ),
+            if capture_delivery_mailbox {
+                Task::none()
+            } else {
+                Task::perform(
+                    load_delivery_mailbox_config_task(),
+                    Message::DeliveryMailboxConfigLoaded,
+                )
+            },
             load_mls_groups(),
             Task::perform(load_peer_routes_task(), Message::PeerRoutesLoaded),
             Task::perform(load_audio_devices_task(), Message::AudioDevicesLoaded),
@@ -6001,6 +6134,45 @@ async fn set_delegated_mls_storage_task(
     })
     .await
     .map_err(|error| format!("delegated MLS storage update task failed: {error}"))?
+}
+
+async fn load_delivery_mailbox_config_task() -> Result<storage::DeliveryMailboxConfig, String> {
+    tokio::task::spawn_blocking(storage::load_delivery_mailbox_config)
+        .await
+        .map_err(|error| format!("delivery mailbox settings load failed: {error}"))?
+}
+
+async fn save_delivery_mailbox_config_task(
+    config: storage::DeliveryMailboxConfig,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || storage::save_delivery_mailbox_config(&config))
+        .await
+        .map_err(|error| format!("delivery mailbox settings save failed: {error}"))?
+}
+
+async fn fetch_delivery_mailbox_task(
+    helper_url: String,
+    recipient_device: [u8; 32],
+) -> Result<(usize, usize), String> {
+    let page = delivery_client::list_copies(&helper_url, 0, 16).await?;
+    let mut received = 0;
+    let mut duplicates = 0;
+    for copy in page.copies {
+        let (grant, event) = delivery_client::decode_copy(&copy.payload)?;
+        if copy.event_id != grant.event_id
+            || event.event_id != grant.event_id
+            || copy.expires_at_unix != grant.expires_at_unix
+        {
+            return Err("mailbox entry ID does not match its signed MLS envelope".into());
+        }
+        let event_id = grant.event_id;
+        match process_delegated_copy_for_recipient_task(grant, event, recipient_device).await? {
+            storage::ProcessedMlsApplicationEvent::Received(_) => received += 1,
+            storage::ProcessedMlsApplicationEvent::Duplicate => duplicates += 1,
+        }
+        delivery_client::acknowledge_copy(&helper_url, &event_id).await?;
+    }
+    Ok((received, duplicates))
 }
 
 fn peer_grant_to_storage(grant: peer::DelegatedMlsCopyGrant) -> storage::DelegatedMlsCopyGrant {
@@ -6892,7 +7064,10 @@ async fn fanout_mls_commits_to_peer(
     outcome
 }
 
-async fn fanout_mls_events_task(group_id: Vec<u8>) -> Result<MlsEventFanoutReport, String> {
+async fn fanout_mls_events_task(
+    group_id: Vec<u8>,
+    mailbox_url: Option<String>,
+) -> Result<MlsEventFanoutReport, String> {
     let route_group_id = group_id.clone();
     let (events_expired, recipients, routes) = tokio::task::spawn_blocking(move || {
         let events_expired = storage::expire_queued_mls_events(&route_group_id)?;
@@ -6914,6 +7089,7 @@ async fn fanout_mls_events_task(group_id: Vec<u8>) -> Result<MlsEventFanoutRepor
         recipients: recipients.len(),
         events_acked: 0,
         copies_held: 0,
+        mailbox_copies_held: 0,
         events_expired,
         failures: Vec::new(),
     };
@@ -6930,10 +7106,21 @@ async fn fanout_mls_events_task(group_id: Vec<u8>) -> Result<MlsEventFanoutRepor
                 )
                 .await;
                 report.copies_held += held;
-                if let Some(reason) = failure {
+                let mut stored_remote = 0;
+                let mut remote_failure = None;
+                if held < pending.len()
+                    && let Some(helper_url) = mailbox_url.as_deref()
+                {
+                    (stored_remote, remote_failure) =
+                        upload_mls_copies_to_mailbox(helper_url, peer_device, &pending).await;
+                    report.mailbox_copies_held += stored_remote;
+                }
+                if held + stored_remote < pending.len() {
                     report.failures.push(format!(
-                        "{}… sem rota direta; cópia: {reason}",
-                        hex_encode_bytes(&peer_device[..4])
+                        "{}… sem rota direta; peer helper: {}; helper Elixir: {}",
+                        hex_encode_bytes(&peer_device[..4]),
+                        failure.unwrap_or_else(|| "não configurado".into()),
+                        remote_failure.unwrap_or_else(|| "não configurado".into())
                     ));
                 }
             }
@@ -6986,19 +7173,32 @@ async fn fanout_mls_events_task(group_id: Vec<u8>) -> Result<MlsEventFanoutRepor
                 )
                 .await;
                 report.copies_held += held;
-                if held == 0 {
+                let mut stored_remote = 0;
+                let mut remote_failure = None;
+                if held < events_for_copy.len()
+                    && let Some(helper_url) = mailbox_url.as_deref()
+                {
+                    (stored_remote, remote_failure) =
+                        upload_mls_copies_to_mailbox(helper_url, peer_device, &events_for_copy)
+                            .await;
+                    report.mailbox_copies_held += stored_remote;
+                }
+                if held + stored_remote == 0 {
                     report.failures.push(format!(
-                        "{}…: {error}; cópia: {}",
+                        "{}…: {error}; peer helper: {}; helper Elixir: {}",
                         hex_encode_bytes(&peer_device[..4]),
-                        copy_failure.unwrap_or_else(|| "nenhum ajudante aceitou".to_owned())
+                        copy_failure.unwrap_or_else(|| "nenhum ajudante aceitou".to_owned()),
+                        remote_failure.unwrap_or_else(|| "não configurado".to_owned())
                     ));
                     break;
                 }
-                if let Some(copy_failure) = copy_failure {
+                if let Some(copy_failure) = copy_failure
+                    && held + stored_remote < events_for_copy.len()
+                {
                     report.failures.push(format!(
-                        "{}…: {} evento(s) direto(s) falharam; cópia parcial: {copy_failure}",
+                        "{}…: envio direto falhou; cópia parcial: {copy_failure}; helper Elixir: {}",
                         hex_encode_bytes(&peer_device[..4]),
-                        held
+                        remote_failure.unwrap_or_else(|| "não configurado".to_owned())
                     ));
                 }
                 break;
@@ -7187,6 +7387,46 @@ async fn fanout_mls_copies_to_helper(
         }
     })
     .await;
+    (stored, failure)
+}
+
+async fn upload_mls_copies_to_mailbox(
+    helper_url: &str,
+    recipient_device: [u8; 32],
+    events: &[storage::StoredOutboundEvent],
+) -> (usize, Option<String>) {
+    let mut stored = 0;
+    let mut failure = None;
+    for queued in events {
+        let event = queued.event.clone();
+        let grant = match tokio::task::spawn_blocking(move || {
+            storage::sign_delegated_mls_copy_grant(&event, recipient_device)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result)
+        {
+            Ok(grant) => grant,
+            Err(error) => {
+                failure = Some(format!("não foi possível autorizar cópia: {error}"));
+                break;
+            }
+        };
+        let envelope = match delivery_client::encode_copy(&grant, &queued.event) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                failure = Some(format!("envelope de cópia inválido: {error}"));
+                break;
+            }
+        };
+        match delivery_client::upload_copy(helper_url, &envelope).await {
+            Ok(_) => stored += 1,
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        }
+    }
     (stored, failure)
 }
 

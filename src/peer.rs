@@ -2158,7 +2158,7 @@ fn decode_mls_commit(bytes: &[u8]) -> Result<MlsCommitEnvelope, String> {
     })
 }
 
-fn encode_delegated_mls_copy(
+pub fn encode_delegated_mls_copy(
     grant: &DelegatedMlsCopyGrant,
     event: &MlsEventEnvelope,
 ) -> Result<Vec<u8>, String> {
@@ -2197,7 +2197,7 @@ fn encode_delegated_mls_copy(
     Ok(output)
 }
 
-fn decode_delegated_mls_copy(
+pub fn decode_delegated_mls_copy(
     bytes: &[u8],
 ) -> Result<(DelegatedMlsCopyGrant, MlsEventEnvelope), String> {
     const FIXED: usize = 4 + 2 + 16 + 32 + 32 + 16 + 8 + 8 + 4 + 32 + 64 + 4;

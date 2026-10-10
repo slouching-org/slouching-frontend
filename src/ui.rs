@@ -1032,6 +1032,43 @@ fn settings(state: &Slouching, l: Layout) -> Element<'_, Message> {
                     l.label(error, 11.0, RED)
                 } else {
                     l.label("A fila expira em até 30 dias e é apagada após a confirmação do destinatário.", 11.0, MUTED)
+                },
+                rule(LINE, l.px(8.0)),
+                l.label("MAILBOX ELIXIR · OPCIONAL", 11.0, GOLD),
+                l.label(
+                    "Quando uma rota direta falhar, o app pode guardar uma cópia MLS cifrada neste helper. O ACK do helper não significa que o destinatário recebeu a mensagem.",
+                    11.0,
+                    PAPER
+                ),
+                l.input_maybe(
+                    "https://helper.example.org",
+                    &state.delivery_mailbox_config.url,
+                    Some(Message::DeliveryMailboxUrlChanged as fn(String) -> Message)
+                ),
+                row![
+                    l.control(
+                        "shield",
+                        if state.delivery_mailbox_config.enabled { "Desativar helper remoto" } else { "Ativar helper remoto" },
+                        Some(Message::ToggleDeliveryMailbox(!state.delivery_mailbox_config.enabled)),
+                        true
+                    ),
+                    l.control("check", "Salvar", Some(Message::SaveDeliveryMailboxConfig), false),
+                    l.control("close", "Descartar", Some(Message::DiscardDeliveryMailboxConfig), false)
+                ]
+                .spacing(l.px(6.0)),
+                l.control(
+                    "refresh",
+                    "Buscar cópias agora",
+                    (state.delivery_mailbox_config.enabled
+                        && matches!(state.identity_status, crate::IdentityStatus::Ready(_)))
+                        .then_some(Message::FetchDeliveryMailbox),
+                    false
+                ),
+                l.label(state.delivery_mailbox_status.clone(), 10.0, MUTED),
+                if let Some(error) = &state.delivery_mailbox_config_error {
+                    l.label(error.clone(), 10.0, RED)
+                } else {
+                    l.label("A chave do dispositivo assina listagem e ACK; endpoints remotos exigem HTTPS.", 10.0, MUTED)
                 }
             ]
             .spacing(l.px(24.0)),

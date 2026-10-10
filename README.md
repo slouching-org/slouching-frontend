@@ -543,6 +543,18 @@ queued until the target device accepts the event. Helper retention is
 best-effort within the configured quota and expiry.
 Turning off consent erases every queued ciphertext copy from that device.
 
+The same settings screen now supports an optional remote Elixir mailbox. Enter
+the helper's HTTPS origin, enable it, and save. MLS fan-out uploads signed
+ciphertext copies there when direct delivery and opted-in peer copies do not
+cover every pending recipient event. On the recipient device, enable and save
+the same helper URL, then choose **Buscar cópias agora**. The client checks the
+recipient grant and event metadata, persists the MLS event locally, and only
+then ACKs deletion at the helper. The helper ACK confirms storage removal, not
+MLS delivery. Fetch is manual and limited to 16 copies per click; repeat it to
+continue. Loopback HTTP is accepted for development; remote helper URLs require
+HTTPS. Remote deployment and physical-device use remain unverified, and this
+mailbox does not create a live P2P route or traverse NAT.
+
 The MLS screen now detects authenticated committer equivocation. It verifies a
 conflicting historical Commit against a saved OpenMLS epoch snapshot, stores
 both Commit values in the encrypted database, and quarantines that group on
@@ -575,6 +587,7 @@ SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-capture
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 11-mls --capture-mls-member-removal
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 11-mls --capture-mls-attachment
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 02-settings --settings-tab 1
+SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 02-settings --settings-tab 1 --capture-delivery-mailbox
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-verification
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-contact-pairing
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 04-connecting --capture-lan-discovery
@@ -638,6 +651,9 @@ it was attempted here but requires a Wayland or X11 session.
 The updated `04-connecting` screen was also not captured here because this
 environment has no graphical display; capture it with the command above from
 the local frontend repository in a Wayland or X11 session.
+The remote mailbox settings capture was also attempted in this headless
+checkout and could not render without `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, or
+`DISPLAY`; use the command above in a graphical session.
 
 Assets and font license/provenance notes are in [assets/README.md](assets/README.md).
 

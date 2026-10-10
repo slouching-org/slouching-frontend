@@ -17,6 +17,7 @@ use openmls_rust_crypto::RustCrypto;
 use openmls_sqlite_storage::{Codec as OpenMlsCodec, SqliteStorageProvider};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -29,7 +30,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 24;
+const PROFILE_SCHEMA_VERSION: u32 = 25;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 const MAX_DELEGATED_COPY_BYTES: usize = 32 * 1024;
@@ -1743,6 +1744,59 @@ pub struct PeerRelayConfig {
     pub token: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeliveryMailboxConfig {
+    pub url: String,
+    pub enabled: bool,
+}
+
+/// Signs a recipient mailbox request with the existing device identity key.
+pub fn sign_delivery_http_request(
+    method: &str,
+    path: &str,
+    timestamp: &str,
+    nonce: &[u8; 32],
+    body: &[u8],
+) -> Result<([u8; 32], [u8; 64]), String> {
+    let payload = delivery_http_request_payload(method, path, timestamp, nonce, body)?;
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let identity = signing_key_from_secret(secret)?;
+    let signature = identity.sign(&payload).to_bytes();
+    Ok((identity.verifying_key().to_bytes(), signature))
+}
+
+fn delivery_http_request_payload(
+    method: &str,
+    path: &str,
+    timestamp: &str,
+    nonce: &[u8; 32],
+    body: &[u8],
+) -> Result<Vec<u8>, String> {
+    if !matches!(method, "GET" | "POST")
+        || path.is_empty()
+        || path.len() > 4096
+        || timestamp.is_empty()
+        || timestamp.len() > 20
+    {
+        return Err("delivery request signing input is invalid".to_owned());
+    }
+    let mut payload = Vec::with_capacity(96 + method.len() + path.len() + timestamp.len());
+    payload.extend_from_slice(b"slouching/delivery-http-request/v1\0");
+    payload.extend_from_slice(method.as_bytes());
+    payload.push(b'\n');
+    payload.extend_from_slice(path.as_bytes());
+    payload.push(b'\n');
+    payload.extend_from_slice(timestamp.as_bytes());
+    payload.push(b'\n');
+    payload.extend_from_slice(hex::encode(nonce).as_bytes());
+    payload.push(b'\n');
+    payload.extend_from_slice(&Sha256::digest(body));
+    Ok(payload)
+}
+
 pub fn familiar_id(label: &str) -> &'static str {
     match label {
         "Gnomo" => "gnome",
@@ -1846,6 +1900,52 @@ fn load_peer_relay_config_in(connection: &Connection) -> Result<PeerRelayConfig,
 
 pub fn save_peer_relay_config(config: &PeerRelayConfig) -> Result<(), String> {
     save_peer_relay_config_in(&open_local_database()?, config)
+}
+
+pub fn load_delivery_mailbox_config() -> Result<DeliveryMailboxConfig, String> {
+    load_delivery_mailbox_config_in(&open_local_database()?)
+}
+
+fn load_delivery_mailbox_config_in(
+    connection: &Connection,
+) -> Result<DeliveryMailboxConfig, String> {
+    connection
+        .query_row(
+            "SELECT helper_url, enabled FROM local_delivery_mailbox_config WHERE id = 1",
+            [],
+            |row| {
+                Ok(DeliveryMailboxConfig {
+                    url: row.get(0)?,
+                    enabled: row.get::<_, i64>(1)? != 0,
+                })
+            },
+        )
+        .optional()
+        .map(|config| config.unwrap_or_default())
+        .map_err(|error| format!("could not load delivery mailbox settings: {error}"))
+}
+
+pub fn save_delivery_mailbox_config(config: &DeliveryMailboxConfig) -> Result<(), String> {
+    save_delivery_mailbox_config_in(&open_local_database()?, config)
+}
+
+fn save_delivery_mailbox_config_in(
+    connection: &Connection,
+    config: &DeliveryMailboxConfig,
+) -> Result<(), String> {
+    if config.url.trim().len() > 2048 {
+        return Err("delivery helper URL exceeds 2048 bytes".to_owned());
+    }
+    connection
+        .execute(
+            "INSERT INTO local_delivery_mailbox_config (id, helper_url, enabled)
+             VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET helper_url = excluded.helper_url,
+                 enabled = excluded.enabled",
+            params![config.url.trim(), i64::from(config.enabled)],
+        )
+        .map_err(|error| format!("could not save delivery mailbox settings: {error}"))?;
+    Ok(())
 }
 
 fn save_peer_relay_config_in(
@@ -6047,6 +6147,20 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
             )
             .map_err(|error| format!("could not add encrypted familiar image storage: {error}"))?;
     }
+    if version < 25 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS local_delivery_mailbox_config (
+                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                     helper_url TEXT NOT NULL CHECK (length(helper_url) <= 2048),
+                     enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))
+                 );
+                 INSERT OR IGNORE INTO local_delivery_mailbox_config (id, helper_url, enabled)
+                     VALUES (1, '', 0);
+                 PRAGMA user_version = 25;",
+            )
+            .map_err(|error| format!("could not create delivery mailbox settings: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -6104,6 +6218,30 @@ fn restrict_directory_permissions(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_request_signature_payload_matches_http_v1_contract() {
+        let nonce = [0x0a; 32];
+        let body = b"{}";
+        let payload = delivery_http_request_payload(
+            "GET",
+            "/api/delivery/copies?after_id=3&limit=16",
+            "1800000000",
+            &nonce,
+            body,
+        )
+        .expect("canonical request should be signed");
+        let expected = format!(
+            "slouching/delivery-http-request/v1\0GET\n/api/delivery/copies?after_id=3&limit=16\n1800000000\n{}\n",
+            hex::encode(nonce)
+        );
+        assert_eq!(
+            &payload[..expected.len()],
+            expected.as_bytes(),
+            "request domain and canonical fields should match the Elixir contract"
+        );
+        assert_eq!(&payload[expected.len()..], Sha256::digest(body).as_slice());
+    }
     use crate::file_transfer::{FILE_CHUNK_PLAINTEXT_BYTES, FileTransferSecrets};
     use crate::identity::BINDING_VERSION;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -8532,6 +8670,46 @@ mod tests {
         );
         drop(reopened);
         fs::remove_dir_all(directory).expect("temporary relay database should be removed");
+    }
+
+    #[test]
+    fn delivery_mailbox_opt_in_persists_in_encrypted_profile() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-delivery-config-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary delivery database directory should exist");
+        let path = directory.join("profile.sqlite3");
+        let key = [0x37; PROFILE_DB_KEY_LEN];
+        let config = DeliveryMailboxConfig {
+            url: "https://mailbox.crew.example".to_owned(),
+            enabled: true,
+        };
+
+        let connection = open_database(&path, &key).expect("encrypted schema should migrate");
+        assert_eq!(
+            load_delivery_mailbox_config_in(&connection).expect("default config should load"),
+            DeliveryMailboxConfig::default()
+        );
+        save_delivery_mailbox_config_in(&connection, &config)
+            .expect("mailbox settings should be stored");
+        assert_eq!(
+            load_delivery_mailbox_config_in(&connection).expect("mailbox settings should reload"),
+            config
+        );
+        drop(connection);
+
+        let reopened = open_database(&path, &key).expect("encrypted profile should reopen");
+        assert_eq!(
+            load_delivery_mailbox_config_in(&reopened).expect("mailbox opt-in should persist"),
+            config
+        );
+        drop(reopened);
+        fs::remove_dir_all(directory).expect("temporary delivery database should be removed");
     }
 
     #[test]
