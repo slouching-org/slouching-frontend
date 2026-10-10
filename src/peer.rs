@@ -10,10 +10,10 @@ use tokio::{
     sync::mpsc,
 };
 
-/// Direct-only protocol version used for persistent paired-device text sessions.
-pub const PEER_ALPN: &[u8] = b"org.slouching.peer/9";
+/// Direct-only protocol version used for persistent paired-device sessions.
+pub const PEER_ALPN: &[u8] = b"org.slouching.peer/10";
 const FRAME_MAGIC: &[u8; 4] = b"SLCH";
-const FRAME_VERSION: u16 = 9;
+const FRAME_VERSION: u16 = 10;
 const FRAME_DATA: u8 = 1;
 const FRAME_ACK: u8 = 2;
 const FRAME_CLOSE: u8 = 3;
@@ -27,6 +27,7 @@ const FRAME_MLS_KEY_PACKAGE: u8 = 10;
 const FRAME_MLS_WELCOME: u8 = 11;
 const FRAME_MLS_DELEGATED_COPY: u8 = 12;
 const FRAME_MLS_COPY_FETCH: u8 = 13;
+const FRAME_CALL_SIGNAL: u8 = 14;
 const ATTACHMENT_STREAM_MAGIC: &[u8; 4] = b"SLAB";
 const ATTACHMENT_STREAM_VERSION: u16 = 1;
 const ATTACHMENT_STREAM_HEADER_BYTES: usize = 4 + 2 + 16 + 16 + 32 + 8;
@@ -42,6 +43,8 @@ const MLS_WELCOME_MAGIC: &[u8; 4] = b"SLMW";
 const MLS_WELCOME_VERSION: u16 = 2;
 const MLS_DELEGATED_COPY_MAGIC: &[u8; 4] = b"SLDG";
 const MLS_DELEGATED_COPY_VERSION: u16 = 1;
+const CALL_SIGNAL_MAGIC: &[u8; 4] = b"SLCS";
+const CALL_SIGNAL_VERSION: u16 = 1;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
 const MAX_MLS_EVENT_BYTES: usize = 64 * 1024;
 const MAX_MLS_COMMIT_BYTES: usize = 64 * 1024;
@@ -49,6 +52,7 @@ const MAX_MLS_PROPOSAL_BYTES: usize = 64 * 1024;
 const MAX_MLS_KEY_PACKAGE_BYTES: usize = 64 * 1024;
 const MAX_MLS_WELCOME_BYTES: usize = 256 * 1024;
 const MAX_MLS_DELEGATED_COPY_BYTES: usize = 96 * 1024;
+const MAX_CALL_SIGNAL_BYTES: usize = 128 * 1024;
 const MAX_CHECKPOINT_BYTES: usize = 16 * 1024;
 pub const MAX_PENDING_MESSAGES: usize = 16;
 const MAX_MLS_COMMIT_REQUESTS_PER_SESSION: u8 = 16;
@@ -113,6 +117,24 @@ pub struct MlsWelcomeEnvelope {
     pub purpose: MlsGroupPurpose,
     pub welcome: Vec<u8>,
     pub ratchet_tree: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CallSignalKind {
+    Offer = 1,
+    Answer = 2,
+    IceCandidate = 3,
+    End = 4,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallSignal {
+    pub group_id: [u8; 16],
+    pub epoch: u64,
+    pub kind: CallSignalKind,
+    /// Opaque, bounded JSON payload for SDP or an ICE candidate; empty for End.
+    pub payload: Vec<u8>,
 }
 
 /// The application-level use of an MLS group. Call media keys are never
@@ -180,6 +202,11 @@ pub enum PeerCommand {
     SendMlsWelcome {
         request_id: u64,
         welcome: MlsWelcomeEnvelope,
+    },
+    #[allow(dead_code)] // Used by the WebRTC negotiation flow added next.
+    SendCallSignal {
+        request_id: u64,
+        signal: CallSignal,
     },
     SendAttachmentBlob {
         request_id: u64,
@@ -257,6 +284,11 @@ pub enum PeerEvent {
         peer_id: EndpointId,
         welcome: MlsWelcomeEnvelope,
     },
+    CallSignalReceived {
+        sequence: u64,
+        peer_id: EndpointId,
+        signal: CallSignal,
+    },
     DelegatedMlsCopyReceived {
         sequence: u64,
         peer_id: EndpointId,
@@ -286,6 +318,9 @@ pub enum PeerEvent {
     MlsWelcomeAcknowledged {
         request_id: u64,
     },
+    CallSignalAcknowledged {
+        request_id: u64,
+    },
     DelegatedMlsCopyAcknowledged {
         request_id: u64,
     },
@@ -306,6 +341,10 @@ pub enum PeerEvent {
         reason: String,
     },
     MlsWelcomeRejected {
+        request_id: u64,
+        reason: String,
+    },
+    CallSignalRejected {
         request_id: u64,
         reason: String,
     },
@@ -336,6 +375,9 @@ pub enum PeerEvent {
     MlsWelcomeDeliveryUnknown {
         request_id: u64,
     },
+    CallSignalDeliveryUnknown {
+        request_id: u64,
+    },
     DelegatedMlsCopyDeliveryUnknown {
         request_id: u64,
     },
@@ -360,6 +402,7 @@ enum PendingOutbound {
     MlsProposal { request_id: u64 },
     MlsKeyPackage { request_id: u64 },
     MlsWelcome { request_id: u64 },
+    CallSignal { request_id: u64 },
     DelegatedMlsCopy { request_id: u64 },
 }
 
@@ -575,6 +618,10 @@ enum Frame {
         sequence: u64,
         welcome: MlsWelcomeEnvelope,
     },
+    CallSignal {
+        sequence: u64,
+        signal: CallSignal,
+    },
     DelegatedMlsCopy {
         sequence: u64,
         grant: Box<DelegatedMlsCopyGrant>,
@@ -680,6 +727,7 @@ impl DirectPeerListener {
                 | PeerEvent::MlsProposalReceived { .. }
                 | PeerEvent::MlsKeyPackageReceived { .. }
                 | PeerEvent::MlsWelcomeReceived { .. }
+                | PeerEvent::CallSignalReceived { .. }
                 | PeerEvent::DelegatedMlsCopyReceived { .. }
                 | PeerEvent::DelegatedMlsCopiesRequested { .. }
                 | PeerEvent::MlsCommitRequested { .. }
@@ -688,12 +736,14 @@ impl DirectPeerListener {
                 | PeerEvent::MlsProposalAcknowledged { .. }
                 | PeerEvent::MlsKeyPackageAcknowledged { .. }
                 | PeerEvent::MlsWelcomeAcknowledged { .. }
+                | PeerEvent::CallSignalAcknowledged { .. }
                 | PeerEvent::DelegatedMlsCopyAcknowledged { .. }
                 | PeerEvent::MlsEventRejected { .. }
                 | PeerEvent::MlsCommitRejected { .. }
                 | PeerEvent::MlsProposalRejected { .. }
                 | PeerEvent::MlsKeyPackageRejected { .. }
                 | PeerEvent::MlsWelcomeRejected { .. }
+                | PeerEvent::CallSignalRejected { .. }
                 | PeerEvent::DelegatedMlsCopyRejected { .. }
                 | PeerEvent::Rejected { .. }
                 | PeerEvent::DeliveryUnknown { .. }
@@ -702,6 +752,7 @@ impl DirectPeerListener {
                 | PeerEvent::MlsProposalDeliveryUnknown { .. }
                 | PeerEvent::MlsKeyPackageDeliveryUnknown { .. }
                 | PeerEvent::MlsWelcomeDeliveryUnknown { .. }
+                | PeerEvent::CallSignalDeliveryUnknown { .. }
                 | PeerEvent::DelegatedMlsCopyDeliveryUnknown { .. } => {}
             }
         }
@@ -912,6 +963,21 @@ impl DirectPeerSession {
                                     welcome,
                                 };
                             }
+                            Some(Ok(Frame::CallSignal { sequence, signal })) => {
+                                if closing || sequence != next_in_sequence || pending_inbound.len() >= MAX_PENDING_MESSAGES {
+                                    break 'session "invalid or excessive call signaling sequence".to_owned();
+                                }
+                                let Some(next) = next_in_sequence.checked_add(1) else {
+                                    break 'session "inbound message sequence exhausted".to_owned();
+                                };
+                                next_in_sequence = next;
+                                pending_inbound.insert(sequence);
+                                yield PeerEvent::CallSignalReceived {
+                                    sequence,
+                                    peer_id: self.peer_id,
+                                    signal,
+                                };
+                            }
                             Some(Ok(Frame::MlsCommitRequest { group_id, predecessor_epoch })) => {
                                 received_commit_requests = received_commit_requests.saturating_add(1);
                                 if received_commit_requests > MAX_MLS_COMMIT_REQUESTS_PER_SESSION {
@@ -950,6 +1016,9 @@ impl DirectPeerSession {
                                     PendingOutbound::MlsWelcome { request_id } => {
                                         yield PeerEvent::MlsWelcomeAcknowledged { request_id };
                                     }
+                                    PendingOutbound::CallSignal { request_id } => {
+                                        yield PeerEvent::CallSignalAcknowledged { request_id };
+                                    }
                                     PendingOutbound::DelegatedMlsCopy { request_id } => {
                                         yield PeerEvent::DelegatedMlsCopyAcknowledged { request_id };
                                     }
@@ -966,6 +1035,7 @@ impl DirectPeerSession {
                                     PendingOutbound::MlsProposal { request_id } => yield PeerEvent::MlsProposalRejected { request_id, reason },
                                     PendingOutbound::MlsKeyPackage { request_id } => yield PeerEvent::MlsKeyPackageRejected { request_id, reason },
                                     PendingOutbound::MlsWelcome { request_id } => yield PeerEvent::MlsWelcomeRejected { request_id, reason },
+                                    PendingOutbound::CallSignal { request_id } => yield PeerEvent::CallSignalRejected { request_id, reason },
                                     PendingOutbound::DelegatedMlsCopy { request_id } => yield PeerEvent::DelegatedMlsCopyRejected { request_id, reason },
                                 }
                             }
@@ -1161,6 +1231,31 @@ impl DirectPeerSession {
                                 }
                                 next_out_sequence = next;
                             }
+                            Some(PeerCommand::SendCallSignal { request_id, signal }) => {
+                                let payload = match encode_call_signal(&signal) {
+                                    Ok(payload) => payload,
+                                    Err(reason) => {
+                                        yield PeerEvent::CallSignalRejected { request_id, reason };
+                                        continue;
+                                    }
+                                };
+                                if pending_sends.len() >= MAX_PENDING_MESSAGES {
+                                    yield PeerEvent::CallSignalRejected {
+                                        request_id,
+                                        reason: "too many pending peer messages".into(),
+                                    };
+                                    continue;
+                                }
+                                let sequence = next_out_sequence;
+                                let Some(next) = next_out_sequence.checked_add(1) else {
+                                    break 'session "outbound message sequence exhausted".to_owned();
+                                };
+                                pending_sends.insert(sequence, PendingOutbound::CallSignal { request_id });
+                                if let Err(error) = write_frame(&mut self.send, FRAME_CALL_SIGNAL, sequence, &payload).await {
+                                    break 'session format!("could not send call signaling frame: {error}");
+                                }
+                                next_out_sequence = next;
+                            }
                             Some(PeerCommand::SendDelegatedMlsCopy { request_id, grant, event }) => {
                                 let payload = match encode_delegated_mls_copy(&grant, &event) {
                                     Ok(payload) => payload,
@@ -1260,6 +1355,9 @@ impl DirectPeerSession {
                     }
                     PendingOutbound::MlsWelcome { request_id } => {
                         yield PeerEvent::MlsWelcomeDeliveryUnknown { request_id };
+                    }
+                    PendingOutbound::CallSignal { request_id } => {
+                        yield PeerEvent::CallSignalDeliveryUnknown { request_id };
                     }
                     PendingOutbound::DelegatedMlsCopy { request_id } => {
                         yield PeerEvent::DelegatedMlsCopyDeliveryUnknown { request_id };
@@ -1429,6 +1527,7 @@ pub async fn send_once(
             | PeerEvent::MlsProposalReceived { .. }
             | PeerEvent::MlsKeyPackageReceived { .. }
             | PeerEvent::MlsWelcomeReceived { .. }
+            | PeerEvent::CallSignalReceived { .. }
             | PeerEvent::DelegatedMlsCopyReceived { .. }
             | PeerEvent::DelegatedMlsCopiesRequested { .. }
             | PeerEvent::MlsCommitRequested { .. }
@@ -1437,12 +1536,14 @@ pub async fn send_once(
             | PeerEvent::MlsProposalAcknowledged { .. }
             | PeerEvent::MlsKeyPackageAcknowledged { .. }
             | PeerEvent::MlsWelcomeAcknowledged { .. }
+            | PeerEvent::CallSignalAcknowledged { .. }
             | PeerEvent::DelegatedMlsCopyAcknowledged { .. }
             | PeerEvent::MlsEventRejected { .. }
             | PeerEvent::MlsCommitRejected { .. }
             | PeerEvent::MlsProposalRejected { .. }
             | PeerEvent::MlsKeyPackageRejected { .. }
             | PeerEvent::MlsWelcomeRejected { .. }
+            | PeerEvent::CallSignalRejected { .. }
             | PeerEvent::DelegatedMlsCopyRejected { .. }
             | PeerEvent::Unauthorized { .. } => {}
             PeerEvent::MlsEventDeliveryUnknown { .. } => {
@@ -1459,6 +1560,9 @@ pub async fn send_once(
             }
             PeerEvent::MlsWelcomeDeliveryUnknown { .. } => {
                 return Err("MLS Welcome delivery could not be confirmed".to_owned());
+            }
+            PeerEvent::CallSignalDeliveryUnknown { .. } => {
+                return Err("call signaling delivery could not be confirmed".to_owned());
             }
             PeerEvent::DelegatedMlsCopyDeliveryUnknown { .. } => {
                 return Err("delegated MLS copy delivery could not be confirmed".to_owned());
@@ -1606,6 +1710,18 @@ where
                 welcome: decode_mls_welcome(&bytes)?,
             })
         }
+        FRAME_CALL_SIGNAL if (1..=MAX_CALL_SIGNAL_BYTES).contains(&length) && sequence != 0 => {
+            let mut bytes = vec![0_u8; length];
+            reader
+                .read_exact(&mut bytes)
+                .await
+                .map_err(|error| format!("could not read call signaling frame: {error}"))?;
+            Ok(Frame::CallSignal {
+                sequence,
+                signal: decode_call_signal(&bytes)?,
+            })
+        }
+        FRAME_CALL_SIGNAL => Err("peer sent an invalid call signaling frame".to_owned()),
         FRAME_MLS_DELEGATED_COPY
             if (1..=MAX_MLS_DELEGATED_COPY_BYTES).contains(&length) && sequence != 0 =>
         {
@@ -1907,6 +2023,62 @@ fn decode_mls_welcome(bytes: &[u8]) -> Result<MlsWelcomeEnvelope, String> {
         return Err("MLS Welcome envelope identity or content digest is invalid".to_owned());
     }
     Ok(envelope)
+}
+
+fn encode_call_signal(signal: &CallSignal) -> Result<Vec<u8>, String> {
+    if signal.group_id.iter().all(|byte| *byte == 0)
+        || signal.epoch > i64::MAX as u64
+        || signal.payload.len() > MAX_CALL_SIGNAL_BYTES
+        || (signal.kind == CallSignalKind::End && !signal.payload.is_empty())
+        || (signal.kind != CallSignalKind::End && signal.payload.is_empty())
+    {
+        return Err("call signaling envelope is invalid or oversized".to_owned());
+    }
+    let mut output = Vec::with_capacity(35 + signal.payload.len());
+    output.extend_from_slice(CALL_SIGNAL_MAGIC);
+    output.extend_from_slice(&CALL_SIGNAL_VERSION.to_be_bytes());
+    output.extend_from_slice(&signal.group_id);
+    output.extend_from_slice(&signal.epoch.to_be_bytes());
+    output.push(signal.kind as u8);
+    output.extend_from_slice(&(signal.payload.len() as u32).to_be_bytes());
+    output.extend_from_slice(&signal.payload);
+    Ok(output)
+}
+
+fn decode_call_signal(bytes: &[u8]) -> Result<CallSignal, String> {
+    const HEADER_BYTES: usize = 4 + 2 + 16 + 8 + 1 + 4;
+    if bytes.len() < HEADER_BYTES || bytes.len() > HEADER_BYTES + MAX_CALL_SIGNAL_BYTES {
+        return Err("call signaling envelope length is invalid".to_owned());
+    }
+    if &bytes[..4] != CALL_SIGNAL_MAGIC {
+        return Err("call signaling envelope marker is invalid".to_owned());
+    }
+    let version = u16::from_be_bytes(bytes[4..6].try_into().unwrap());
+    if version != CALL_SIGNAL_VERSION {
+        return Err(format!("unsupported call signaling version: {version}"));
+    }
+    let group_id = bytes[6..22].try_into().unwrap();
+    let epoch = u64::from_be_bytes(bytes[22..30].try_into().unwrap());
+    let kind = match bytes[30] {
+        1 => CallSignalKind::Offer,
+        2 => CallSignalKind::Answer,
+        3 => CallSignalKind::IceCandidate,
+        4 => CallSignalKind::End,
+        _ => return Err("call signaling kind is invalid".to_owned()),
+    };
+    let payload_len = u32::from_be_bytes(bytes[31..35].try_into().unwrap()) as usize;
+    if payload_len > MAX_CALL_SIGNAL_BYTES || HEADER_BYTES + payload_len != bytes.len() {
+        return Err("call signaling payload length is invalid".to_owned());
+    }
+    let signal = CallSignal {
+        group_id,
+        epoch,
+        kind,
+        payload: bytes[HEADER_BYTES..].to_vec(),
+    };
+    // Share the encoder's canonical bounds for both received and sent envelopes.
+    encode_call_signal(&signal)?;
+    Ok(signal)
 }
 
 fn encode_mls_commit(commit: &MlsCommitEnvelope) -> Result<Vec<u8>, String> {
@@ -2607,6 +2779,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pinned_sessions_exchange_acknowledged_call_signaling() {
+        let listener_key = SecretKey::from_bytes(&[0x56; 32]);
+        let sender_key = SecretKey::from_bytes(&[0x57; 32]);
+        let listener = bind_listener(
+            listener_key,
+            "127.0.0.1:0".parse().unwrap(),
+            sender_key.public(),
+        )
+        .await
+        .expect("call signaling receiver should bind a loopback endpoint");
+        let listener_id = listener.id();
+        let address = listener
+            .direct_addresses()
+            .into_iter()
+            .find(|address| address.ip().is_loopback())
+            .expect("listener should announce its loopback socket");
+        let receiver_task = tokio::spawn(async move {
+            let session = listener
+                .accept_session()
+                .await
+                .expect("listener should accept the pinned sender");
+            let (commands, receiver) = mpsc::channel(4);
+            let mut events = Box::pin(session.run(receiver));
+            while let Some(event) = events.next().await {
+                if let PeerEvent::CallSignalReceived {
+                    sequence, signal, ..
+                } = event
+                {
+                    commands
+                        .send(PeerCommand::AcceptInbound { sequence })
+                        .await
+                        .expect("receiver should ACK after accepting the signal");
+                    commands
+                        .send(PeerCommand::Disconnect)
+                        .await
+                        .expect("receiver should close after ACKing the signal");
+                    while let Some(event) = events.next().await {
+                        if matches!(event, PeerEvent::Disconnected { .. }) {
+                            return signal;
+                        }
+                    }
+                    panic!("receiver disconnected before completing call signaling ACK");
+                }
+            }
+            panic!("session ended before call signaling arrived");
+        });
+
+        let session = connect_peer(sender_key, listener_id, address)
+            .await
+            .expect("sender should connect to the pinned call peer");
+        let (commands, receiver) = mpsc::channel(4);
+        let mut events = Box::pin(session.run(receiver));
+        let signal = CallSignal {
+            group_id: [0x58; 16],
+            epoch: 3,
+            kind: CallSignalKind::Offer,
+            payload: br#"{"type":"offer","sdp":"v=0"}"#.to_vec(),
+        };
+        commands
+            .send(PeerCommand::SendCallSignal {
+                request_id: 10,
+                signal: signal.clone(),
+            })
+            .await
+            .expect("sender should queue the call offer");
+        let mut acknowledged = false;
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(8), events.next())
+            .await
+            .expect("call signaling ACK should arrive before deadline")
+        {
+            if matches!(event, PeerEvent::CallSignalAcknowledged { request_id: 10 }) {
+                acknowledged = true;
+                break;
+            }
+        }
+        assert!(acknowledged, "call offer should receive a transport ACK");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(8), receiver_task)
+                .await
+                .expect("receiver should complete")
+                .unwrap(),
+            signal
+        );
+    }
+
+    #[test]
+    fn call_signal_codec_checks_group_epoch_kind_and_bounds() {
+        let offer = CallSignal {
+            group_id: [0x61; 16],
+            epoch: 4,
+            kind: CallSignalKind::Offer,
+            payload: b"{\"sdp\":\"offer\"}".to_vec(),
+        };
+        let bytes = encode_call_signal(&offer).unwrap();
+        assert_eq!(decode_call_signal(&bytes).unwrap(), offer);
+
+        for invalid in [
+            CallSignal {
+                group_id: [0; 16],
+                epoch: 0,
+                kind: CallSignalKind::Offer,
+                payload: b"offer".to_vec(),
+            },
+            CallSignal {
+                group_id: [1; 16],
+                epoch: u64::MAX,
+                kind: CallSignalKind::Answer,
+                payload: b"answer".to_vec(),
+            },
+            CallSignal {
+                group_id: [1; 16],
+                epoch: 0,
+                kind: CallSignalKind::End,
+                payload: b"unexpected".to_vec(),
+            },
+            CallSignal {
+                group_id: [1; 16],
+                epoch: 0,
+                kind: CallSignalKind::IceCandidate,
+                payload: vec![0x62; MAX_CALL_SIGNAL_BYTES + 1],
+            },
+        ] {
+            assert!(encode_call_signal(&invalid).is_err());
+        }
+        let end = CallSignal {
+            group_id: [0x61; 16],
+            epoch: 4,
+            kind: CallSignalKind::End,
+            payload: Vec::new(),
+        };
+        assert_eq!(
+            decode_call_signal(&encode_call_signal(&end).unwrap()).unwrap(),
+            end
+        );
+        let mut corrupt = bytes;
+        corrupt[30] = 255;
+        assert!(decode_call_signal(&corrupt).is_err());
+    }
+
+    #[tokio::test]
     async fn strict_session_frames_reject_unknown_and_malformed_data() {
         let (mut writer, mut reader) = duplex(128);
         write_frame(&mut writer, FRAME_DATA, 1, "hello".as_bytes())
@@ -2668,7 +2980,7 @@ mod tests {
         let (mut writer, mut reader) = duplex(128);
         writer
             .write_all(&[
-                b'S', b'L', b'C', b'H', 0, 8, FRAME_DATA, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, b'x',
+                b'S', b'L', b'C', b'H', 0, 9, FRAME_DATA, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, b'x',
             ])
             .await
             .unwrap();

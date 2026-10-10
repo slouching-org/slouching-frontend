@@ -338,8 +338,10 @@ groups cannot export media keys. The SFrame sender takes its local leaf index
 from the authenticated call group; a receiver resolves the sender device key
 to that group's current leaf index. A two-device Welcome test checks distinct
 member indexes and encrypts/decrypts a frame with the shared MLS exporter. This
-still does not start a call: no UI path sends SFrame frames, and WebRTC, live
-audio capture/playback, and video remain disconnected. Device choices are not
+still does not start a call: QUIC v10 has bounded offer, answer, ICE candidate,
+and end signals on the pinned session, but the UI rejects incoming signaling
+until the WebRTC controller is integrated. No UI path sends SFrame frames, and
+live audio capture/playback and video remain disconnected. Device choices are not
 persisted or used by calls yet.
 Camera and screen capture are also inactive. **Rede & P2P** in Settings retains
 the Elixir HTTP/WebSocket diagnostics and manual refresh. On Linux, this uses
@@ -367,7 +369,7 @@ be installed and available in the user session.
 ![Actual native Iced audio settings with real input/output devices and an inactive local microphone-test button; names are machine-specific and no call is connected](docs/design/runtime/native-vhs/13-audio-devices.png)
 
 The Network and P2P settings expose persisted opt-in for delegated encrypted
-MLS copies, with the local quota and expiry policy beside the control. QUIC v9
+MLS copies, with the local quota and expiry policy beside the control. QUIC v10
 transports signed author grants and lets a reconnecting recipient fetch up to
 16 authorized copies per connection. When direct delivery fails, the MLS
 fan-out action tries a reachable routed group member that opted in. The helper
@@ -390,9 +392,8 @@ The eleven design-board views and additional MLS screen are captured in [native-
 These are a first implementation of the visual direction, with comparison
 at 1280 × 800 and a compact 960 × 640 window. Exact visual parity,
 accessibility, and live media integration remain to be completed.
-The current direct transport, delegated-copy frames, and call-group Welcome
-purpose are specified in the [v9 peer protocol](docs/fichas/transport/lan-peer-v9.md).
-Version 8 remains as the prior compatibility contract.
+The current direct transport, delegated-copy frames, call-group Welcome purpose,
+and bounded call-signaling frames are specified in the [v10 peer protocol](docs/fichas/transport/lan-peer-v10.md). Version 9 remains as the prior compatibility contract.
 
 ## Reproduce native captures
 

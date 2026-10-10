@@ -29,7 +29,7 @@ only bounded deduplication tombstones. Network & P2P settings expose the
 persisted opt-in and bounded policy.
 The control is unavailable while the OS credential store cannot unlock the
 local encrypted profile. Peer transport and recipient fetch are now present in
-QUIC v9. On connect, the client requests up to 16
+QUIC v10. On connect, the client requests up to 16
 copies addressed to its device; the holder requires its opt-in and ACKs only
 after durable storage, while the recipient verifies the author's grant and
 persists the MLS event before ACK. The helper deletes its copy after that ACK.
@@ -116,10 +116,12 @@ user choose one in the running app. **Testar microfone localmente** explicitly
 opens the selected input and shows an RMS level meter; samples are not saved or
 sent, and the test stops when leaving the audio tab or screen. The device
 choice is not persisted or used by calls yet. Character scenes and call views
-remain visual previews. Camera capture, live audio transport, screen capture,
-contact discovery, QR pairing, and guaranteed offline delivery are not
-implemented. The older web UI under
+remain visual previews. Call MLS groups and SFrame member binding are implemented, and the pinned QUIC
+protocol now carries bounded call-signaling frames. The UI rejects those frames
+until its WebRTC controller is ready. Camera capture, live audio transport,
+screen capture, contact discovery, QR pairing, and guaranteed offline delivery
+are not implemented. The older web UI under
 `prototypes/web/` is a design benchmark, not the product runtime.
 
-See [direct peer transport v9](../transport/lan-peer-v9.md) for the direct session
+See [direct peer transport v10](../transport/lan-peer-v10.md) for the direct session
 contract and [the Iced design plan](iced-design.md) for visual references.

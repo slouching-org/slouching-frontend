@@ -371,6 +371,12 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 assert!(!welcome_acknowledged, "duplicate MLS Welcome ACK");
                 welcome_acknowledged = true;
             }
+            peer::PeerEvent::CallSignalReceived { .. }
+            | peer::PeerEvent::CallSignalAcknowledged { .. }
+            | peer::PeerEvent::CallSignalRejected { .. }
+            | peer::PeerEvent::CallSignalDeliveryUnknown { .. } => {
+                panic!("call signaling was not part of the MLS process test")
+            }
             peer::PeerEvent::DelegatedMlsCopyAcknowledged { .. }
             | peer::PeerEvent::DelegatedMlsCopyRejected { .. }
             | peer::PeerEvent::DelegatedMlsCopyDeliveryUnknown { .. }
@@ -621,6 +627,10 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 | peer::PeerEvent::MlsWelcomeAcknowledged { .. }
                 | peer::PeerEvent::MlsWelcomeRejected { .. }
                 | peer::PeerEvent::MlsWelcomeDeliveryUnknown { .. }
+                | peer::PeerEvent::CallSignalReceived { .. }
+                | peer::PeerEvent::CallSignalAcknowledged { .. }
+                | peer::PeerEvent::CallSignalRejected { .. }
+                | peer::PeerEvent::CallSignalDeliveryUnknown { .. }
                 | peer::PeerEvent::DelegatedMlsCopyAcknowledged { .. }
                 | peer::PeerEvent::DelegatedMlsCopyRejected { .. }
                 | peer::PeerEvent::DelegatedMlsCopyDeliveryUnknown { .. }
@@ -661,6 +671,10 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 | peer::PeerEvent::MlsWelcomeAcknowledged { .. }
                 | peer::PeerEvent::MlsWelcomeRejected { .. }
                 | peer::PeerEvent::MlsWelcomeDeliveryUnknown { .. }
+                | peer::PeerEvent::CallSignalReceived { .. }
+                | peer::PeerEvent::CallSignalAcknowledged { .. }
+                | peer::PeerEvent::CallSignalRejected { .. }
+                | peer::PeerEvent::CallSignalDeliveryUnknown { .. }
                 | peer::PeerEvent::DelegatedMlsCopyAcknowledged { .. }
                 | peer::PeerEvent::DelegatedMlsCopyRejected { .. }
                 | peer::PeerEvent::DelegatedMlsCopyDeliveryUnknown { .. }
@@ -846,7 +860,11 @@ async fn assert_no_application_session(session: peer::DirectPeerSession) {
             | peer::PeerEvent::MlsKeyPackageReceived { .. }
             | peer::PeerEvent::MlsKeyPackageAcknowledged { .. }
             | peer::PeerEvent::MlsWelcomeReceived { .. }
-            | peer::PeerEvent::MlsWelcomeAcknowledged { .. } => {
+            | peer::PeerEvent::MlsWelcomeAcknowledged { .. }
+            | peer::PeerEvent::CallSignalReceived { .. }
+            | peer::PeerEvent::CallSignalAcknowledged { .. }
+            | peer::PeerEvent::CallSignalRejected { .. }
+            | peer::PeerEvent::CallSignalDeliveryUnknown { .. } => {
                 panic!("wrong pinned device exchanged an MLS event")
             }
             peer::PeerEvent::DelegatedMlsCopyReceived { .. }

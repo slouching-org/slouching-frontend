@@ -6014,6 +6014,20 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
         peer::PeerEvent::MlsProposalReceived { .. } => {}
         peer::PeerEvent::MlsKeyPackageReceived { .. } => {}
         peer::PeerEvent::MlsWelcomeReceived { .. } => {}
+        peer::PeerEvent::CallSignalReceived {
+            sequence, signal, ..
+        } => {
+            state.call_group_status = format!(
+                "Sinalização de chamada recebida para epoch {}. A negociação WebRTC ainda não está ativa.",
+                signal.epoch
+            );
+            if let Some(commands) = state.peer_session_commands.as_ref() {
+                let _ = commands.try_send(peer::PeerCommand::RejectInbound {
+                    sequence,
+                    reason: "A negociação WebRTC ainda não está ativa neste cliente.".to_owned(),
+                });
+            }
+        }
         peer::PeerEvent::DelegatedMlsCopyReceived { .. }
         | peer::PeerEvent::DelegatedMlsCopiesRequested { .. } => {}
         peer::PeerEvent::MlsCommitRequested { .. } => {}
@@ -6043,6 +6057,9 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
         | peer::PeerEvent::MlsWelcomeAcknowledged { .. }
         | peer::PeerEvent::MlsWelcomeRejected { .. }
         | peer::PeerEvent::MlsWelcomeDeliveryUnknown { .. }
+        | peer::PeerEvent::CallSignalAcknowledged { .. }
+        | peer::PeerEvent::CallSignalRejected { .. }
+        | peer::PeerEvent::CallSignalDeliveryUnknown { .. }
         | peer::PeerEvent::DelegatedMlsCopyAcknowledged { .. }
         | peer::PeerEvent::DelegatedMlsCopyRejected { .. }
         | peer::PeerEvent::DelegatedMlsCopyDeliveryUnknown { .. } => {}
