@@ -5784,13 +5784,20 @@ fn parse_status(body: &str) -> Result<BackendStatus, FetchError> {
 }
 
 async fn connect_transport() -> Result<(WsStream, protocol::ServerHello), HandshakeError> {
+    let device_key = tokio::task::spawn_blocking(storage::load_device_peer_secret_key)
+        .await
+        .map_err(|error| HandshakeError::Unavailable(error.to_string()))?
+        .map_err(HandshakeError::Unavailable)?;
+    connect_transport_with_key(WS_URL, device_key).await
+}
+
+async fn connect_transport_with_key(
+    ws_url: &str,
+    device_key: iroh::SecretKey,
+) -> Result<(WsStream, protocol::ServerHello), HandshakeError> {
     tokio::time::timeout(Duration::from_secs(3), async {
-        let device_key = tokio::task::spawn_blocking(storage::load_device_peer_secret_key)
-            .await
-            .map_err(|error| HandshakeError::Unavailable(error.to_string()))?
-            .map_err(HandshakeError::Unavailable)?;
         let device_public_key = *device_key.public().as_bytes();
-        let (mut socket, _) = connect_async(WS_URL)
+        let (mut socket, _) = connect_async(ws_url)
             .await
             .map_err(|error| HandshakeError::Unavailable(error.to_string()))?;
         let frame = protocol::ClientFrame {
@@ -9278,6 +9285,22 @@ mod tests {
         assert!(
             decode_authenticated(&unauthorized_capability.encode_to_vec(), &public_key).is_err()
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Elixir gateway; run scripts/smoke-gateway-auth-e2e.sh"]
+    async fn authenticates_over_live_elixir_websocket_and_keeps_heartbeat() {
+        let ws_url = std::env::var("SLOUCHING_GATEWAY_WS_URL")
+            .expect("smoke script provides the temporary gateway URL");
+        let device_key = iroh::SecretKey::from_bytes(&[0x63; 32]);
+        let (mut socket, hello) = connect_transport_with_key(&ws_url, device_key)
+            .await
+            .expect("Elixir gateway authenticates the Rust device proof");
+        assert_eq!(hello.protocol_version, GATEWAY_PROTOCOL_VERSION);
+        assert_eq!(hello.auth_nonce.len(), 32);
+        heartbeat_cycle(&mut socket)
+            .await
+            .expect("authenticated WebSocket stays live through Ping/Pong");
     }
 
     #[test]

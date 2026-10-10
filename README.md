@@ -107,6 +107,14 @@ across NAT, establish messaging by itself, or replace transport/network setup.
 The helper contract and limits are in
 [`docs/fichas/identity/pairing-rendezvous-v1.md`](../../docs/fichas/identity/pairing-rendezvous-v1.md).
 
+The local development WebSocket gateway proves possession of the same device
+key with a fresh Ed25519 challenge. It does not enroll devices or authorize
+product routes. From the project root, `./scripts/smoke-gateway-auth-e2e.sh`
+starts an isolated SQLite-backed Elixir helper and verifies the Rust/Iroh
+signature against its live WebSocket, including Ping/Pong. The fixed test key
+is used only by this smoke test; the desktop client signs with the key in
+Secret Service.
+
 ## Camera video in a call
 
 The **Câmera** tab in **Escolher tela** enumerates native camera devices. Use
