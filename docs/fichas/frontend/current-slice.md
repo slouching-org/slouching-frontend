@@ -103,8 +103,10 @@ The familiar screen stores the display name and familiar in encrypted SQLite;
 the database key and Ed25519 device seed use the operating system credential
 store. The **Conferir identidade do peer** screen lets the user compare the full
 64-character key over an independent channel and mark that exact key as locally
-verified in SQLCipher. A changed key does not inherit trust. QR pairing,
-short-code verification, and contact discovery remain open. A device-signed
+verified in SQLCipher. A changed key does not inherit trust. The client has an
+experimental SPAKE2 primitive and the optional Elixir helper has a bounded
+rendezvous API, but the client does not connect them or exchange signed
+identities yet. Short-code pairing and contact discovery remain open. A device-signed
 binding connects the device identity to its MLS signing key and is carried in
 KeyPackages; that binding alone does not verify a person. Linux needs Secret
 Service available in the user session. The settings **Rede & P2P** screen
