@@ -4,7 +4,7 @@
 //! returned offer and must be persisted by the caller in the encrypted profile.
 
 use crate::file_transfer::{
-    FileOffer, FileTransferSecrets, MAX_FILE_BYTES, chunk_count, encrypt_chunk,
+    FileOffer, FileTransferSecrets, IncomingFileWriter, MAX_FILE_BYTES, chunk_count, encrypt_chunk,
     expected_plaintext_chunk_len, validate_filename,
 };
 use bytes::Bytes;
@@ -295,6 +295,41 @@ impl EncryptedBlobStore {
     pub fn ciphertext_reader(&self, hash: [u8; 32]) -> iroh_blobs::api::blobs::BlobReader {
         self.store.reader(Hash::from_bytes(hash))
     }
+
+    /// Decrypt a stored attachment chunk by chunk and publish it only after
+    /// the ciphertext digest and complete plaintext size have been verified.
+    pub async fn save_decrypted_file(
+        &self,
+        offer: FileOffer,
+        ciphertext_hash: [u8; 32],
+        destination: impl AsRef<Path>,
+    ) -> Result<std::path::PathBuf, String> {
+        offer.encode()?;
+        let chunk_count = offer.chunk_count;
+        let total_bytes = offer.total_bytes;
+        let mut reader = self.ciphertext_reader(ciphertext_hash);
+        let mut output = IncomingFileWriter::create(offer, destination)?;
+        for index in 0..chunk_count {
+            let plaintext_len = expected_plaintext_chunk_len(total_bytes, index)?;
+            let mut ciphertext = vec![0; plaintext_len + 16];
+            reader
+                .read_exact(&mut ciphertext)
+                .await
+                .map_err(|error| format!("encrypted attachment blob is incomplete: {error}"))?;
+            output.write_chunk(index, &ciphertext)?;
+            tokio::task::yield_now().await;
+        }
+        let mut extra = [0; 1];
+        if reader
+            .read(&mut extra)
+            .await
+            .map_err(|error| format!("could not finish reading encrypted attachment: {error}"))?
+            != 0
+        {
+            return Err("encrypted attachment blob exceeds its offered size".to_owned());
+        }
+        output.finish(&ciphertext_hash)
+    }
 }
 
 /// iroh-blobs provider that refuses requests from devices outside the current
@@ -413,13 +448,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plaintext, source);
-        store.remove(&stored.offer.transfer_id).await.unwrap();
-        assert!(
-            !store
-                .has_reference_for_test(&stored.offer.transfer_id)
-                .await
-                .unwrap()
-        );
+        let transfer_id = stored.offer.transfer_id;
+        let save_path = root.join("saved-crew.txt");
+        store
+            .save_decrypted_file(
+                FileOffer::decode(&stored.offer.encode().unwrap()).unwrap(),
+                stored.ciphertext_hash,
+                &save_path,
+            )
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&save_path).await.unwrap(), source);
+        store.remove(&transfer_id).await.unwrap();
+        assert!(!store.has_reference_for_test(&transfer_id).await.unwrap());
         store.shutdown().await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }

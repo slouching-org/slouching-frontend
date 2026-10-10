@@ -36,7 +36,10 @@ per-file keys, authenticated 48 KiB chunks, a 100 MiB size bound, ciphertext
 digests, bounded streaming encryption/decryption, and a filename-only offer
 format. The app has a private per-user encrypted blob-store location and a
 streaming ciphertext import that checks exact length and digest before adding
-a persistent reference. Encrypted blobs can be fetched over Iroh QUIC;
+a persistent reference. A stored blob can be decrypted chunk by chunk to a
+user-selected path; publication waits for AEAD and ciphertext-digest checks and
+never replaces an existing file. On Unix, plaintext staging files use mode
+0600. Encrypted blobs can be fetched over Iroh QUIC;
 the provider handler requires explicit peer authorization. The SQLCipher
 profile now stores and reloads each group-bound offer, content key, sender key,
 and ciphertext digest. Storage checks the author against the active MLS

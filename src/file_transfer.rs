@@ -255,9 +255,14 @@ impl IncomingFileWriter {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         let temporary = parent.join(format!(".slouching-{transfer_id}.part"));
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
             .open(&temporary)
             .map_err(|error| format!("could not create temporary received file: {error}"))?;
         Ok(Self {
@@ -948,6 +953,15 @@ mod tests {
         let total_bytes = source.len() as u64;
         let offer = FileOffer::from_secrets(&secrets, total_bytes, "received.bin".into()).unwrap();
         let mut receiver = IncomingFileWriter::create(offer, &destination).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let temporary = receiver.temporary.as_ref().unwrap();
+            assert_eq!(
+                std::fs::metadata(temporary).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         let mut digest = blake3::Hasher::new();
         for (index, plaintext) in source.chunks(FILE_CHUNK_PLAINTEXT_BYTES).enumerate() {
             let ciphertext = encrypt_chunk(
