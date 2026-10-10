@@ -141,6 +141,13 @@ remains queued after the first recipient ACK and a database reopen. New members 
 pinned session after the committer admits their KeyPackage. The transcript reloads locally, and **Reenviar pendentes**
 sends queued events for the selected group after reconnecting.
 
+The local SQLCipher database also contains a disabled-by-default storage
+primitive for delegated MLS ciphertext. Its signed grants bind one event to
+one target device; it enforces holder quota and finite expiry, and clears a
+stored copy after recipient ACK. The native UI and peer transport do not yet
+expose this feature, so the current message path still requires a reachable
+group member.
+
 ### Testar fan-out MLS com três dispositivos
 
 Use três máquinas na mesma LAN (A, B e C). Em cada uma, crie uma identidade e

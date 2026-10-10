@@ -1,6 +1,6 @@
 use crate::identity::MlsSigningKeyBinding;
 use directories::ProjectDirs;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use keyring::{Entry, Error as KeyringError};
 use openmls::prelude::{
     BasicCredential, Ciphersuite, CredentialWithKey, GroupId, KeyPackage, KeyPackageIn,
@@ -25,9 +25,14 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 15;
+const PROFILE_SCHEMA_VERSION: u32 = 16;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
+const MAX_DELEGATED_COPY_BYTES: usize = 32 * 1024;
+const MAX_DELEGATED_STORAGE_BYTES: i64 = 64 * 1024 * 1024;
+const MAX_DELEGATED_STORAGE_EVENTS: i64 = 4096;
+const MAX_DELEGATED_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
+const MAX_DELEGATED_CHECKPOINT_BYTES: usize = 16 * 1024;
 type StoredEventEnvelope = (
     Vec<u8>,
     Vec<u8>,
@@ -47,6 +52,16 @@ type StoredInboundEnvelope = (
     Vec<u8>,
 );
 type StoredPriorMlsCommit = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+type StoredDelegatedCopyEnvelope = (
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    i64,
+    Option<Vec<u8>>,
+    i64,
+    Vec<u8>,
+    String,
+);
 
 #[derive(Default)]
 struct OpenMlsJsonCodec;
@@ -138,6 +153,58 @@ pub struct StoredOutboundEvent {
 pub struct StoredInboundEvent {
     pub sequence: i64,
     pub event: EncryptedEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegatedMlsCopyGrant {
+    pub event_id: [u8; 16],
+    pub author_device: [u8; 32],
+    pub recipient_device: [u8; 32],
+    pub group_id: [u8; 16],
+    pub epoch: u64,
+    pub expires_at_unix: i64,
+    pub checkpoint: Option<Vec<u8>>,
+    pub ciphertext_digest: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredDelegatedMlsCopy {
+    pub grant: DelegatedMlsCopyGrant,
+    pub ciphertext: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegatedCopyStoreResult {
+    Stored,
+    AlreadyStored,
+}
+
+pub fn set_delegated_mls_storage_policy(enabled: bool, quota_bytes: i64) -> Result<(), String> {
+    if !(0..=MAX_DELEGATED_STORAGE_BYTES).contains(&quota_bytes) {
+        return Err(format!(
+            "delegated storage quota must be between 0 and {MAX_DELEGATED_STORAGE_BYTES} bytes"
+        ));
+    }
+    let connection = open_local_database()?;
+    let used_bytes: i64 = connection
+        .query_row(
+            "SELECT COALESCE(SUM(length(ciphertext)), 0)
+             FROM local_delegated_mls_copies WHERE delivery_state = 'queued'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("could not read delegated storage usage: {error}"))?;
+    if quota_bytes < used_bytes {
+        return Err("delegated storage quota cannot be lower than current usage".to_owned());
+    }
+    connection
+        .execute(
+            "UPDATE local_delegation_policy SET enabled = ?1, quota_bytes = ?2 WHERE id = 1",
+            params![enabled, quota_bytes],
+        )
+        .map_err(|error| format!("could not save delegated storage policy: {error}"))?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2747,6 +2814,384 @@ fn expire_queued_mls_events_in(connection: &Connection, now: i64) -> Result<usiz
         .map_err(|error| format!("could not expire queued MLS events: {error}"))
 }
 
+/// Signs a bounded authorization for a named helper device to retain one
+/// opaque MLS ciphertext for one recipient until the event expiry.
+pub fn sign_delegated_mls_copy_grant(
+    event: &EncryptedEvent,
+    recipient_device: [u8; 32],
+) -> Result<DelegatedMlsCopyGrant, String> {
+    let entry = identity_key_entry()?;
+    let identity = signing_key_from_secret(
+        entry
+            .get_secret()
+            .map_err(|error| format!("could not load the device identity key: {error}"))?,
+    )?;
+    sign_delegated_mls_copy_grant_with_identity(event, recipient_device, &identity)
+}
+
+fn sign_delegated_mls_copy_grant_with_identity(
+    event: &EncryptedEvent,
+    recipient_device: [u8; 32],
+    identity: &SigningKey,
+) -> Result<DelegatedMlsCopyGrant, String> {
+    if event.author_device != identity.verifying_key().to_bytes() {
+        return Err("only the event author device can authorize a delegated copy".to_owned());
+    }
+    if event.group_id.len() != 16
+        || event.ciphertext.is_empty()
+        || event.ciphertext.len() > MAX_DELEGATED_COPY_BYTES
+        || event
+            .checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.len() > MAX_DELEGATED_CHECKPOINT_BYTES)
+    {
+        return Err("delegated MLS event has an invalid or oversized envelope".to_owned());
+    }
+    let group_id = fixed_bytes(event.group_id.clone(), "MLS group ID")?;
+    let ciphertext_digest = *blake3::hash(&event.ciphertext).as_bytes();
+    let mut grant = DelegatedMlsCopyGrant {
+        event_id: event.event_id,
+        author_device: event.author_device,
+        recipient_device,
+        group_id,
+        epoch: event.epoch,
+        expires_at_unix: event.expires_at_unix,
+        checkpoint: event.checkpoint.clone(),
+        ciphertext_digest,
+        signature: [0; 64],
+    };
+    grant.signature = identity
+        .sign(&delegated_copy_signature_payload(&grant))
+        .to_bytes();
+    Ok(grant)
+}
+
+/// Stores an opaque event only when the authenticated session peer is the
+/// author named by its device signature and local delegated storage is enabled.
+pub fn store_delegated_mls_copy(
+    grant: &DelegatedMlsCopyGrant,
+    event: &EncryptedEvent,
+    authenticated_author: [u8; 32],
+) -> Result<DelegatedCopyStoreResult, String> {
+    let mut connection = open_local_database()?;
+    store_delegated_mls_copy_in(
+        &mut connection,
+        grant,
+        event,
+        authenticated_author,
+        unix_time_now()?,
+    )
+}
+
+fn store_delegated_mls_copy_in(
+    connection: &mut Connection,
+    grant: &DelegatedMlsCopyGrant,
+    event: &EncryptedEvent,
+    authenticated_author: [u8; 32],
+    now: i64,
+) -> Result<DelegatedCopyStoreResult, String> {
+    validate_delegated_copy_grant(grant, event, authenticated_author, now)?;
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("could not begin delegated MLS copy transaction: {error}"))?;
+    transaction
+        .execute(
+            "UPDATE local_delegated_mls_copies
+             SET delivery_state = 'expired', ciphertext = NULL
+             WHERE delivery_state = 'queued' AND expires_at_unix <= ?1",
+            [now],
+        )
+        .map_err(|error| format!("could not expire delegated MLS copies: {error}"))?;
+    cleanup_delegated_mls_tombstones(&transaction, now)?;
+    let existing: Option<StoredDelegatedCopyEnvelope> = transaction
+        .query_row(
+            "SELECT ciphertext_digest, author_device, group_id, epoch, checkpoint,
+                    expires_at_unix, grant_signature, delivery_state
+             FROM local_delegated_mls_copies
+             WHERE event_id = ?1 AND recipient_device = ?2",
+            params![grant.event_id.as_slice(), grant.recipient_device.as_slice()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("could not check delegated MLS copy deduplication: {error}"))?;
+    if let Some((digest, author, group, epoch, checkpoint, expires, signature, _state)) = existing {
+        if digest != grant.ciphertext_digest
+            || author != grant.author_device
+            || group != grant.group_id
+            || epoch != grant.epoch as i64
+            || checkpoint != grant.checkpoint
+            || expires != grant.expires_at_unix
+            || signature != grant.signature
+        {
+            return Err(
+                "delegated event ID was reused with different content or authorization".to_owned(),
+            );
+        }
+        transaction.commit().map_err(|error| {
+            format!("could not finish delegated MLS copy deduplication: {error}")
+        })?;
+        return Ok(DelegatedCopyStoreResult::AlreadyStored);
+    }
+    let (enabled, quota_bytes): (bool, i64) = transaction
+        .query_row(
+            "SELECT enabled, quota_bytes FROM local_delegation_policy WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| format!("could not load delegated storage policy: {error}"))?;
+    if !enabled {
+        return Err("this device has not enabled delegated ciphertext storage".to_owned());
+    }
+    let used_bytes: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(SUM(length(ciphertext)), 0)
+             FROM local_delegated_mls_copies WHERE delivery_state = 'queued'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("could not read delegated storage usage: {error}"))?;
+    let used_events: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM local_delegated_mls_copies
+             WHERE delivery_state = 'queued'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("could not read delegated event usage: {error}"))?;
+    let copy_bytes = i64::try_from(event.ciphertext.len())
+        .map_err(|_| "delegated MLS copy exceeds the storage limit".to_owned())?;
+    if used_bytes.saturating_add(copy_bytes) > quota_bytes
+        || used_events >= MAX_DELEGATED_STORAGE_EVENTS
+    {
+        return Err("delegated ciphertext storage quota is full".to_owned());
+    }
+    transaction
+        .execute(
+            "INSERT INTO local_delegated_mls_copies (
+                 event_id, recipient_device, author_device, group_id, epoch,
+                 checkpoint, expires_at_unix, ciphertext_digest, ciphertext,
+                 grant_signature, delivery_state
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'queued')",
+            params![
+                grant.event_id.as_slice(),
+                grant.recipient_device.as_slice(),
+                grant.author_device.as_slice(),
+                grant.group_id.as_slice(),
+                grant.epoch as i64,
+                grant.checkpoint,
+                grant.expires_at_unix,
+                grant.ciphertext_digest.as_slice(),
+                event.ciphertext,
+                grant.signature.as_slice(),
+            ],
+        )
+        .map_err(|error| format!("could not persist delegated MLS ciphertext: {error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("could not commit delegated MLS ciphertext: {error}"))?;
+    Ok(DelegatedCopyStoreResult::Stored)
+}
+
+pub fn list_delegated_mls_copies_for_device(
+    recipient_device: [u8; 32],
+    limit: usize,
+) -> Result<Vec<StoredDelegatedMlsCopy>, String> {
+    if !(1..=100).contains(&limit) {
+        return Err("delegated MLS copy page size must be between 1 and 100".to_owned());
+    }
+    let connection = open_local_database()?;
+    list_delegated_mls_copies_for_device_in(&connection, recipient_device, limit, unix_time_now()?)
+}
+
+fn list_delegated_mls_copies_for_device_in(
+    connection: &Connection,
+    recipient_device: [u8; 32],
+    limit: usize,
+    now: i64,
+) -> Result<Vec<StoredDelegatedMlsCopy>, String> {
+    connection
+        .execute(
+            "UPDATE local_delegated_mls_copies
+             SET delivery_state = 'expired', ciphertext = NULL
+             WHERE delivery_state = 'queued' AND expires_at_unix <= ?1",
+            [now],
+        )
+        .map_err(|error| format!("could not expire delegated MLS copies: {error}"))?;
+    cleanup_delegated_mls_tombstones(connection, now)?;
+    let enabled: bool = connection
+        .query_row(
+            "SELECT enabled FROM local_delegation_policy WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("could not read delegated storage policy: {error}"))?;
+    if !enabled {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT event_id, author_device, group_id, epoch, checkpoint,
+                    expires_at_unix, ciphertext_digest, grant_signature, ciphertext
+             FROM local_delegated_mls_copies
+             WHERE recipient_device = ?1 AND delivery_state = 'queued'
+             ORDER BY expires_at_unix, event_id LIMIT ?2",
+        )
+        .map_err(|error| format!("could not prepare delegated MLS mailbox query: {error}"))?;
+    let rows = statement
+        .query_map(params![recipient_device.as_slice(), limit as i64], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<Vec<u8>>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
+                row.get::<_, Vec<u8>>(7)?,
+                row.get::<_, Vec<u8>>(8)?,
+            ))
+        })
+        .map_err(|error| format!("could not query delegated MLS mailbox: {error}"))?;
+    rows.map(|row| {
+        let (id, author, group, epoch, checkpoint, expires, digest, signature, ciphertext) =
+            row.map_err(|error| format!("could not read delegated MLS mailbox entry: {error}"))?;
+        let grant = DelegatedMlsCopyGrant {
+            event_id: fixed_bytes(id, "delegated event ID")?,
+            author_device: fixed_bytes(author, "delegated author device")?,
+            recipient_device,
+            group_id: fixed_bytes(group, "delegated group ID")?,
+            epoch: u64::try_from(epoch)
+                .map_err(|_| "delegated MLS copy has an invalid epoch".to_owned())?,
+            expires_at_unix: expires,
+            checkpoint,
+            ciphertext_digest: fixed_bytes(digest, "delegated ciphertext digest")?,
+            signature: fixed_bytes(signature, "delegated copy signature")?,
+        };
+        let event = EncryptedEvent {
+            event_id: grant.event_id,
+            author_device: grant.author_device,
+            group_id: grant.group_id.to_vec(),
+            epoch: grant.epoch,
+            checkpoint: grant.checkpoint.clone(),
+            expires_at_unix: grant.expires_at_unix,
+            ciphertext: ciphertext.clone(),
+        };
+        validate_delegated_copy_grant(&grant, &event, grant.author_device, now)?;
+        Ok(StoredDelegatedMlsCopy { grant, ciphertext })
+    })
+    .collect()
+}
+
+pub fn acknowledge_delegated_mls_copy(
+    event_id: [u8; 16],
+    recipient_device: [u8; 32],
+) -> Result<bool, String> {
+    let connection = open_local_database()?;
+    acknowledge_delegated_mls_copy_in(&connection, event_id, recipient_device, unix_time_now()?)
+}
+
+fn acknowledge_delegated_mls_copy_in(
+    connection: &Connection,
+    event_id: [u8; 16],
+    recipient_device: [u8; 32],
+    now: i64,
+) -> Result<bool, String> {
+    connection
+        .execute(
+            "UPDATE local_delegated_mls_copies
+             SET delivery_state = 'expired', ciphertext = NULL
+             WHERE event_id = ?1 AND recipient_device = ?2
+               AND delivery_state = 'queued' AND expires_at_unix <= ?3",
+            params![event_id.as_slice(), recipient_device.as_slice(), now],
+        )
+        .map_err(|error| format!("could not expire acknowledged MLS copy: {error}"))?;
+    cleanup_delegated_mls_tombstones(connection, now)?;
+    let changed = connection
+        .execute(
+            "UPDATE local_delegated_mls_copies
+             SET delivery_state = 'received_by_device', ciphertext = NULL
+             WHERE event_id = ?1 AND recipient_device = ?2
+               AND delivery_state = 'queued' AND expires_at_unix > ?3",
+            params![event_id.as_slice(), recipient_device.as_slice(), now],
+        )
+        .map_err(|error| format!("could not acknowledge delegated MLS copy: {error}"))?;
+    Ok(changed == 1)
+}
+
+fn cleanup_delegated_mls_tombstones(connection: &Connection, now: i64) -> Result<usize, String> {
+    connection
+        .execute(
+            "DELETE FROM local_delegated_mls_copies
+             WHERE delivery_state != 'queued' AND expires_at_unix <= ?1",
+            [now.saturating_sub(MAX_DELEGATED_TTL_SECONDS)],
+        )
+        .map_err(|error| format!("could not clean up delegated MLS tombstones: {error}"))
+}
+
+fn validate_delegated_copy_grant(
+    grant: &DelegatedMlsCopyGrant,
+    event: &EncryptedEvent,
+    authenticated_author: [u8; 32],
+    now: i64,
+) -> Result<(), String> {
+    if authenticated_author != grant.author_device
+        || grant.event_id.iter().all(|byte| *byte == 0)
+        || grant.author_device.iter().all(|byte| *byte == 0)
+        || grant.recipient_device.iter().all(|byte| *byte == 0)
+        || event.author_device != grant.author_device
+        || event.event_id != grant.event_id
+        || event.group_id.as_slice() != grant.group_id
+        || event.epoch != grant.epoch
+        || event.expires_at_unix != grant.expires_at_unix
+        || event.checkpoint != grant.checkpoint
+        || event.ciphertext.is_empty()
+        || event.ciphertext.len() > MAX_DELEGATED_COPY_BYTES
+        || grant.expires_at_unix <= now
+        || grant.expires_at_unix > now.saturating_add(MAX_DELEGATED_TTL_SECONDS)
+        || grant.epoch > i64::MAX as u64
+        || grant
+            .checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.len() > MAX_DELEGATED_CHECKPOINT_BYTES)
+        || blake3::hash(&event.ciphertext).as_bytes() != &grant.ciphertext_digest
+    {
+        return Err("delegated MLS copy grant does not match a valid event".to_owned());
+    }
+    let verifying_key = VerifyingKey::from_bytes(&grant.author_device)
+        .map_err(|_| "delegated MLS copy author key is invalid".to_owned())?;
+    let signature = Signature::from_bytes(&grant.signature);
+    verifying_key
+        .verify_strict(&delegated_copy_signature_payload(grant), &signature)
+        .map_err(|_| "delegated MLS copy authorization signature is invalid".to_owned())
+}
+
+fn delegated_copy_signature_payload(grant: &DelegatedMlsCopyGrant) -> Vec<u8> {
+    let checkpoint = grant.checkpoint.as_deref().unwrap_or_default();
+    let mut payload = Vec::with_capacity(160 + checkpoint.len());
+    payload.extend_from_slice(b"slouching/delegated-mls-copy/v1");
+    payload.extend_from_slice(&grant.event_id);
+    payload.extend_from_slice(&grant.author_device);
+    payload.extend_from_slice(&grant.recipient_device);
+    payload.extend_from_slice(&grant.group_id);
+    payload.extend_from_slice(&grant.epoch.to_be_bytes());
+    payload.extend_from_slice(&grant.expires_at_unix.to_be_bytes());
+    payload.extend_from_slice(&(checkpoint.len() as u32).to_be_bytes());
+    payload.extend_from_slice(checkpoint);
+    payload.extend_from_slice(&grant.ciphertext_digest);
+    payload
+}
+
 pub fn load_identity_public_key() -> Result<Option<[u8; 32]>, String> {
     let entry = identity_key_entry()?;
     match entry.get_secret() {
@@ -4373,6 +4818,43 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
                  PRAGMA user_version = 15;",
             )
             .map_err(|error| format!("could not create MLS event recipient ledger: {error}"))?;
+    }
+    if version < 16 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE local_delegation_policy (
+                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                     enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                     quota_bytes INTEGER NOT NULL CHECK (quota_bytes BETWEEN 0 AND 67108864)
+                 );
+                 INSERT INTO local_delegation_policy (id, enabled, quota_bytes)
+                     VALUES (1, 0, 67108864);
+                 CREATE TABLE local_delegated_mls_copies (
+                     event_id BLOB NOT NULL CHECK (length(event_id) = 16),
+                     recipient_device BLOB NOT NULL CHECK (length(recipient_device) = 32),
+                     author_device BLOB NOT NULL CHECK (length(author_device) = 32),
+                     group_id BLOB NOT NULL CHECK (length(group_id) = 16),
+                     epoch INTEGER NOT NULL CHECK (epoch >= 0),
+                     checkpoint BLOB,
+                     expires_at_unix INTEGER NOT NULL CHECK (expires_at_unix > 0),
+                     ciphertext_digest BLOB NOT NULL CHECK (length(ciphertext_digest) = 32),
+                     ciphertext BLOB,
+                     grant_signature BLOB NOT NULL CHECK (length(grant_signature) = 64),
+                     delivery_state TEXT NOT NULL CHECK (
+                         delivery_state IN ('queued', 'received_by_device', 'expired')
+                     ),
+                     PRIMARY KEY (event_id, recipient_device),
+                     CHECK (
+                         (delivery_state = 'queued' AND ciphertext IS NOT NULL
+                             AND length(ciphertext) BETWEEN 1 AND 32768)
+                         OR (delivery_state != 'queued' AND ciphertext IS NULL)
+                     )
+                 );
+                 CREATE INDEX local_delegated_mls_copies_by_recipient
+                     ON local_delegated_mls_copies(recipient_device, delivery_state, expires_at_unix);
+                 PRAGMA user_version = 16;",
+            )
+            .map_err(|error| format!("could not create delegated MLS copy storage: {error}"))?;
     }
     transaction
         .commit()
@@ -6036,5 +6518,178 @@ mod tests {
         drop(second_receiver);
         drop(sender);
         fs::remove_dir_all(directory).expect("temporary databases should be removed");
+    }
+
+    #[test]
+    fn delegated_mls_copies_require_authorization_opt_in_quota_and_recipient_ack() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-delegated-mls-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary database directory should be created");
+        let mut connection = open_database(&directory.join("helper.sqlite3"), &[0xa1; 32])
+            .expect("helper database should initialize");
+        let author = SigningKey::from_bytes(&[0xa2; 32]);
+        let recipient = [0xa3; 32];
+        let now = 2_000_000_000;
+        let event = EncryptedEvent {
+            event_id: [0xa4; 16],
+            author_device: author.verifying_key().to_bytes(),
+            group_id: vec![0xa5; 16],
+            epoch: 7,
+            checkpoint: Some(vec![0xa6; 8]),
+            expires_at_unix: now + 100,
+            ciphertext: b"cipher!!".to_vec(),
+        };
+        let grant = sign_delegated_mls_copy_grant_with_identity(&event, recipient, &author)
+            .expect("author should sign a recipient-bound copy grant");
+        assert!(
+            store_delegated_mls_copy_in(&mut connection, &grant, &event, event.author_device, now)
+                .is_err()
+        );
+        connection
+            .execute(
+                "UPDATE local_delegation_policy SET enabled = 1, quota_bytes = 8 WHERE id = 1",
+                [],
+            )
+            .expect("test helper should opt into delegated storage");
+        assert!(
+            store_delegated_mls_copy_in(&mut connection, &grant, &event, [0xff; 32], now).is_err()
+        );
+        let mut wrong_target_grant = grant.clone();
+        wrong_target_grant.recipient_device = [0xae; 32];
+        assert!(
+            store_delegated_mls_copy_in(
+                &mut connection,
+                &wrong_target_grant,
+                &event,
+                event.author_device,
+                now,
+            )
+            .is_err()
+        );
+        let too_long = EncryptedEvent {
+            event_id: [0xaf; 16],
+            expires_at_unix: now + MAX_DELEGATED_TTL_SECONDS + 1,
+            ..event.clone()
+        };
+        let too_long_grant =
+            sign_delegated_mls_copy_grant_with_identity(&too_long, recipient, &author)
+                .expect("author can sign an event that the helper must reject for its long TTL");
+        assert!(
+            store_delegated_mls_copy_in(
+                &mut connection,
+                &too_long_grant,
+                &too_long,
+                event.author_device,
+                now,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            store_delegated_mls_copy_in(&mut connection, &grant, &event, event.author_device, now)
+                .expect("valid authorized copy should persist"),
+            DelegatedCopyStoreResult::Stored
+        );
+        assert_eq!(
+            store_delegated_mls_copy_in(&mut connection, &grant, &event, event.author_device, now)
+                .expect("exact repeated copy should deduplicate"),
+            DelegatedCopyStoreResult::AlreadyStored
+        );
+        assert!(
+            list_delegated_mls_copies_for_device_in(&connection, [0xa7; 32], 10, now)
+                .expect("other recipient mailbox should be empty")
+                .is_empty()
+        );
+        let copies = list_delegated_mls_copies_for_device_in(&connection, recipient, 10, now)
+            .expect("authorized target should list its pending copy");
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].grant, grant);
+        assert_eq!(copies[0].ciphertext, event.ciphertext);
+        assert!(
+            !acknowledge_delegated_mls_copy_in(&connection, event.event_id, [0xa7; 32], now)
+                .expect("wrong recipient should not acknowledge another device's copy")
+        );
+        assert!(
+            acknowledge_delegated_mls_copy_in(&connection, event.event_id, recipient, now)
+                .expect("recipient should acknowledge the stored copy")
+        );
+        assert!(
+            !acknowledge_delegated_mls_copy_in(&connection, event.event_id, recipient, now)
+                .expect("duplicate ACK should be idempotent")
+        );
+        let stored_state: (String, Option<Vec<u8>>) = connection
+            .query_row(
+                "SELECT delivery_state, ciphertext FROM local_delegated_mls_copies
+                 WHERE event_id = ?1 AND recipient_device = ?2",
+                params![event.event_id.as_slice(), recipient.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("copy receipt should retain a tombstone and clear the ciphertext");
+        assert_eq!(stored_state, ("received_by_device".to_owned(), None));
+
+        let expiring = EncryptedEvent {
+            event_id: [0xa8; 16],
+            expires_at_unix: now + 50,
+            ciphertext: b"12345678".to_vec(),
+            ..event.clone()
+        };
+        let expiring_grant =
+            sign_delegated_mls_copy_grant_with_identity(&expiring, recipient, &author)
+                .expect("author should sign the second target copy");
+        assert_eq!(
+            store_delegated_mls_copy_in(
+                &mut connection,
+                &expiring_grant,
+                &expiring,
+                event.author_device,
+                now
+            )
+            .expect("copy within quota should persist"),
+            DelegatedCopyStoreResult::Stored
+        );
+        let over_quota = EncryptedEvent {
+            event_id: [0xa9; 16],
+            ciphertext: b"x".to_vec(),
+            ..expiring.clone()
+        };
+        let over_quota_grant =
+            sign_delegated_mls_copy_grant_with_identity(&over_quota, recipient, &author)
+                .expect("author should sign the quota test copy");
+        assert!(
+            store_delegated_mls_copy_in(
+                &mut connection,
+                &over_quota_grant,
+                &over_quota,
+                event.author_device,
+                now,
+            )
+            .is_err()
+        );
+        assert!(
+            list_delegated_mls_copies_for_device_in(
+                &connection,
+                recipient,
+                10,
+                expiring.expires_at_unix,
+            )
+            .expect("expired copies should not be offered to recipients")
+            .is_empty()
+        );
+        let expired_state: (String, Option<Vec<u8>>) = connection
+            .query_row(
+                "SELECT delivery_state, ciphertext FROM local_delegated_mls_copies
+                 WHERE event_id = ?1 AND recipient_device = ?2",
+                params![expiring.event_id.as_slice(), recipient.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("expired receipt tombstone should persist");
+        assert_eq!(expired_state, ("expired".to_owned(), None));
+        drop(connection);
+        fs::remove_dir_all(directory).expect("temporary helper database should be removed");
     }
 }

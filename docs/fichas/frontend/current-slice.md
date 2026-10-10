@@ -19,6 +19,15 @@ The receiver validates the sender binding and event metadata, advances the
 ratchet, stores ciphertext and the local transcript in SQLCipher, then ACKs.
 Each application event atomically snapshots the current peer devices with its ciphertext and ratchet update. Per-device ACKs keep other recipients queued; the global outbox entry closes only after all snapshot members ACK. Direct send checks that the pinned peer is in this snapshot, and queued events can be retried for that peer after reconnecting. The fan-out control sends messages through saved routes in order, after that member's pending Commit chain is clear. An unreachable peer remains queued while other members continue. Membership Commit bytes and the predecessor-epoch member roster are saved atomically with the merged group state. The MLS screen drains pending Commits in epoch order over the active pinned QUIC session, sending only to devices in each Commit's predecessor-epoch recipient snapshot. It waits for each durable ACK before advancing. If a device receives a later Commit before its expected predecessor, it requests that epoch over the pinned session; the committer can return an already-ACKed Commit only to a device in its original recipient snapshot. Newly invited members are excluded; a removed device can receive the Commit that removes it. The receiver validates envelope metadata, MLS signature, group, predecessor epoch, designated committer, and device-bound credentials before atomically persisting the Commit and journal record; transport ACK follows persistence and is durably recorded per recipient on the sender. The UI shows each eligible device's saved adoption ACK. Exact redelivery is idempotent. The fan-out control visits recipients with queued Commits and saved routes in turn, sends bounded ordered batches, and persists each ACK before continuing. An unavailable peer does not stop the others; its Commits remain queued for retry. Routes can be stale and are learned from successful outbound pinned connections. Offline delivery and concurrent proposal handling remain open.
 
+The encrypted local profile now has a disabled-by-default delegated MLS-copy
+store. It accepts ciphertext only with an Ed25519 grant from the authenticated
+author device, bound to one recipient and one event digest. It enforces a 64
+MiB / 4,096-event holder quota, a 32 KiB item limit, and a 30-day maximum TTL;
+it retains bounded deduplication receipts and removes ciphertext after ACK or
+expiry. Peer transport, recipient fetch, visible opt-in controls, and
+multi-holder replication are still pending, so this storage primitive is not
+yet an offline delivery feature.
+
 Before applying a next-epoch Commit, the client stores the prior OpenMLS group
 state in the encrypted profile database. If a different Commit later arrives
 for an already accepted predecessor epoch, the client restores that snapshot
