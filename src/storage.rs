@@ -307,6 +307,14 @@ pub struct StoredMlsMessage {
     pub event_id: [u8; 16],
     pub direction: DirectMessageDirection,
     pub text: String,
+    pub delivery_receipt: Option<MlsEventDeliveryReceipt>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MlsEventDeliveryReceipt {
+    pub state: OutboundDeliveryState,
+    pub recipients: usize,
+    pub delivered: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -885,10 +893,18 @@ fn list_mls_messages_in(
 ) -> Result<Vec<StoredMlsMessage>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT sequence, event_id, direction, text FROM (
+            "SELECT m.sequence, m.event_id, m.direction, m.text,
+                    e.delivery_state, COUNT(r.device_public_key),
+                    COALESCE(SUM(CASE WHEN r.delivery_state = 'delivered' THEN 1 ELSE 0 END), 0)
+             FROM (
                  SELECT sequence, event_id, direction, text FROM local_mls_messages
                  WHERE group_id = ?1 ORDER BY sequence DESC LIMIT ?2
-             ) ORDER BY sequence ASC",
+             ) m
+             LEFT JOIN local_events e ON e.event_id = m.event_id
+                 AND e.direction = 'outbound' AND m.direction = 'sent'
+             LEFT JOIN local_mls_event_recipients r ON r.event_id = e.event_id
+             GROUP BY m.sequence, m.event_id, m.direction, m.text, e.delivery_state
+             ORDER BY m.sequence ASC",
         )
         .map_err(|error| format!("could not prepare MLS history query: {error}"))?;
     let rows = statement
@@ -898,17 +914,37 @@ fn list_mls_messages_in(
                 row.get::<_, Vec<u8>>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })
         .map_err(|error| format!("could not query MLS history: {error}"))?;
     rows.map(|row| {
-        let (sequence, event_id, direction, text) =
+        let (sequence, event_id, direction, text, state, recipients, delivered) =
             row.map_err(|error| format!("could not read MLS history row: {error}"))?;
+        let direction = DirectMessageDirection::try_from(direction.as_str())?;
+        let delivery_receipt = if direction == DirectMessageDirection::Sent {
+            Some(MlsEventDeliveryReceipt {
+                state: state
+                    .as_deref()
+                    .map(OutboundDeliveryState::try_from)
+                    .transpose()?
+                    .unwrap_or(OutboundDeliveryState::Queued),
+                recipients: usize::try_from(recipients)
+                    .map_err(|_| "MLS receipt has an invalid recipient count".to_owned())?,
+                delivered: usize::try_from(delivered)
+                    .map_err(|_| "MLS receipt has an invalid ACK count".to_owned())?,
+            })
+        } else {
+            None
+        };
         Ok(StoredMlsMessage {
             sequence,
             event_id: fixed_bytes(event_id, "MLS event id")?,
-            direction: DirectMessageDirection::try_from(direction.as_str())?,
+            direction,
             text,
+            delivery_receipt,
         })
     })
     .collect()
@@ -8206,6 +8242,14 @@ mod tests {
         assert_eq!(sender_history.len(), 1);
         assert_eq!(sender_history[0].direction, DirectMessageDirection::Sent);
         assert_eq!(sender_history[0].text, "MLS application payload");
+        assert_eq!(
+            sender_history[0].delivery_receipt,
+            Some(MlsEventDeliveryReceipt {
+                state: OutboundDeliveryState::Queued,
+                recipients: 2,
+                delivered: 0,
+            })
+        );
         mark_mls_event_delivered_to_peer_in(
             &mut sender,
             prepared.event.event_id,
@@ -8218,6 +8262,16 @@ mod tests {
             receiver_identity.verifying_key().to_bytes(),
         )
         .expect("duplicate event ACK should be idempotent");
+        let partial_receipt = list_mls_messages_in(&sender, &group.group_id, 20)
+            .expect("partial recipient ACK should appear in the local transcript");
+        assert_eq!(
+            partial_receipt[0].delivery_receipt,
+            Some(MlsEventDeliveryReceipt {
+                state: OutboundDeliveryState::Queued,
+                recipients: 2,
+                delivered: 1,
+            })
+        );
         let remaining = list_queued_mls_events_for_peer_in(
             &sender,
             &group.group_id,
@@ -8248,6 +8302,16 @@ mod tests {
             )
             .expect("global event should leave the outbox after all ACKs");
         assert_eq!(final_state, "held_by_peer");
+        let delivered_receipt = list_mls_messages_in(&sender, &group.group_id, 20)
+            .expect("all recipient ACKs should appear in the local transcript");
+        assert_eq!(
+            delivered_receipt[0].delivery_receipt,
+            Some(MlsEventDeliveryReceipt {
+                state: OutboundDeliveryState::HeldByPeer,
+                recipients: 2,
+                delivered: 2,
+            })
+        );
         assert!(
             list_queued_mls_events_for_peer_in(
                 &sender,

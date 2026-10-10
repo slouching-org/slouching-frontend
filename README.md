@@ -322,6 +322,11 @@ skipped until its group epoch is current; unavailable peers remain queued. New
 MLS chat events expire after 30 days. Expired events leave the retry queue,
 recipients reject new expired events before changing their MLS ratchet, and
 fan-out status reports the number that expired during the run.
+The local transcript shows how many recipient devices have durably saved each
+sent message, including partial delivery and expiry. Device confirmation means
+the event was persisted; it does not mean a person read it.
+Peer and mailbox copy counts are reported separately by the fan-out result and
+do not count as recipient delivery.
 Membership Commits are also saved atomically with the
 group epoch in a separate local outbox; the latest pending Commit is restored
 from SQLCipher and can be sent from the MLS screen over an active direct
@@ -349,12 +354,12 @@ remains queued after the first recipient ACK and a database reopen. New members 
 pinned session after the committer admits their KeyPackage. The transcript reloads locally, and **Reenviar pendentes**
 sends queued events for the selected group after reconnecting.
 
-The local SQLCipher database also contains a disabled-by-default storage
-primitive for delegated MLS ciphertext. Its signed grants bind one event to
-one target device; it enforces holder quota and finite expiry, and clears a
-stored copy after recipient ACK. The native UI and peer transport do not yet
-expose this feature, so the current message path still requires a reachable
-group member.
+The local SQLCipher database and native UI expose disabled-by-default storage
+for delegated MLS ciphertext. Signed grants bind one event to one target
+device; the holder enforces quota and finite expiry, then clears a stored copy
+after recipient ACK. A group member or optional Elixir mailbox can hold a copy
+when direct delivery fails. The sender's outbox remains pending until the
+recipient device confirms MLS processing; helper storage is not delivery.
 
 ### Testar fan-out MLS com três dispositivos
 
@@ -656,6 +661,10 @@ the local frontend repository in a Wayland or X11 session.
 The remote mailbox settings capture was also attempted in this headless
 checkout and could not render without `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, or
 `DISPLAY`; use the command above in a graphical session.
+The MLS transcript now renders per-device ACK counts on sent messages. Its
+updated screenshot could not be captured in this headless checkout for the same
+missing-display reason; use the `11-mls` capture command above in a graphical
+session.
 
 Assets and font license/provenance notes are in [assets/README.md](assets/README.md).
 

@@ -2338,6 +2338,27 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 .iter()
                 .map(|message| {
                     let outgoing = message.direction == storage::DirectMessageDirection::Sent;
+                    let delivery_label = message.delivery_receipt.map(|receipt| {
+                        if receipt.state == storage::OutboundDeliveryState::Expired {
+                            "Expirada · sem confirmação de todos os dispositivos".to_owned()
+                        } else if receipt.state == storage::OutboundDeliveryState::Failed {
+                            "Falha de entrega · evento preservado localmente".to_owned()
+                        } else if receipt.recipients == 0 {
+                            "Salva localmente · nenhum dispositivo no snapshot".to_owned()
+                        } else if receipt.delivered == receipt.recipients {
+                            format!("Recebida por todos os {} dispositivos", receipt.recipients)
+                        } else if receipt.delivered > 0 {
+                            format!(
+                                "Recebida por {} de {} dispositivos · aguardando os demais",
+                                receipt.delivered, receipt.recipients
+                            )
+                        } else {
+                            format!(
+                                "Aguardando recebimento por {} dispositivos",
+                                receipt.recipients
+                            )
+                        }
+                    });
                     let content: Element<'_, Message> =
                         match FileAttachmentOffer::decode_mls_text(&message.text) {
                             Ok(Some(attachment)) => {
@@ -2358,7 +2379,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
                                     save,
                                     l.label(
                                         if outgoing {
-                                            "Enviado · MLS"
+                                            delivery_label.as_deref().unwrap_or("Enviado · MLS")
                                         } else {
                                             "Recebido · MLS"
                                         },
@@ -2373,7 +2394,9 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
                                 l.label(message.text.clone(), 13.0, PAPER),
                                 l.label(
                                     if outgoing {
-                                        "Enviada · sessão atual"
+                                        delivery_label
+                                            .as_deref()
+                                            .unwrap_or("Enviada · sessão atual")
                                     } else {
                                         "Recebida · sessão atual"
                                     },

@@ -5502,6 +5502,9 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         format!("Peer confirmou o evento, mas o estado local falhou: {error}")
                 }
             }
+            if let Some(group_id) = state.mls_history_group.clone() {
+                return load_mls_history(state, group_id);
+            }
         }
     }
     Task::none()
@@ -5820,6 +5823,7 @@ fn boot() -> (Slouching, Task<Message>) {
             event_id: [0x6d; 16],
             direction: storage::DirectMessageDirection::Received,
             text: attachment,
+            delivery_receipt: None,
         }];
     }
     if args.iter().any(|arg| arg == "--capture-call-negotiation") {
