@@ -25,7 +25,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 16;
+const PROFILE_SCHEMA_VERSION: u32 = 17;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 const MAX_DELEGATED_COPY_BYTES: usize = 32 * 1024;
@@ -1281,6 +1281,12 @@ pub struct LocalProfile {
     pub familiar: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PeerRelayConfig {
+    pub url: String,
+    pub token: String,
+}
+
 pub fn familiar_id(label: &str) -> &'static str {
     match label {
         "Gnomo" => "gnome",
@@ -1342,6 +1348,50 @@ pub fn save_profile(profile: &LocalProfile) -> Result<(), String> {
             params![display_name, profile.familiar],
         )
         .map_err(|error| format!("could not save encrypted local profile: {error}"))?;
+    Ok(())
+}
+
+pub fn load_peer_relay_config() -> Result<PeerRelayConfig, String> {
+    load_peer_relay_config_in(&open_local_database()?)
+}
+
+fn load_peer_relay_config_in(connection: &Connection) -> Result<PeerRelayConfig, String> {
+    connection
+        .query_row(
+            "SELECT relay_url, access_token FROM local_peer_relay_config WHERE id = 1",
+            [],
+            |row| {
+                Ok(PeerRelayConfig {
+                    url: row.get(0)?,
+                    token: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map(|config| config.unwrap_or_default())
+        .map_err(|error| format!("could not load participant relay settings: {error}"))
+}
+
+pub fn save_peer_relay_config(config: &PeerRelayConfig) -> Result<(), String> {
+    save_peer_relay_config_in(&open_local_database()?, config)
+}
+
+fn save_peer_relay_config_in(
+    connection: &Connection,
+    config: &PeerRelayConfig,
+) -> Result<(), String> {
+    if config.url.len() > 2048 || config.token.len() > 512 {
+        return Err("relay URL or access token exceeds its size limit".to_owned());
+    }
+    connection
+        .execute(
+            "INSERT INTO local_peer_relay_config (id, relay_url, access_token)
+             VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET relay_url = excluded.relay_url,
+                 access_token = excluded.access_token",
+            params![config.url, config.token],
+        )
+        .map_err(|error| format!("could not save participant relay settings: {error}"))?;
     Ok(())
 }
 
@@ -4939,6 +4989,20 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
             )
             .map_err(|error| format!("could not create delegated MLS copy storage: {error}"))?;
     }
+    if version < 17 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE local_peer_relay_config (
+                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                     relay_url TEXT NOT NULL CHECK (length(relay_url) <= 2048),
+                     access_token TEXT NOT NULL CHECK (length(access_token) <= 512)
+                 );
+                 INSERT INTO local_peer_relay_config (id, relay_url, access_token)
+                     VALUES (1, '', '');
+                 PRAGMA user_version = 17;",
+            )
+            .map_err(|error| format!("could not create local relay settings: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -6820,5 +6884,39 @@ mod tests {
         );
         drop(connection);
         fs::remove_dir_all(directory).expect("temporary helper database should be removed");
+    }
+
+    #[test]
+    fn participant_relay_url_and_token_persist_in_encrypted_profile() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-relay-config-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary relay database directory should exist");
+        let path = directory.join("profile.sqlite3");
+        let key = [0x72; PROFILE_DB_KEY_LEN];
+        let config = PeerRelayConfig {
+            url: "https://relay.crew.example".to_owned(),
+            token: "crew-shared-token-0123456789".to_owned(),
+        };
+        let connection = open_database(&path, &key).expect("encrypted schema should migrate");
+        save_peer_relay_config_in(&connection, &config)
+            .expect("relay URL and token should be stored");
+        assert_eq!(
+            load_peer_relay_config_in(&connection).expect("relay configuration should load"),
+            config
+        );
+        drop(connection);
+        let reopened = open_database(&path, &key).expect("encrypted profile should reopen");
+        assert_eq!(
+            load_peer_relay_config_in(&reopened).expect("relay configuration should persist"),
+            config
+        );
+        drop(reopened);
+        fs::remove_dir_all(directory).expect("temporary relay database should be removed");
     }
 }

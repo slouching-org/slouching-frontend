@@ -208,6 +208,12 @@ struct Slouching {
     peer_routes_error: Option<String>,
     peer_listen_port: String,
     peer_address: String,
+    peer_relay_url: String,
+    peer_relay_token: String,
+    peer_relay_config: storage::PeerRelayConfig,
+    peer_relay_config_status: String,
+    peer_relay_config_loaded: bool,
+    peer_relay_config_dirty: bool,
     peer_draft: String,
     peer_listen_status: PeerListenStatus,
     peer_send_status: PeerSendStatus,
@@ -358,6 +364,12 @@ impl Default for Slouching {
             peer_routes_error: None,
             peer_listen_port: "45873".to_owned(),
             peer_address: String::new(),
+            peer_relay_url: String::new(),
+            peer_relay_token: String::new(),
+            peer_relay_config: storage::PeerRelayConfig::default(),
+            peer_relay_config_status: "Relay opcional desativado".to_owned(),
+            peer_relay_config_loaded: false,
+            peer_relay_config_dirty: false,
             peer_draft: String::new(),
             peer_listen_status: PeerListenStatus::Idle,
             peer_send_status: PeerSendStatus::Idle,
@@ -458,6 +470,12 @@ enum Message {
     PeerHistoryCleared(String, Result<usize, String>),
     PeerListenPortChanged(String),
     PeerAddressChanged(String),
+    PeerRelayUrlChanged(String),
+    PeerRelayTokenChanged(String),
+    SavePeerRelayConfig,
+    DiscardPeerRelayConfig,
+    PeerRelayConfigLoaded(Result<storage::PeerRelayConfig, String>),
+    PeerRelayConfigSaved(storage::PeerRelayConfig, Result<(), String>),
     PeerDraftChanged(String),
     StartPeerListener,
     StopPeerListener,
@@ -961,6 +979,77 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         }
         Message::PeerListenPortChanged(value) => state.peer_listen_port = value,
         Message::PeerAddressChanged(value) => state.peer_address = value,
+        Message::PeerRelayUrlChanged(value) => {
+            state.peer_relay_url = value;
+            state.peer_relay_config_dirty = true;
+            state.peer_relay_config_status =
+                "Relay editado; salve para aplicar à próxima conexão".to_owned();
+        }
+        Message::PeerRelayTokenChanged(value) => {
+            state.peer_relay_token = value;
+            state.peer_relay_config_dirty = true;
+            state.peer_relay_config_status =
+                "Relay editado; salve para aplicar à próxima conexão".to_owned();
+        }
+        Message::PeerRelayConfigLoaded(result) => match result {
+            Ok(config) => {
+                state.peer_relay_config_loaded = true;
+                state.peer_relay_url = config.url.clone();
+                state.peer_relay_token = config.token.clone();
+                state.peer_relay_config = config.clone();
+                state.peer_relay_config_dirty = false;
+                state.peer_relay_config_status = if config.url.is_empty() {
+                    "Relay opcional desativado".to_owned()
+                } else {
+                    "Relay do grupo carregado do perfil local".to_owned()
+                };
+            }
+            Err(error) => state.peer_relay_config_status = error,
+        },
+        Message::SavePeerRelayConfig => {
+            if state.peer_listener_handle.is_some() {
+                state.peer_relay_config_status =
+                    "Desconecte antes de alterar o relay usado por uma sessão.".to_owned();
+                return Task::none();
+            }
+            let config = storage::PeerRelayConfig {
+                url: state.peer_relay_url.trim().to_owned(),
+                token: state.peer_relay_token.trim().to_owned(),
+            };
+            if let Err(error) = validate_peer_relay_config(&config) {
+                state.peer_relay_config_status = error;
+                return Task::none();
+            }
+            state.peer_relay_config_status = "Salvando relay no perfil local cifrado…".to_owned();
+            return Task::perform(save_peer_relay_config_task(config.clone()), move |result| {
+                Message::PeerRelayConfigSaved(config, result)
+            });
+        }
+        Message::DiscardPeerRelayConfig => {
+            state.peer_relay_url = state.peer_relay_config.url.clone();
+            state.peer_relay_token = state.peer_relay_config.token.clone();
+            state.peer_relay_config_dirty = false;
+            state.peer_relay_config_status = if state.peer_relay_config.url.is_empty() {
+                "Relay opcional desativado".to_owned()
+            } else {
+                "Relay salvo restaurado".to_owned()
+            };
+        }
+        Message::PeerRelayConfigSaved(config, result) => match result {
+            Ok(()) => {
+                state.peer_relay_config_loaded = true;
+                state.peer_relay_config = config.clone();
+                state.peer_relay_url = config.url;
+                state.peer_relay_token = config.token;
+                state.peer_relay_config_dirty = false;
+                state.peer_relay_config_status = if state.peer_relay_config.url.is_empty() {
+                    "Relay opcional desativado e removido do perfil".to_owned()
+                } else {
+                    "Relay do grupo salvo no perfil local cifrado".to_owned()
+                };
+            }
+            Err(error) => state.peer_relay_config_status = error,
+        },
         Message::PeerRoutesLoaded(result) => match result {
             Ok(routes) => {
                 state.peer_routes = routes;
@@ -980,6 +1069,18 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             if state.peer_listener_handle.is_some() {
                 return Task::none();
             }
+            if !state.peer_relay_config_loaded {
+                state.peer_listen_status = PeerListenStatus::Failed(
+                    "Aguarde o perfil local carregar a configuração de relay.".to_owned(),
+                );
+                return Task::none();
+            }
+            if state.peer_relay_config_dirty {
+                state.peer_listen_status = PeerListenStatus::Failed(
+                    "Salve ou descarte as alterações de relay antes de iniciar.".to_owned(),
+                );
+                return Task::none();
+            }
             if !matches!(state.identity_status, IdentityStatus::Ready(_)) {
                 state.peer_listen_status = PeerListenStatus::Failed(
                     "Crie ou carregue a identidade do dispositivo antes de escutar.".to_owned(),
@@ -992,6 +1093,13 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     state.peer_listen_status = PeerListenStatus::Failed(
                         "Informe uma porta UDP entre 1 e 65535.".to_owned(),
                     );
+                    return Task::none();
+                }
+            };
+            let relay = match peer_relay_from_config(&state.peer_relay_config) {
+                Ok(relay) => relay,
+                Err(error) => {
+                    state.peer_listen_status = PeerListenStatus::Failed(error);
                     return Task::none();
                 }
             };
@@ -1025,7 +1133,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.helper_listener_active = helper_mode;
             state.peer_listener_port = Some(port);
             state.peer_listener_addresses.clear();
-            let (task, handle) = peer_listener_task(generation, port, expected_peer);
+            let (task, handle) = peer_listener_task(generation, port, expected_peer, relay);
             state.peer_listener_handle = Some(handle);
             state.peer_session_commands = None;
             return task;
@@ -1088,6 +1196,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         let _ = commands.try_send(peer::PeerCommand::RequestDelegatedMlsCopies);
                     }
                     let remember_route = !state.helper_listener_active
+                        && !state.peer_address.trim().is_empty()
                         && matches!(state.peer_send_status, PeerSendStatus::Connecting);
                     let route_task = if remember_route {
                         Task::perform(
@@ -1622,6 +1731,18 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             }
         },
         Message::SendPeerText => {
+            if !state.peer_relay_config_loaded {
+                state.peer_send_status = PeerSendStatus::Failed(
+                    "Aguarde o perfil local carregar a configuração de relay.".to_owned(),
+                );
+                return Task::none();
+            }
+            if state.peer_relay_config_dirty {
+                state.peer_send_status = PeerSendStatus::Failed(
+                    "Salve ou descarte as alterações de relay antes de conectar.".to_owned(),
+                );
+                return Task::none();
+            }
             if !matches!(state.identity_status, IdentityStatus::Ready(_)) {
                 state.peer_send_status = PeerSendStatus::Failed(
                     "Crie ou carregue a identidade do dispositivo antes de enviar.".to_owned(),
@@ -1667,13 +1788,35 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 );
                 return Task::none();
             }
-            let address = match state.peer_address.parse::<std::net::SocketAddr>() {
-                Ok(address) if !address.ip().is_unspecified() && address.port() != 0 => address,
-                _ => {
-                    state.peer_send_status = PeerSendStatus::Failed("Informe um IP alcançável e a porta UDP do outro dispositivo, por exemplo 192.168.1.20:45873.".to_owned());
+            let address = if state.peer_address.trim().is_empty() {
+                None
+            } else {
+                match state.peer_address.parse::<std::net::SocketAddr>() {
+                    Ok(address) if !address.ip().is_unspecified() && address.port() != 0 => {
+                        Some(address)
+                    }
+                    _ => {
+                        state.peer_send_status = PeerSendStatus::Failed(
+                            "Informe um IP alcançável com porta UDP válida.".to_owned(),
+                        );
+                        return Task::none();
+                    }
+                }
+            };
+            let relay = match peer_relay_from_config(&state.peer_relay_config) {
+                Ok(relay) => relay,
+                Err(error) => {
+                    state.peer_send_status = PeerSendStatus::Failed(error);
                     return Task::none();
                 }
             };
+            if address.is_none() && relay.is_none() {
+                state.peer_send_status = PeerSendStatus::Failed(
+                    "Informe o endereço UDP do peer ou configure o relay operado pelo grupo."
+                        .to_owned(),
+                );
+                return Task::none();
+            }
             state.peer_send_status = PeerSendStatus::Connecting;
             let generation = state.peer_listener_generation.saturating_add(1);
             state.peer_listener_generation = generation;
@@ -1681,7 +1824,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.peer_next_request_id = state.peer_next_request_id.saturating_add(1);
             state.peer_pending_sends.insert(request_id, text.clone());
             let (task, handle) =
-                peer_connect_task(generation, expected_peer, address, request_id, text);
+                peer_connect_task(generation, expected_peer, address, relay, request_id, text);
             state.peer_listener_handle = Some(handle);
             return task;
         }
@@ -3363,6 +3506,10 @@ fn boot() -> (Slouching, Task<Message>) {
             Task::perform(load_profile_task(), Message::ProfileLoaded),
             Task::perform(load_identity_task(), Message::IdentityLoaded),
             Task::perform(
+                load_peer_relay_config_task(),
+                Message::PeerRelayConfigLoaded,
+            ),
+            Task::perform(
                 load_delegated_mls_storage_task(),
                 Message::DelegatedMlsStorageLoaded,
             ),
@@ -3378,6 +3525,18 @@ async fn load_profile_task() -> Result<Option<storage::LocalProfile>, String> {
     tokio::task::spawn_blocking(storage::load_profile)
         .await
         .map_err(|error| format!("local profile task failed: {error}"))?
+}
+
+async fn load_peer_relay_config_task() -> Result<storage::PeerRelayConfig, String> {
+    tokio::task::spawn_blocking(storage::load_peer_relay_config)
+        .await
+        .map_err(|error| format!("local relay-settings load failed: {error}"))?
+}
+
+async fn save_peer_relay_config_task(config: storage::PeerRelayConfig) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || storage::save_peer_relay_config(&config))
+        .await
+        .map_err(|error| format!("local relay-settings save failed: {error}"))?
 }
 
 async fn load_delegated_mls_storage_task() -> Result<storage::DelegatedMlsStorageStatus, String> {
@@ -4564,6 +4723,7 @@ fn peer_listener_task(
     generation: u64,
     port: u16,
     expected_peer: Option<iroh::EndpointId>,
+    relay: Option<peer::ParticipantRelay>,
 ) -> (Task<Message>, Handle) {
     let events = async_stream::stream! {
         let local_identity = match load_peer_secret_key_task().await {
@@ -4575,9 +4735,9 @@ fn peer_listener_task(
         };
         let bind_address = std::net::SocketAddr::from(([0, 0, 0, 0], port));
         let listener_result = if let Some(expected_peer) = expected_peer {
-            peer::bind_listener(local_identity, bind_address, expected_peer).await
+            peer::bind_listener_with_relay(local_identity, bind_address, expected_peer, relay).await
         } else {
-            peer::bind_helper_listener(local_identity, bind_address).await
+            peer::bind_helper_listener_with_relay(local_identity, bind_address, relay).await
         };
         let listener = match listener_result {
             Ok(listener) => listener,
@@ -4622,7 +4782,8 @@ fn peer_listener_task(
 fn peer_connect_task(
     generation: u64,
     expected_peer: iroh::EndpointId,
-    address: std::net::SocketAddr,
+    address: Option<std::net::SocketAddr>,
+    relay: Option<peer::ParticipantRelay>,
     request_id: u64,
     first_text: String,
 ) -> (Task<Message>, Handle) {
@@ -4631,7 +4792,7 @@ fn peer_connect_task(
             Ok(identity) => identity,
             Err(error) => { yield PeerListenEvent::Failed(error); return; }
         };
-        match peer::connect_peer(local_identity, expected_peer, address).await {
+        match peer::connect_peer_with_relay(local_identity, expected_peer, address, relay).await {
             Ok(session) => {
                 let (commands, command_rx) = tokio::sync::mpsc::channel(32);
                 if let Err(error) = commands.send(peer::PeerCommand::Send { request_id, text: first_text }).await {
@@ -4907,6 +5068,51 @@ fn run_lan_command(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn validate_peer_relay_config(config: &storage::PeerRelayConfig) -> Result<(), String> {
+    if config.url.is_empty() {
+        return if config.token.is_empty() {
+            Ok(())
+        } else {
+            Err("remova o token ou informe a URL do relay do grupo".to_owned())
+        };
+    }
+    let relay_url = config
+        .url
+        .parse::<iroh::RelayUrl>()
+        .map_err(|error| format!("URL do relay inválida: {error}"))?;
+    let local_http = relay_url.scheme() == "http"
+        && relay_url.host_str().is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        });
+    if relay_url.scheme() != "https" && !local_http {
+        return Err("relay remoto exige HTTPS; HTTP só é permitido em localhost".to_owned());
+    }
+    if config.token.len() < 16 {
+        return Err("use um token compartilhado com pelo menos 16 caracteres".to_owned());
+    }
+    Ok(())
+}
+
+fn peer_relay_from_config(
+    config: &storage::PeerRelayConfig,
+) -> Result<Option<peer::ParticipantRelay>, String> {
+    validate_peer_relay_config(config)?;
+    if config.url.is_empty() {
+        return Ok(None);
+    }
+    let url = config
+        .url
+        .parse::<iroh::RelayUrl>()
+        .map_err(|error| format!("URL do relay inválida: {error}"))?;
+    Ok(Some(peer::ParticipantRelay {
+        url,
+        access_token: config.token.clone(),
+    }))
+}
+
 fn parse_peer_id(value: &str) -> Result<iroh::EndpointId, String> {
     let bytes = hex_decode_key(value)?;
     iroh::EndpointId::from_bytes(&bytes)
@@ -4937,6 +5143,34 @@ fn hex_encode_key(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn participant_relay_requires_tls_and_a_shared_token() {
+        let valid = storage::PeerRelayConfig {
+            url: "https://relay.crew.example".to_owned(),
+            token: "crew-shared-token-0123456789".to_owned(),
+        };
+        assert!(validate_peer_relay_config(&valid).is_ok());
+        assert!(peer_relay_from_config(&valid).unwrap().is_some());
+
+        let no_token = storage::PeerRelayConfig {
+            token: "short".to_owned(),
+            ..valid.clone()
+        };
+        assert!(validate_peer_relay_config(&no_token).is_err());
+
+        let insecure_remote = storage::PeerRelayConfig {
+            url: "http://relay.crew.example".to_owned(),
+            ..valid
+        };
+        assert!(validate_peer_relay_config(&insecure_remote).is_err());
+
+        let local_development = storage::PeerRelayConfig {
+            url: "http://127.0.0.1:3340".to_owned(),
+            token: "local-development-token-0123456789".to_owned(),
+        };
+        assert!(validate_peer_relay_config(&local_development).is_ok());
+    }
 
     #[test]
     fn parses_only_the_expected_predecessor_from_order_errors() {

@@ -58,6 +58,12 @@ pub struct DirectPeerListener {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParticipantRelay {
+    pub url: iroh::RelayUrl,
+    pub access_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MlsEventEnvelope {
     pub event_id: [u8; 16],
     pub author_device: [u8; 32],
@@ -1006,7 +1012,16 @@ pub async fn bind_listener(
     bind_address: SocketAddr,
     expected_peer: EndpointId,
 ) -> Result<DirectPeerListener, String> {
-    let endpoint = bind_endpoint(local_identity, bind_address).await?;
+    bind_listener_with_relay(local_identity, bind_address, expected_peer, None).await
+}
+
+pub async fn bind_listener_with_relay(
+    local_identity: SecretKey,
+    bind_address: SocketAddr,
+    expected_peer: EndpointId,
+    relay: Option<ParticipantRelay>,
+) -> Result<DirectPeerListener, String> {
+    let endpoint = bind_endpoint_with_relay(local_identity, bind_address, relay).await?;
     Ok(DirectPeerListener {
         endpoint,
         expected_peer: Some(expected_peer),
@@ -1016,11 +1031,20 @@ pub async fn bind_listener(
 /// Binds a helper listener that accepts any authenticated device identity.
 /// Application frames still require their own author/device binding checks;
 /// delegated copy frames require the signed grant author to match this peer.
+#[allow(dead_code)]
 pub async fn bind_helper_listener(
     local_identity: SecretKey,
     bind_address: SocketAddr,
 ) -> Result<DirectPeerListener, String> {
-    let endpoint = bind_endpoint(local_identity, bind_address).await?;
+    bind_helper_listener_with_relay(local_identity, bind_address, None).await
+}
+
+pub async fn bind_helper_listener_with_relay(
+    local_identity: SecretKey,
+    bind_address: SocketAddr,
+    relay: Option<ParticipantRelay>,
+) -> Result<DirectPeerListener, String> {
+    let endpoint = bind_endpoint_with_relay(local_identity, bind_address, relay).await?;
     Ok(DirectPeerListener {
         endpoint,
         expected_peer: None,
@@ -1032,12 +1056,31 @@ pub async fn connect_peer(
     expected_peer: EndpointId,
     peer_address: SocketAddr,
 ) -> Result<DirectPeerSession, String> {
-    let endpoint = bind_endpoint(
+    connect_peer_with_relay(local_identity, expected_peer, Some(peer_address), None).await
+}
+
+pub async fn connect_peer_with_relay(
+    local_identity: SecretKey,
+    expected_peer: EndpointId,
+    peer_address: Option<SocketAddr>,
+    relay: Option<ParticipantRelay>,
+) -> Result<DirectPeerSession, String> {
+    if peer_address.is_none() && relay.is_none() {
+        return Err("enter a reachable peer address or configure the group's relay".to_owned());
+    }
+    let endpoint = bind_endpoint_with_relay(
         local_identity,
         "0.0.0.0:0".parse().expect("valid bind addr"),
+        relay.clone(),
     )
     .await?;
-    let remote = EndpointAddr::new(expected_peer).with_ip_addr(peer_address);
+    let mut remote = EndpointAddr::new(expected_peer);
+    if let Some(peer_address) = peer_address {
+        remote = remote.with_ip_addr(peer_address);
+    }
+    if let Some(relay) = relay {
+        remote = remote.with_relay_url(relay.url);
+    }
     let connection = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(remote, PEER_ALPN))
         .await
         .map_err(|_| "timed out connecting to direct peer".to_owned())?
@@ -1155,14 +1198,22 @@ pub async fn send_once(
     Err("peer session ended before acknowledgement".to_owned())
 }
 
-async fn bind_endpoint(
+async fn bind_endpoint_with_relay(
     local_identity: SecretKey,
     bind_address: SocketAddr,
+    relay: Option<ParticipantRelay>,
 ) -> Result<Endpoint, String> {
+    let relay_mode = match relay {
+        Some(relay) => RelayMode::Custom(iroh::RelayMap::from_iter([iroh::RelayConfig::new(
+            relay.url, None,
+        )
+        .with_auth_token(relay.access_token)])),
+        None => RelayMode::Disabled,
+    };
     Endpoint::builder(presets::Minimal)
         .secret_key(local_identity)
         .alpns(vec![PEER_ALPN.to_vec()])
-        .relay_mode(RelayMode::Disabled)
+        .relay_mode(relay_mode)
         .bind_addr(bind_address)
         .map_err(|error| format!("invalid direct peer bind address: {error}"))?
         .bind()
@@ -1932,7 +1983,117 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh_relay::server::{
+        Access, AccessControl, ClientRequest, RelayConfig, Server, ServerConfig,
+    };
+    use std::sync::Arc;
     use tokio::io::duplex;
+
+    #[derive(Debug)]
+    struct RelayTestToken(String);
+
+    impl AccessControl for RelayTestToken {
+        async fn on_connect(&self, request: &ClientRequest) -> Access {
+            if request.auth_token().as_deref() == Some(&self.0) {
+                Access::Allow
+            } else {
+                Access::Deny { reason: None }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_authenticated_relay_carries_a_pinned_peer_message() {
+        let token = "integration-test-shared-token";
+        let mut config = ServerConfig::default();
+        let mut relay_config = RelayConfig::new("127.0.0.1:0".parse::<SocketAddr>().unwrap());
+        relay_config.access = Arc::new(RelayTestToken(token.to_owned()));
+        config.relay = Some(relay_config);
+        let server = Server::spawn(config)
+            .await
+            .expect("test relay should start on an ephemeral loopback port");
+        let relay_url = format!("http://{}", server.http_addr().expect("HTTP relay address"))
+            .parse::<iroh::RelayUrl>()
+            .expect("loopback relay URL should parse");
+        let relay = ParticipantRelay {
+            url: relay_url,
+            access_token: token.to_owned(),
+        };
+
+        let receiver_key = SecretKey::from_bytes(&[0x71; 32]);
+        let sender_key = SecretKey::from_bytes(&[0x72; 32]);
+        let receiver = bind_listener_with_relay(
+            receiver_key.clone(),
+            "127.0.0.1:0".parse().unwrap(),
+            sender_key.public(),
+            Some(relay.clone()),
+        )
+        .await
+        .expect("receiver should bind with its configured relay");
+        let receiver_id = receiver.id();
+        let receiver_task = tokio::spawn(async move {
+            let session = tokio::time::timeout(Duration::from_secs(12), receiver.accept_session())
+                .await
+                .expect("relay-routed connection should arrive")
+                .expect("receiver should accept the pinned sender");
+            let (commands, command_rx) = mpsc::channel(4);
+            let mut events = Box::pin(session.run(command_rx));
+            let mut received_message = false;
+            while let Some(event) = tokio::time::timeout(Duration::from_secs(12), events.next())
+                .await
+                .expect("relay-routed message should arrive")
+            {
+                match event {
+                    PeerEvent::Received { sequence, text } => {
+                        assert_eq!(text, "message through the participant relay");
+                        received_message = true;
+                        commands
+                            .send(PeerCommand::AcceptInbound { sequence })
+                            .await
+                            .expect("receiver should acknowledge the saved message");
+                    }
+                    PeerEvent::Disconnected { .. } => return received_message,
+                    _ => {}
+                }
+            }
+            received_message
+        });
+
+        let sender = connect_peer_with_relay(sender_key, receiver_id, None, Some(relay))
+            .await
+            .expect("peer should connect through the relay without a direct address");
+        let (commands, command_rx) = mpsc::channel(4);
+        let mut events = Box::pin(sender.run(command_rx));
+        commands
+            .send(PeerCommand::Send {
+                request_id: 1,
+                text: "message through the participant relay".to_owned(),
+            })
+            .await
+            .unwrap();
+        let mut acknowledged = false;
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(12), events.next())
+            .await
+            .expect("relay-routed message should receive an ACK")
+        {
+            if matches!(event, PeerEvent::Acknowledged { request_id: 1, .. }) {
+                acknowledged = true;
+                commands.send(PeerCommand::Disconnect).await.unwrap();
+            }
+            if matches!(event, PeerEvent::Disconnected { .. }) {
+                break;
+            }
+        }
+        assert!(
+            acknowledged,
+            "receiver ACK should reach the sender over relay"
+        );
+        assert!(receiver_task.await.unwrap());
+        server
+            .shutdown()
+            .await
+            .expect("test relay should shut down");
+    }
 
     #[tokio::test]
     async fn closing_idle_listener_unblocks_accept_and_releases_endpoint() {

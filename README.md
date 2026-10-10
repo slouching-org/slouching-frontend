@@ -52,10 +52,12 @@ path.
    be available to create or load this identity.
 2. On both devices, paste the other device's public key into **Chave pública do
    peer · pin manual**. This manually pins the peer for both sending and receiving.
-3. On the receiving device, choose a UDP port (for example `45873`) and click
-   **Aguardar peer**. Each announced socket address has its own **Copiar este
-   endereço** button. Pick the address reachable from the sender's network;
-   wildcard addresses such as `0.0.0.0` cannot be shared.
+3. Optionally configure the same participant-operated relay URL and shared
+   token in **Relay do grupo** on both devices, then save it before starting a
+   listener or sending. On the receiving device, choose a UDP port (for
+   example `45873`) and click **Aguardar peer**. Each announced socket address
+   has its own **Copiar este endereço** button. Pick an address reachable from
+   the sender's network; wildcard addresses such as `0.0.0.0` cannot be shared.
 4. On the sending device, enter the receiver's address and port, type a
    message, and click **Conectar e enviar**. After connection, either device
    can send multiple messages over the same session. Sent text appears only
@@ -73,15 +75,31 @@ acceptance into the receiver's local transcript, not that the user read it.
 History stays on each device and is scoped to the pinned peer key; it is not
 synchronized. **Apagar histórico local deste peer** removes only that peer's
 rows after an explicit confirmation. This is pairwise QUIC channel encryption
-and pinned device identity, not MLS messaging or contact verification. There
-is no address discovery, relay, cross-NAT support, retry/offline delivery, or
-media. If both devices use the same VPN, choose the receiver's VPN address and
-allow UDP through the VPN and local firewalls; this uses the VPN as the route,
-not Slouching NAT traversal. VPN connectivity has not yet been tested between
-machines. Allow the chosen UDP port through each device's local firewall. The automated
+and pinned device identity, not MLS messaging or contact verification. Direct
+addresses are still exchanged manually; there is no automatic discovery,
+hole-punching, offline delivery, or media. With a saved relay, a blank peer
+address uses that relay, while a supplied address lets Iroh try the direct
+route and relay fallback. Relay URL and token are stored in the encrypted
+local profile. The relay carries encrypted QUIC traffic and can observe
+connection metadata; it is operated by a group member, not provided by
+Slouching. Remote relays must use HTTPS and require the same shared token on
+all members. The local integration test starts an authenticated Iroh Relay
+1.3 server and confirms a pinned message and ACK with no direct peer address;
+remote TLS deployment and cross-network behavior have not yet been verified.
+
+If both devices use the same VPN, they can also try the direct flow now: enter
+the receiver's VPN address and allow the chosen UDP port through the VPN and
+local firewalls. The VPN must carry UDP between the devices. This has not yet
+been tested between physical machines. The automated
 `cargo test --test peer_process` launches separate OS processes, exchanges
 multiple messages in both directions over one connection, checks wrong-pin
 rejection, and verifies a pending send is reported as unknown on disconnect.
+
+To operate a relay, run the Iroh Relay `1.3.0` server on a host the group
+controls, configure HTTPS and `access.shared_token`, and enter that HTTPS URL
+and token on every participating device. The app does not silently use a
+public relay. A group member must provide DNS, TLS, uptime, and network access
+for the relay host.
 
 ### Delegated MLS copy helper
 
@@ -91,9 +109,8 @@ session at a time, so an author can store a signed ciphertext copy and a
 different recipient can reconnect later to fetch it. Other application frames
 still require the manually pinned peer. This is store-and-forward only: the
 author, helper, and recipient still need a reachable route to the helper when
-each session is made. The current transport disables Iroh relay and NAT
-traversal; a VPN may provide that route, but public cross-network connectivity
-has not been implemented or verified.
+each session is made. The saved participant-operated relay can provide that
+route, but the helper flow has not yet been exercised over a remote relay.
 
 The native app now recreates all eleven design-board views with real Iced
 widgets, original characters and scenery, extracted outline SVG icons,
@@ -244,7 +261,7 @@ be installed and available in the user session.
 
 ![Actual refreshed 1280 × 800 native Iced familiar screen from this transport milestone; Secret Service is unavailable in this capture](docs/design/runtime/native-vhs/01-familiar.png)
 
-![Native Iced direct chat with separate copy controls for sample LAN and VPN socket addresses; the capture addresses are illustrative and Secret Service is unavailable.](docs/design/runtime/native-vhs/06-chat.png)
+![Native Iced direct chat with relay settings and separate copy controls for sample LAN and VPN socket addresses; addresses are illustrative and Secret Service is unavailable.](docs/design/runtime/native-vhs/06-chat.png)
 
 ![Actual native Iced home with open scenery and icon-based feature strip, without the frog mage or gnome cutouts](docs/design/runtime/native-vhs/09-home.png)
 

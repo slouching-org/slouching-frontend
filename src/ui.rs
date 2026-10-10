@@ -171,6 +171,21 @@ impl Layout {
     ) -> Element<'a, Message> {
         self.input_maybe(placeholder, value, Some(on_input))
     }
+    fn secret_input<'a>(
+        self,
+        placeholder: &'a str,
+        value: &'a str,
+        on_input: fn(String) -> Message,
+    ) -> Element<'a, Message> {
+        text_input(placeholder, value)
+            .on_input(on_input)
+            .secure(true)
+            .font(MONO)
+            .size(self.px(14.0).max(11.0))
+            .padding(self.px(12.0))
+            .style(input_style)
+            .into()
+    }
     fn input_maybe<'a>(
         self,
         placeholder: &'a str,
@@ -1794,7 +1809,8 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
             "Tentar carregar identidade",
         ),
     };
-    let identity = column![
+    let identity =
+        column![
         l.label("SUA IDENTIDADE DO DISPOSITIVO", 10.0, GOLD),
         l.label(identity_detail, 10.0, PAPER),
         l.control("key", copy_label, copy_message, !identity_ready),
@@ -1810,6 +1826,38 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
             10.0,
             MUTED
         ),
+        l.label("RELAY DO GRUPO · OPCIONAL", 10.0, GOLD),
+        l.label(
+            "Relay próprio em HTTPS; o mesmo URL/token precisa estar configurado em cada membro.",
+            10.0,
+            MUTED
+        ),
+        l.input_maybe(
+            "https://relay.example.org",
+            &state.peer_relay_url,
+            (!listener_active).then_some(Message::PeerRelayUrlChanged as fn(String) -> Message)
+        ),
+        l.secret_input(
+            "Token compartilhado do relay",
+            &state.peer_relay_token,
+            Message::PeerRelayTokenChanged
+        ),
+        row![
+            l.control(
+                "check",
+                "Salvar relay",
+                (state.peer_relay_config_dirty && !listener_active)
+                    .then_some(Message::SavePeerRelayConfig),
+                false
+            ),
+            l.control(
+                "close",
+                "Descartar",
+                state.peer_relay_config_dirty.then_some(Message::DiscardPeerRelayConfig),
+                false
+            )
+        ].spacing(l.px(6.0)),
+        l.label(state.peer_relay_config_status.clone(), 10.0, MUTED),
         l.label("PORTA UDP PARA RECEBER", 10.0, GOLD),
         l.input_maybe(
             "45873",
@@ -1817,7 +1865,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
             (!listener_active).then_some(Message::PeerListenPortChanged as fn(String) -> Message)
         )
     ]
-    .spacing(l.px(10.0));
+        .spacing(l.px(10.0));
     let listener_status: Element<'_, Message> = match &state.peer_listen_status {
         crate::PeerListenStatus::Idle => l
             .label(
@@ -1928,7 +1976,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
         listen_button,
         listener_status,
         l.label(
-            "A porta precisa estar liberada no firewall da rede local.",
+            "Sem relay: libere UDP na rede. Com relay: URL e token precisam corresponder ao servidor do grupo.",
             10.0,
             MUTED
         )
@@ -1948,7 +1996,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
         column![
             l.label("ENDEREÇO DIRETO DO PEER", 10.0, GOLD),
             l.input(
-                "192.168.1.20:45873",
+                "IP:porta · vazio usa relay salvo",
                 &state.peer_address,
                 Message::PeerAddressChanged
             )
