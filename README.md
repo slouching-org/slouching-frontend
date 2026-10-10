@@ -237,9 +237,11 @@ key, but does not prove the person behind a transferred image. Import never
 marks trust automatically; press **Marcar como conferida** only after
 authenticating the QR source. That decision is local to this encrypted profile
 and exact key. It does not verify a display name, and a replacement key must be
-verified again. Short verification codes are not available. Camera scanning
-uses an explicit, temporary local capture and follows the same signature,
-expiry, self-invite, and trust checks as PNG import.
+verified again. A symmetric 12-digit safety code derived from both device keys
+is available for live comparison; it does not implement SPAKE2 rendezvous or
+establish trust by itself. Camera scanning uses an explicit, temporary local
+capture and follows the same signature, expiry, self-invite, and trust checks
+as PNG import.
 
 To operate a relay, run the Iroh Relay `1.3.0` server on a host the group
 controls, configure HTTPS and `access.shared_token`, and enter that HTTPS URL
@@ -414,8 +416,9 @@ the system credential store. The direct-text trust screen creates a signed
 10-minute QR invitation containing the public key and optional listener
 addresses, then imports it from PNG and lets the user choose a route. The QR
 does not auto-verify human identity; a changed key has no inherited trust.
-Short verification codes and contact discovery are not implemented. OpenMLS credentials
-include a versioned binding signed by the durable device key. One-use
+The trust screen derives a symmetric 12-digit safety code from both device
+keys for live comparison. SPAKE2 rendezvous and contact discovery are not
+implemented. OpenMLS credentials include a versioned binding signed by the durable device key. One-use
 KeyPackages and private MLS state are stored in SQLCipher. The direct-chat
 screen separately pins device public keys. Character scenes remain visual
 previews. **Áudio & vídeo** enumerates real audio inputs and outputs, and lets
@@ -476,9 +479,9 @@ be installed and available in the user session.
 
 ![Actual native Iced peer verification screen after importing a QR, with separate LAN and VPN address choices; all values are capture fixtures](docs/design/runtime/native-vhs/08-verify-invite-imported.png)
 
-These identity captures predate the camera-scan control. Refresh them with
-`--capture-peer-verification` in a graphical session; this TTY environment
-cannot create an Iced window.
+These identity captures predate the camera-scan control and the 12-digit safety
+code. Refresh them with `--capture-peer-verification` in a graphical session;
+this TTY environment cannot create an Iced window.
 
 ![Native Iced call screen capture from before protected Opus RTP integration; a fresh capture needs a Wayland or X11 display](docs/design/runtime/native-vhs/10-call.png)
 
@@ -563,7 +566,9 @@ The audio-settings capture uses real device enumeration from the current
 session; device names vary by machine. Selected devices feed live call capture
 and playback, but not this illustrative capture.
 `--capture-peer-verification` supplies sample local and peer keys for the trust
-screen capture; they are fixtures, not identities from the keyring.
+screen capture and its derived 12-digit safety code; they are fixtures, not
+identities from the keyring. Refresh the identity screenshot from a graphical
+Wayland or X11 session; this checkout has no display server.
 `--capture-peer-invite` supplies a signed sample invitation and renders its QR
 in the identity screen; its keys and address are fixtures.
 `--capture-peer-invite-imported` shows the selectable LAN and VPN addresses
