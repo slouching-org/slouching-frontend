@@ -63,8 +63,11 @@ path.
    can send multiple messages over the same session. Sent text appears only
    after an ACK; received text appears live after the pinned identity check.
 
-The listener stays available through the session. Either side can use
-**Desconectar sessão** to close it; start a new session to reconnect. The
+A successful outbound connection saves the pinned device key and socket address
+in the encrypted local route book. The chat screen lists these routes for future
+group-member delivery; LAN addresses can become stale. The listener stays
+available through the session. Either side can use **Desconectar sessão** to
+close it; start a new session to reconnect. The
 receiver saves an inbound message to its encrypted local history before ACK;
 the sender saves an outbound message after receiving ACK. ACK confirms
 acceptance into the receiver's local transcript, not that the user read it.
@@ -173,7 +176,7 @@ be installed and available in the user session.
 
 ![Actual refreshed 1280 × 800 native Iced familiar screen from this transport milestone; Secret Service is unavailable in this capture](docs/design/runtime/native-vhs/01-familiar.png)
 
-![Actual 1884 × 1000 Iced chat capture; Secret Service was unavailable in the capture session, so identity-gated controls are disabled. When listening, the UI offers a button to copy the chosen LAN socket address.](docs/design/runtime/native-vhs/06-chat.png)
+![Actual 1884 × 1000 native Iced chat showing the pinned-route area; Secret Service is unavailable in this capture, so identity-gated controls are disabled.](docs/design/runtime/native-vhs/06-chat.png)
 
 ![Actual native Iced home with open scenery and icon-based feature strip, without the frog mage or gnome cutouts](docs/design/runtime/native-vhs/09-home.png)
 

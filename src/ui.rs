@@ -1928,6 +1928,38 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
             )
             .into(),
     };
+    let routes: Element<'_, Message> = if state.peer_routes_error.is_some() {
+        l.label("ROTAS PINADAS: cofre local indisponível.", 10.0, GOLD)
+            .into()
+    } else if state.peer_routes.is_empty() {
+        l.label(
+            "ROTAS PINADAS: conecte a um peer para guardar a chave e o endereço usados.",
+            10.0,
+            MUTED,
+        )
+        .into()
+    } else {
+        let entries = state.peer_routes.iter().fold(
+            column![l.label(
+                format!("ROTAS PINADAS · {}", state.peer_routes.len()),
+                10.0,
+                GOLD
+            )]
+            .spacing(l.px(3.0)),
+            |entries, route| {
+                entries.push(l.label(
+                    format!(
+                        "{}… · {}",
+                        crate::hex_encode_bytes(&route.device_public_key[..4]),
+                        route.address
+                    ),
+                    10.0,
+                    MUTED,
+                ))
+            },
+        );
+        scrollable(entries).height(l.px(72.0)).into()
+    };
     let transcript: Element<'_, Message> = if state.peer_transcript.is_empty() {
         container(
             l.label(
@@ -2035,6 +2067,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
         rule(LINE, 1.0),
         send_address,
         send_status,
+        routes,
         rule(LINE, 1.0),
         history_action,
         transcript,

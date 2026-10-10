@@ -176,6 +176,8 @@ struct Slouching {
     profile_status: ProfileStatus,
     identity_status: IdentityStatus,
     peer_public_key: String,
+    peer_routes: Vec<storage::StoredPeerRoute>,
+    peer_routes_error: Option<String>,
     peer_listen_port: String,
     peer_address: String,
     peer_draft: String,
@@ -315,6 +317,8 @@ impl Default for Slouching {
             profile_status: ProfileStatus::Loading,
             identity_status: IdentityStatus::Loading,
             peer_public_key: String::new(),
+            peer_routes: Vec::new(),
+            peer_routes_error: None,
             peer_listen_port: "45873".to_owned(),
             peer_address: String::new(),
             peer_draft: String::new(),
@@ -407,6 +411,8 @@ enum Message {
     StartPeerListener,
     StopPeerListener,
     PeerListenEvent(u64, PeerListenEvent),
+    PeerRoutesLoaded(Result<Vec<storage::StoredPeerRoute>, String>),
+    PeerRouteSaved(Result<Vec<storage::StoredPeerRoute>, String>),
     PeerInboundStored(u64, String, Result<storage::StoredDirectMessage, String>),
     PeerOutboundStored(u64, String, Result<storage::StoredDirectMessage, String>),
     SendPeerText,
@@ -772,6 +778,20 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         }
         Message::PeerListenPortChanged(value) => state.peer_listen_port = value,
         Message::PeerAddressChanged(value) => state.peer_address = value,
+        Message::PeerRoutesLoaded(result) => match result {
+            Ok(routes) => {
+                state.peer_routes = routes;
+                state.peer_routes_error = None;
+            }
+            Err(error) => state.peer_routes_error = Some(error),
+        },
+        Message::PeerRouteSaved(result) => match result {
+            Ok(routes) => {
+                state.peer_routes = routes;
+                state.peer_routes_error = None;
+            }
+            Err(error) => state.peer_routes_error = Some(error),
+        },
         Message::PeerDraftChanged(value) => state.peer_draft = value,
         Message::StartPeerListener => {
             if state.peer_listener_handle.is_some() {
@@ -851,16 +871,27 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     state.peer_session_commands = Some(commands);
                 }
                 PeerListenEvent::Session(peer::PeerEvent::Connected { peer_id }) => {
+                    let remember_route =
+                        matches!(state.peer_send_status, PeerSendStatus::Connecting);
+                    let route_task = if remember_route {
+                        Task::perform(
+                            save_peer_route_task(*peer_id.as_bytes(), state.peer_address.clone()),
+                            Message::PeerRouteSaved,
+                        )
+                    } else {
+                        Task::none()
+                    };
                     apply_peer_event(state, peer::PeerEvent::Connected { peer_id });
                     let Some(group_id) = state.mls_history_group.clone() else {
-                        return Task::none();
+                        return route_task;
                     };
                     state.mls_status = "Sessão conectada; verificando Commits pendentes autorizados para este dispositivo…".to_owned();
                     let peer_device = *peer_id.as_bytes();
-                    return Task::perform(
+                    let commits_task = Task::perform(
                         load_mls_commits_for_peer_task(group_id.clone(), peer_device),
                         move |result| Message::MlsCommitsReadyToSend(group_id, result),
                     );
+                    return Task::batch([route_task, commits_task]);
                 }
                 PeerListenEvent::Session(event) => match event {
                     peer::PeerEvent::Received { sequence, text } => {
@@ -2710,6 +2741,7 @@ fn boot() -> (Slouching, Task<Message>) {
             Task::perform(load_profile_task(), Message::ProfileLoaded),
             Task::perform(load_identity_task(), Message::IdentityLoaded),
             load_mls_groups(),
+            Task::perform(load_peer_routes_task(), Message::PeerRoutesLoaded),
             transport,
             capture,
         ]),
@@ -2756,6 +2788,24 @@ async fn store_direct_message_task(
     })
     .await
     .map_err(|error| format!("direct history task failed: {error}"))?
+}
+
+async fn load_peer_routes_task() -> Result<Vec<storage::StoredPeerRoute>, String> {
+    tokio::task::spawn_blocking(storage::list_peer_routes)
+        .await
+        .map_err(|error| format!("peer route load task failed: {error}"))?
+}
+
+async fn save_peer_route_task(
+    peer_device: [u8; 32],
+    address: String,
+) -> Result<Vec<storage::StoredPeerRoute>, String> {
+    tokio::task::spawn_blocking(move || {
+        storage::save_peer_route(peer_device, &address)?;
+        storage::list_peer_routes()
+    })
+    .await
+    .map_err(|error| format!("peer route persistence task failed: {error}"))?
 }
 
 async fn save_profile_task(profile: storage::LocalProfile) -> Result<(), String> {

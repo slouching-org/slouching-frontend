@@ -25,7 +25,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 12;
+const PROFILE_SCHEMA_VERSION: u32 = 13;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 type StoredEventEnvelope = (
@@ -154,6 +154,12 @@ pub struct StoredDirectMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPeerRoute {
+    pub device_public_key: [u8; 32],
+    pub address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredMlsMessage {
     pub sequence: i64,
     pub event_id: [u8; 16],
@@ -188,6 +194,26 @@ pub fn list_direct_messages(
     }
     let connection = open_local_database()?;
     list_direct_messages_in(&connection, peer_device, limit)
+}
+
+/// Stores a direct socket route only after the peer key has been pinned.
+pub fn save_peer_route(peer_device: [u8; 32], address: &str) -> Result<(), String> {
+    if peer_device.iter().all(|byte| *byte == 0) {
+        return Err("peer route requires a nonzero pinned device key".to_owned());
+    }
+    let address = address
+        .parse::<std::net::SocketAddr>()
+        .map_err(|_| "peer route must be an IP address and UDP port".to_owned())?;
+    if address.ip().is_unspecified() || address.port() == 0 {
+        return Err("peer route must use a reachable IP and nonzero port".to_owned());
+    }
+    let mut connection = open_local_database()?;
+    save_peer_route_in(&mut connection, peer_device, &address.to_string())
+}
+
+pub fn list_peer_routes() -> Result<Vec<StoredPeerRoute>, String> {
+    let connection = open_local_database()?;
+    list_peer_routes_in(&connection)
 }
 
 /// Removes only this peer's local direct-message history.
@@ -346,6 +372,45 @@ fn clear_direct_history_in(
         .commit()
         .map_err(|error| format!("could not commit direct history deletion: {error}"))?;
     Ok(deleted)
+}
+
+fn save_peer_route_in(
+    connection: &mut Connection,
+    peer_device: [u8; 32],
+    address: &str,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT INTO local_peer_routes (device_public_key, socket_address)
+             VALUES (?1, ?2)
+             ON CONFLICT(device_public_key) DO UPDATE SET socket_address = excluded.socket_address",
+            params![peer_device.as_slice(), address],
+        )
+        .map_err(|error| format!("could not save pinned peer route: {error}"))?;
+    Ok(())
+}
+
+fn list_peer_routes_in(connection: &Connection) -> Result<Vec<StoredPeerRoute>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT device_public_key, socket_address FROM local_peer_routes
+             ORDER BY socket_address, device_public_key",
+        )
+        .map_err(|error| format!("could not prepare pinned peer route query: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("could not query pinned peer routes: {error}"))?;
+    rows.map(|row| {
+        let (device_public_key, address) =
+            row.map_err(|error| format!("could not read pinned peer route: {error}"))?;
+        Ok(StoredPeerRoute {
+            device_public_key: fixed_bytes(device_public_key, "pinned peer route key")?,
+            address,
+        })
+    })
+    .collect()
 }
 
 fn list_direct_messages_in(
@@ -3699,6 +3764,19 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
             )
             .map_err(|error| format!("could not create encrypted MLS proposal journal: {error}"))?;
     }
+    if version < 13 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE local_peer_routes (
+                     device_public_key BLOB PRIMARY KEY NOT NULL
+                         CHECK (length(device_public_key) = 32),
+                     socket_address TEXT NOT NULL
+                         CHECK (length(socket_address) BETWEEN 1 AND 128)
+                 );
+                 PRAGMA user_version = 13;",
+            )
+            .map_err(|error| format!("could not create encrypted peer route book: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -3768,6 +3846,43 @@ mod tests {
             peer_identity.public().as_bytes(),
             device_identity.verifying_key().as_bytes()
         );
+    }
+
+    #[test]
+    fn pinned_peer_routes_persist_and_update_by_device_key() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-peer-routes-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary database directory should be created");
+        let path = directory.join("profile.sqlite3");
+        let key = [0x37; PROFILE_DB_KEY_LEN];
+        let peer = [0x61; 32];
+        let another_peer = [0x62; 32];
+        let mut connection =
+            open_database(&path, &key).expect("encrypted peer route database should initialize");
+
+        save_peer_route_in(&mut connection, peer, "192.168.1.20:45873")
+            .expect("first pinned peer route should persist");
+        save_peer_route_in(&mut connection, peer, "192.168.1.21:45873")
+            .expect("updated address should replace the prior route");
+        save_peer_route_in(&mut connection, another_peer, "[fd00::2]:45874")
+            .expect("IPv6 peer route should persist");
+
+        let routes = list_peer_routes_in(&connection).expect("pinned routes should reload");
+        assert_eq!(routes.len(), 2);
+        assert!(routes.iter().any(|route| {
+            route.device_public_key == peer && route.address == "192.168.1.21:45873"
+        }));
+        assert!(routes.iter().any(|route| {
+            route.device_public_key == another_peer && route.address == "[fd00::2]:45874"
+        }));
+        drop(connection);
+        fs::remove_dir_all(directory).expect("temporary peer route database should be removed");
     }
 
     #[test]

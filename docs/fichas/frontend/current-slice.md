@@ -2,7 +2,9 @@
 
 **Status:** eleven design-board screens plus a native MLS group screen. Direct
 LAN chat uses pinned Ed25519 device identities and persistent Iroh/QUIC
-sessions. MLS group setup can send a device-bound KeyPackage over the active
+sessions. Successful outbound connections save the pinned device key and
+last-seen socket address in the encrypted local route book, a foundation for
+planned multi-member Commit fan-out. MLS group setup can send a device-bound KeyPackage over the active
 pinned session; the committer reviews and admits it after matching the package
 identity to the transport peer. After admission, the committer sends Welcome
 and ratchet tree over the pinned session. The invitee validates the target
