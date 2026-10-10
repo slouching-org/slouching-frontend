@@ -286,6 +286,9 @@ struct Slouching {
     audio_input_selected: Option<String>,
     audio_output_selected: Option<String>,
     audio_devices_status: String,
+    audio_monitor_generation: u64,
+    audio_monitor_handle: Option<Handle>,
+    audio_monitor_level: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -354,6 +357,13 @@ enum PeerListenEvent {
     SessionCommands(tokio::sync::mpsc::Sender<peer::PeerCommand>),
     Session(peer::PeerEvent),
     Failed(String),
+}
+
+#[derive(Debug, Clone)]
+enum AudioMonitorEvent {
+    Started(u64),
+    Level(u64, f32),
+    Failed(u64, String),
 }
 
 impl Default for Slouching {
@@ -453,6 +463,9 @@ impl Default for Slouching {
             audio_input_selected: None,
             audio_output_selected: None,
             audio_devices_status: "Carregando dispositivos de áudio…".to_owned(),
+            audio_monitor_generation: 0,
+            audio_monitor_handle: None,
+            audio_monitor_level: 0.0,
         }
     }
 }
@@ -472,6 +485,9 @@ enum Message {
     AudioDevicesLoaded(Result<audio::AudioDevices, String>),
     AudioInputSelected(String),
     AudioOutputSelected(String),
+    StartAudioMonitor,
+    StopAudioMonitor,
+    AudioMonitorEvent(AudioMonitorEvent),
     ShareTab(u8),
     SelectSource(u8),
     DraftChanged(String),
@@ -806,6 +822,9 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             }
         }
         Message::Navigate(screen) => {
+            if screen != state.screen {
+                stop_audio_monitor(state);
+            }
             state.screen = screen;
             state.show_gallery = false;
             state.note = None;
@@ -813,9 +832,18 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         Message::InviteChanged(value) => state.invite = value,
         Message::NameChanged(value) => state.name = value,
         Message::ChooseFamiliar(value) => state.familiar = value,
-        Message::ToggleGallery => state.show_gallery = !state.show_gallery,
-        Message::SettingsTab(value) => state.settings_tab = value,
+        Message::ToggleGallery => {
+            stop_audio_monitor(state);
+            state.show_gallery = !state.show_gallery;
+        }
+        Message::SettingsTab(value) => {
+            if value != 1 {
+                stop_audio_monitor(state);
+            }
+            state.settings_tab = value;
+        }
         Message::RefreshAudioDevices => {
+            stop_audio_monitor(state);
             state.audio_devices_status = "Atualizando dispositivos…".to_owned();
             return Task::perform(load_audio_devices_task(), Message::AudioDevicesLoaded);
         }
@@ -842,31 +870,76 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.audio_devices_status = format!("Falha ao enumerar áudio: {error}");
         }
         Message::AudioInputSelected(name) => {
-            if let Some(device) = state
+            let device_name = state
                 .audio_input_devices
                 .iter()
                 .find(|device| device.id == name)
-            {
+                .map(|device| device.name.clone());
+            if let Some(device_name) = device_name {
+                stop_audio_monitor(state);
                 state.audio_input_selected = Some(name);
                 state.audio_devices_status = format!(
                     "Microfone selecionado: {} · seleção local ainda não usada em chamadas.",
-                    device.name
+                    device_name
                 );
             }
         }
         Message::AudioOutputSelected(name) => {
-            if let Some(device) = state
+            let device_name = state
                 .audio_output_devices
                 .iter()
                 .find(|device| device.id == name)
-            {
+                .map(|device| device.name.clone());
+            if let Some(device_name) = device_name {
                 state.audio_output_selected = Some(name);
                 state.audio_devices_status = format!(
                     "Saída selecionada: {} · seleção local ainda não usada em chamadas.",
-                    device.name
+                    device_name
                 );
             }
         }
+        Message::StartAudioMonitor => {
+            let Some(device_id) = state.audio_input_selected.clone() else {
+                state.audio_devices_status = "Nenhum microfone disponível para testar.".to_owned();
+                return Task::none();
+            };
+            if state.audio_monitor_handle.is_some() {
+                return Task::none();
+            }
+            state.audio_monitor_generation = state.audio_monitor_generation.wrapping_add(1);
+            let generation = state.audio_monitor_generation;
+            let (task, handle) = audio_monitor_task(device_id, generation);
+            state.audio_monitor_handle = Some(handle);
+            state.audio_monitor_level = 0.0;
+            state.audio_devices_status = "Abrindo o microfone para teste local…".to_owned();
+            return task;
+        }
+        Message::StopAudioMonitor => {
+            stop_audio_monitor(state);
+            state.audio_devices_status = "Teste do microfone encerrado.".to_owned();
+        }
+        Message::AudioMonitorEvent(event) => match event {
+            AudioMonitorEvent::Started(generation)
+                if generation == state.audio_monitor_generation =>
+            {
+                state.audio_devices_status =
+                    "Microfone ativo apenas neste teste local; nenhum áudio é enviado.".to_owned();
+            }
+            AudioMonitorEvent::Level(generation, level)
+                if generation == state.audio_monitor_generation =>
+            {
+                state.audio_monitor_level = level.clamp(0.0, 1.0);
+            }
+            AudioMonitorEvent::Failed(generation, error)
+                if generation == state.audio_monitor_generation =>
+            {
+                stop_audio_monitor(state);
+                state.audio_devices_status = format!("Falha ao testar microfone: {error}");
+            }
+            AudioMonitorEvent::Started(_)
+            | AudioMonitorEvent::Level(_, _)
+            | AudioMonitorEvent::Failed(_, _) => {}
+        },
         Message::ShareTab(value) => {
             state.share_tab = value;
             state.selected_source = 0;
@@ -4113,6 +4186,54 @@ async fn load_audio_devices_task() -> Result<audio::AudioDevices, String> {
         .map_err(|error| format!("audio device task failed: {error}"))?
 }
 
+fn audio_monitor_task(device_id: String, generation: u64) -> (Task<Message>, Handle) {
+    Task::run(
+        audio_monitor_events(device_id, generation),
+        Message::AudioMonitorEvent,
+    )
+    .abortable()
+}
+
+fn stop_audio_monitor(state: &mut Slouching) {
+    state.audio_monitor_generation = state.audio_monitor_generation.wrapping_add(1);
+    if let Some(handle) = state.audio_monitor_handle.take() {
+        handle.abort();
+    }
+    state.audio_monitor_level = 0.0;
+}
+
+fn audio_monitor_events(
+    device_id: String,
+    generation: u64,
+) -> impl futures_util::Stream<Item = AudioMonitorEvent> + Send + 'static {
+    async_stream::stream! {
+        let monitor = match tokio::task::spawn_blocking(move || audio::InputMonitor::open(&device_id)).await {
+            Ok(Ok(monitor)) => monitor,
+            Ok(Err(error)) => {
+                yield AudioMonitorEvent::Failed(generation, error);
+                return;
+            }
+            Err(error) => {
+                yield AudioMonitorEvent::Failed(generation, format!("microphone task failed: {error}"));
+                return;
+            }
+        };
+        if let Err(error) = monitor.play() {
+            yield AudioMonitorEvent::Failed(generation, error);
+            return;
+        }
+        yield AudioMonitorEvent::Started(generation);
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Some(error) = monitor.error() {
+                yield AudioMonitorEvent::Failed(generation, error);
+                break;
+            }
+            yield AudioMonitorEvent::Level(generation, monitor.level());
+        }
+    }
+}
+
 async fn save_peer_relay_config_task(config: storage::PeerRelayConfig) -> Result<(), String> {
     tokio::task::spawn_blocking(move || storage::save_peer_relay_config(&config))
         .await
@@ -5924,6 +6045,26 @@ mod tests {
         );
 
         assert!(!state.mls_attachment_transfers.contains_key(&7));
+    }
+
+    #[test]
+    fn stopping_microphone_test_clears_level_and_ignores_late_samples() {
+        let mut state = Slouching {
+            audio_monitor_generation: 3,
+            audio_monitor_level: 0.8,
+            audio_devices_status: "Microfone ativo".to_owned(),
+            ..Slouching::default()
+        };
+
+        stop_audio_monitor(&mut state);
+        assert_eq!(state.audio_monitor_generation, 4);
+        assert_eq!(state.audio_monitor_level, 0.0);
+
+        let _ = update(
+            &mut state,
+            Message::AudioMonitorEvent(AudioMonitorEvent::Level(3, 0.9)),
+        );
+        assert_eq!(state.audio_monitor_level, 0.0);
     }
 
     #[test]

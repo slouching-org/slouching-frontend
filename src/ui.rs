@@ -5,8 +5,8 @@ use crate::{
     file_transfer::FileAttachmentOffer, storage,
 };
 use iced::widget::{
-    self, button, canvas, column, container, image, row, scrollable, space, stack, svg, text,
-    text_input,
+    self, button, canvas, column, container, image, progress_bar, row, scrollable, space, stack,
+    svg, text, text_input,
 };
 use iced::{
     Background, Border, Color, ContentFit, Element, Fill, Font, Length, Point, Rectangle, Renderer,
@@ -731,6 +731,25 @@ fn settings(state: &Slouching, l: Layout) -> Element<'_, Message> {
             if state.audio_input_devices.is_empty() {
                 input_choices = input_choices.push(l.label("Nenhuma entrada de áudio", 11.0, MUTED));
             }
+            let monitor_active = state.audio_monitor_handle.is_some();
+            let monitor_button = button(l.label(
+                if monitor_active {
+                    "Parar teste do microfone"
+                } else {
+                    "Testar microfone localmente"
+                },
+                11.0,
+                if monitor_active { NIGHT } else { PAPER },
+            ))
+            .on_press_maybe(
+                (monitor_active || state.audio_input_selected.is_some()).then_some(if monitor_active {
+                    Message::StopAudioMonitor
+                } else {
+                    Message::StartAudioMonitor
+                }),
+            )
+            .padding([l.px(7.0), l.px(10.0)])
+            .style(move |_, status| button_style(status, monitor_active, false));
             let mut output_choices = column![].spacing(l.px(4.0));
             for device in &state.audio_output_devices {
                 let selected = state.audio_output_selected.as_ref() == Some(&device.id);
@@ -749,6 +768,13 @@ fn settings(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 l.label("Á U D I O", 11.0, GOLD),
                 l.label("Microfone", 13.0, PAPER),
                 container(scrollable(input_choices).height(l.px(54.0))).height(l.px(58.0)),
+                row![
+                    monitor_button,
+                    container(progress_bar(0.0..=1.0, state.audio_monitor_level)).width(Fill),
+                    l.label(format!("{:>3.0}%", state.audio_monitor_level * 100.0), 10.0, GOLD)
+                ]
+                .spacing(l.px(8.0))
+                .align_y(iced::Center),
                 l.label("Saída", 13.0, PAPER),
                 container(scrollable(output_choices).height(l.px(54.0))).height(l.px(58.0)),
                 button(l.label("Atualizar dispositivos", 11.0, PAPER))

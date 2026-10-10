@@ -308,9 +308,12 @@ include a versioned binding signed by the durable device key. One-use
 KeyPackages and private MLS state are stored in SQLCipher. The direct-chat
 screen separately pins device public keys. Character scenes and call views
 remain visual previews. **Áudio & vídeo** enumerates real audio inputs and
-outputs, and lets the user choose a device for the current app session. That
-choice is not persisted or used by calls yet; no microphone stream is opened.
-Camera and screen capture are also inactive. **Rede & P2P** in Settings retains
+outputs, and lets the user choose a device for the current app session. The
+explicit **Testar microfone localmente** action opens the selected input and
+shows an RMS level meter; samples stay in the audio callback and are neither
+saved nor sent. The test stops when the user leaves the audio tab or screen.
+Device choices are not persisted or used by calls yet. Camera and screen
+capture are also inactive. **Rede & P2P** in Settings retains
 the Elixir HTTP/WebSocket diagnostics and manual refresh. On Linux, this uses
 Secret Service, so a desktop password vault must
 be installed and available in the user session.
@@ -331,7 +334,7 @@ be installed and available in the user session.
 
 ![Actual native Iced Network and P2P settings with delegated MLS copy consent and helper-listener guidance; Secret Service is unavailable in this capture, so the local policy cannot load](docs/design/runtime/native-vhs/02-settings.png)
 
-![Actual native Iced audio settings enumerating this session's input and output devices; names are machine-specific and the selections do not feed a call yet](docs/design/runtime/native-vhs/13-audio-devices.png)
+![Actual native Iced audio settings with real input/output devices and an inactive local microphone-test button; names are machine-specific and no call is connected](docs/design/runtime/native-vhs/13-audio-devices.png)
 
 The Network and P2P settings expose persisted opt-in for delegated encrypted
 MLS copies, with the local quota and expiry policy beside the control. QUIC v8

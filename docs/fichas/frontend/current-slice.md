@@ -112,11 +112,13 @@ separately shows local Elixir HTTP/WebSocket diagnostics; it does not carry
 chat traffic.
 
 The audio settings enumerate the host's real input/output devices and let the
-user choose one in the running app. That choice is not persisted or used by a
-call yet; no microphone stream is opened. Character scenes and call views
-remain visual previews. Camera capture, live microphone/audio transport, screen
-capture, contact discovery, QR pairing, and guaranteed offline delivery are
-not implemented. The older web UI under
+user choose one in the running app. **Testar microfone localmente** explicitly
+opens the selected input and shows an RMS level meter; samples are not saved or
+sent, and the test stops when leaving the audio tab or screen. The device
+choice is not persisted or used by calls yet. Character scenes and call views
+remain visual previews. Camera capture, live audio transport, screen capture,
+contact discovery, QR pairing, and guaranteed offline delivery are not
+implemented. The older web UI under
 `prototypes/web/` is a design benchmark, not the product runtime.
 
 See [direct peer transport v8](../transport/lan-peer-v8.md) for the direct session

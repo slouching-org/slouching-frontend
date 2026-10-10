@@ -1,4 +1,11 @@
-use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::{
+    FromSample, Sample, SampleFormat,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU32, Ordering},
+};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AudioDevices {
@@ -31,6 +38,111 @@ fn describe(device: &cpal::Device) -> Option<AudioDevice> {
         id: device.id().ok()?.to_string(),
         name: device.description().ok()?.name().to_owned(),
     })
+}
+
+pub struct InputMonitor {
+    stream: cpal::Stream,
+    level_milli: Arc<AtomicU32>,
+    error: Arc<Mutex<Option<String>>>,
+}
+
+impl InputMonitor {
+    pub fn open(device_id: &str) -> Result<Self, String> {
+        let host = cpal::default_host();
+        let device = host
+            .input_devices()
+            .map_err(|error| format!("could not enumerate audio inputs: {error}"))?
+            .find(|device| device.id().is_ok_and(|id| id.to_string() == device_id))
+            .ok_or_else(|| "selected microphone is no longer available".to_owned())?;
+        let config = device
+            .default_input_config()
+            .map_err(|error| format!("could not read microphone format: {error}"))?;
+        let format = config.sample_format();
+        let level_milli = Arc::new(AtomicU32::new(0));
+        let callback_level = Arc::clone(&level_milli);
+        let error = Arc::new(Mutex::new(None));
+        let callback_error = Arc::clone(&error);
+        let stream = device
+            .build_input_stream_raw(
+                config.config(),
+                format,
+                move |data, _| {
+                    if let Some(level) = level_from_data(data, format) {
+                        callback_level.store((level * 1000.0) as u32, Ordering::Relaxed);
+                    }
+                },
+                move |stream_error| {
+                    if let Ok(mut error) = callback_error.lock() {
+                        *error = Some(stream_error.to_string());
+                    }
+                },
+                None,
+            )
+            .map_err(|error| format!("could not open microphone: {error}"))?;
+
+        Ok(Self {
+            stream,
+            level_milli,
+            error,
+        })
+    }
+
+    pub fn play(&self) -> Result<(), String> {
+        self.stream
+            .play()
+            .map_err(|error| format!("could not start microphone: {error}"))
+    }
+
+    pub fn level(&self) -> f32 {
+        self.level_milli.load(Ordering::Relaxed) as f32 / 1000.0
+    }
+
+    pub fn error(&self) -> Option<String> {
+        self.error.lock().ok().and_then(|error| error.clone())
+    }
+}
+
+fn rms_level<T>(samples: &[T]) -> f32
+where
+    T: Copy,
+    f32: FromSample<T>,
+{
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mean_square = samples
+        .iter()
+        .map(|sample| {
+            let sample = f32::from_sample(*sample);
+            sample * sample
+        })
+        .sum::<f32>()
+        / samples.len() as f32;
+    mean_square.sqrt().clamp(0.0, 1.0)
+}
+
+fn level_from_data(data: &cpal::Data, format: SampleFormat) -> Option<f32> {
+    macro_rules! samples {
+        ($sample:ty) => {
+            data.as_slice::<$sample>().map(rms_level::<$sample>)
+        };
+    }
+    match format {
+        SampleFormat::F32 => samples!(f32),
+        SampleFormat::F64 => samples!(f64),
+        SampleFormat::I8 => samples!(i8),
+        SampleFormat::I16 => samples!(i16),
+        SampleFormat::I24 => samples!(cpal::I24),
+        SampleFormat::I32 => samples!(i32),
+        SampleFormat::I64 => samples!(i64),
+        SampleFormat::U8 => samples!(u8),
+        SampleFormat::U16 => samples!(u16),
+        SampleFormat::U24 => samples!(cpal::U24),
+        SampleFormat::U32 => samples!(u32),
+        SampleFormat::U64 => samples!(u64),
+        SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32 => None,
+        _ => None,
+    }
 }
 
 pub fn enumerate_devices() -> Result<AudioDevices, String> {
@@ -86,5 +198,12 @@ mod tests {
             Some("mic-b".to_owned())
         );
         assert_eq!(choose_device_id(None, None, &[]), None);
+    }
+
+    #[test]
+    fn microphone_meter_calculates_bounded_rms_and_silence() {
+        assert_eq!(rms_level(&[] as &[f32]), 0.0);
+        assert_eq!(rms_level(&[0.5_f32, -0.5_f32]), 0.5);
+        assert_eq!(rms_level(&[1.5_f32, -1.5_f32]), 1.0);
     }
 }
