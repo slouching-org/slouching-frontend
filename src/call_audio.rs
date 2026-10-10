@@ -108,6 +108,55 @@ pub struct CallAudioDecoder {
     unprotector: MediaFrameReceiver,
 }
 
+/// Receives protected audio from every other member of a call MLS group.
+/// Each sender needs an independent replay window and stateful Opus decoder.
+pub struct CallAudioDecoderSet {
+    decoders: Vec<CallAudioDecoder>,
+}
+
+impl CallAudioDecoderSet {
+    pub(crate) fn for_call_group(group_id: &[u8]) -> Result<Self, String> {
+        let context = crate::storage::load_call_media_context(group_id)?;
+        let decoders = context
+            .members
+            .iter()
+            .filter(|member| member.index != context.local_member_index)
+            .map(|member| {
+                CallAudioDecoder::new(MediaFrameReceiver::new(
+                    context.epoch,
+                    member.index,
+                    context.base_key.as_slice(),
+                )?)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if decoders.is_empty() {
+            return Err("call MLS group has no remote audio members".to_owned());
+        }
+        Ok(Self { decoders })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(decoders: Vec<CallAudioDecoder>) -> Result<Self, String> {
+        if decoders.is_empty() {
+            return Err("call audio decoder set cannot be empty".to_owned());
+        }
+        Ok(Self { decoders })
+    }
+
+    /// The SFrame member index selects the decoder, preserving per-speaker
+    /// replay protection and Opus state while rejecting unknown senders.
+    pub fn unprotect_and_decode(&mut self, protected: &[u8]) -> Result<Vec<f32>, String> {
+        let mut last_error = None;
+        for decoder in &mut self.decoders {
+            match decoder.unprotect_and_decode(protected) {
+                Ok(pcm) => return Ok(pcm),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| "call has no remote audio decoder".to_owned()))
+    }
+}
+
 impl CallAudioDecoder {
     pub fn for_call_group_member(
         group_id: &[u8],
@@ -170,6 +219,36 @@ mod tests {
         assert_eq!(decoded.len(), FRAME_SAMPLES);
         assert!(decoded.iter().any(|sample| sample.abs() > 0.01));
         assert!(decoder.unprotect_and_decode(&protected).is_err());
+    }
+
+    #[test]
+    fn decoder_set_receives_multiple_members_with_independent_replay_windows() {
+        let mut sender_a =
+            CallAudioEncoder::new(MediaFrameSender::new(4, 2, TEST_MLS_EXPORTER_KEY).unwrap())
+                .unwrap();
+        let mut sender_b =
+            CallAudioEncoder::new(MediaFrameSender::new(4, 3, TEST_MLS_EXPORTER_KEY).unwrap())
+                .unwrap();
+        let mut receivers = CallAudioDecoderSet::new(vec![
+            CallAudioDecoder::new(MediaFrameReceiver::new(4, 2, TEST_MLS_EXPORTER_KEY).unwrap())
+                .unwrap(),
+            CallAudioDecoder::new(MediaFrameReceiver::new(4, 3, TEST_MLS_EXPORTER_KEY).unwrap())
+                .unwrap(),
+        ])
+        .unwrap();
+        let pcm = [0.1; FRAME_SAMPLES];
+        let frame_a = sender_a.encode_and_protect(&pcm).unwrap();
+        let frame_b = sender_b.encode_and_protect(&pcm).unwrap();
+
+        assert_eq!(
+            receivers.unprotect_and_decode(&frame_a).unwrap().len(),
+            FRAME_SAMPLES
+        );
+        assert!(receivers.unprotect_and_decode(&frame_a).is_err());
+        assert_eq!(
+            receivers.unprotect_and_decode(&frame_b).unwrap().len(),
+            FRAME_SAMPLES
+        );
     }
 
     #[test]

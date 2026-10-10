@@ -71,7 +71,7 @@ impl PeerConnectionEventHandler for CallEvents {
 
 struct CallAudioState {
     encoder: AsyncMutex<crate::call_audio::CallAudioEncoder>,
-    decoder: AsyncMutex<crate::call_audio::CallAudioDecoder>,
+    decoder: AsyncMutex<crate::call_audio::CallAudioDecoderSet>,
     track: Arc<TrackLocalStaticSample>,
     ssrc: u32,
     input_device_id: String,
@@ -224,10 +224,7 @@ impl CallRtcSession {
             tokio::task::spawn_blocking(move || {
                 Ok::<_, String>((
                     crate::call_audio::CallAudioEncoder::for_call_group(&group_id)?,
-                    crate::call_audio::CallAudioDecoder::for_call_group_member(
-                        &group_id,
-                        &remote_device,
-                    )?,
+                    crate::call_audio::CallAudioDecoderSet::for_call_group(&group_id)?,
                     crate::call_video::CallVideoEncoder::for_call_group(&group_id)?,
                     crate::call_video::CallVideoDecoder::for_call_group_member(
                         &group_id,
@@ -253,7 +250,7 @@ impl CallRtcSession {
 
     async fn new_with_audio_codecs(
         encoder: crate::call_audio::CallAudioEncoder,
-        decoder: crate::call_audio::CallAudioDecoder,
+        decoder: crate::call_audio::CallAudioDecoderSet,
         input_device_id: String,
         sink: Arc<dyn crate::call_audio::AudioSink>,
     ) -> Result<Self, String> {
@@ -1195,9 +1192,12 @@ mod tests {
                 crate::media::MediaFrameSender::new(3, 0, EXPORTER_KEY).unwrap(),
             )
             .unwrap(),
-            crate::call_audio::CallAudioDecoder::new(
-                crate::media::MediaFrameReceiver::new(3, 1, EXPORTER_KEY).unwrap(),
-            )
+            crate::call_audio::CallAudioDecoderSet::new(vec![
+                crate::call_audio::CallAudioDecoder::new(
+                    crate::media::MediaFrameReceiver::new(3, 1, EXPORTER_KEY).unwrap(),
+                )
+                .unwrap(),
+            ])
             .unwrap(),
             String::new(),
             Arc::new(TestSink(caller_sink_tx)),
@@ -1209,9 +1209,12 @@ mod tests {
                 crate::media::MediaFrameSender::new(3, 1, EXPORTER_KEY).unwrap(),
             )
             .unwrap(),
-            crate::call_audio::CallAudioDecoder::new(
-                crate::media::MediaFrameReceiver::new(3, 0, EXPORTER_KEY).unwrap(),
-            )
+            crate::call_audio::CallAudioDecoderSet::new(vec![
+                crate::call_audio::CallAudioDecoder::new(
+                    crate::media::MediaFrameReceiver::new(3, 0, EXPORTER_KEY).unwrap(),
+                )
+                .unwrap(),
+            ])
             .unwrap(),
             String::new(),
             Arc::new(TestSink(callee_sink_tx)),
