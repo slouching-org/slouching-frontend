@@ -37,6 +37,7 @@ mod protocol {
 const STATUS_URL: &str = "http://127.0.0.1:3707/api/status";
 const WS_URL: &str = "ws://127.0.0.1:3707/ws";
 const CONTRACT_VERSION: u32 = 1;
+const GATEWAY_PROTOCOL_VERSION: u32 = 2;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_PAYLOAD: &[u8] = b"slouching-v1";
@@ -5784,13 +5785,19 @@ fn parse_status(body: &str) -> Result<BackendStatus, FetchError> {
 
 async fn connect_transport() -> Result<(WsStream, protocol::ServerHello), HandshakeError> {
     tokio::time::timeout(Duration::from_secs(3), async {
+        let device_key = tokio::task::spawn_blocking(storage::load_device_peer_secret_key)
+            .await
+            .map_err(|error| HandshakeError::Unavailable(error.to_string()))?
+            .map_err(HandshakeError::Unavailable)?;
+        let device_public_key = *device_key.public().as_bytes();
         let (mut socket, _) = connect_async(WS_URL)
             .await
             .map_err(|error| HandshakeError::Unavailable(error.to_string()))?;
         let frame = protocol::ClientFrame {
             payload: Some(protocol::client_frame::Payload::Hello(
                 protocol::ClientHello {
-                    protocol_version: CONTRACT_VERSION,
+                    protocol_version: GATEWAY_PROTOCOL_VERSION,
+                    device_public_key: device_public_key.to_vec(),
                 },
             )),
         };
@@ -5809,6 +5816,30 @@ async fn connect_transport() -> Result<(WsStream, protocol::ServerHello), Handsh
             ));
         };
         let hello = decode_server_hello(&bytes)?;
+        let signed = gateway_auth_payload(&device_public_key, &hello.auth_nonce);
+        let signature = device_key.sign(&signed);
+        let proof = protocol::ClientFrame {
+            payload: Some(protocol::client_frame::Payload::AuthProof(
+                protocol::AuthProof {
+                    signature: signature.to_bytes().to_vec(),
+                },
+            )),
+        };
+        socket
+            .send(WsMessage::Binary(proof.encode_to_vec().into()))
+            .await
+            .map_err(|error| HandshakeError::Unavailable(error.to_string()))?;
+        let reply = socket
+            .next()
+            .await
+            .ok_or_else(|| HandshakeError::Protocol("backend closed before authentication".into()))?
+            .map_err(|error| HandshakeError::Unavailable(error.to_string()))?;
+        let WsMessage::Binary(bytes) = reply else {
+            return Err(HandshakeError::Protocol(
+                "expected binary authentication response".into(),
+            ));
+        };
+        decode_authenticated(&bytes, &device_public_key)?;
         Ok((socket, hello))
     })
     .await
@@ -5889,13 +5920,15 @@ fn decode_server_hello(bytes: &[u8]) -> Result<protocol::ServerHello, HandshakeE
         .map_err(|error| HandshakeError::Protocol(error.to_string()))?;
     match frame.payload {
         Some(protocol::server_frame::Payload::Hello(hello))
-            if hello.protocol_version == CONTRACT_VERSION && hello.server_role == "elixir" =>
+            if hello.protocol_version == GATEWAY_PROTOCOL_VERSION
+                && hello.server_role == "elixir"
+                && hello.auth_nonce.len() == 32 =>
         {
             Ok(hello)
         }
         Some(protocol::server_frame::Payload::Hello(hello)) => {
             Err(HandshakeError::Protocol(format!(
-                "expected Elixir protocol v{CONTRACT_VERSION}; got {} v{}",
+                "expected Elixir protocol v{GATEWAY_PROTOCOL_VERSION}; got {} v{}",
                 hello.server_role, hello.protocol_version
             )))
         }
@@ -5905,7 +5938,40 @@ fn decode_server_hello(bytes: &[u8]) -> Result<protocol::ServerHello, HandshakeE
                 error.supported_version
             )))
         }
+        Some(protocol::server_frame::Payload::Authenticated(_)) => Err(HandshakeError::Protocol(
+            "authentication response arrived before challenge".into(),
+        )),
         None => Err(HandshakeError::Protocol("empty ServerFrame".into())),
+    }
+}
+
+fn gateway_auth_payload(device_public_key: &[u8; 32], nonce: &[u8]) -> Vec<u8> {
+    let mut payload = b"slouching/gateway-auth/v1\0".to_vec();
+    payload.extend_from_slice(&GATEWAY_PROTOCOL_VERSION.to_be_bytes());
+    payload.extend_from_slice(device_public_key);
+    payload.extend_from_slice(nonce);
+    payload
+}
+
+fn decode_authenticated(
+    bytes: &[u8],
+    expected_device_public_key: &[u8; 32],
+) -> Result<(), HandshakeError> {
+    let frame = protocol::ServerFrame::decode(bytes)
+        .map_err(|error| HandshakeError::Protocol(error.to_string()))?;
+    match frame.payload {
+        Some(protocol::server_frame::Payload::Authenticated(authenticated))
+            if authenticated.device_public_key == expected_device_public_key
+                && !authenticated.application_routes_available =>
+        {
+            Ok(())
+        }
+        Some(protocol::server_frame::Payload::Authenticated(_)) => Err(HandshakeError::Protocol(
+            "backend authentication identity/capability mismatch".into(),
+        )),
+        _ => Err(HandshakeError::Protocol(
+            "backend did not confirm device authentication".into(),
+        )),
     }
 }
 
@@ -9142,11 +9208,12 @@ mod tests {
         let hello = protocol::ServerFrame {
             payload: Some(protocol::server_frame::Payload::Hello(
                 protocol::ServerHello {
-                    protocol_version: CONTRACT_VERSION,
+                    protocol_version: GATEWAY_PROTOCOL_VERSION,
                     server_role: "elixir".into(),
                     identity_available: false,
                     messaging_available: false,
                     calls_available: false,
+                    auth_nonce: vec![0x51; 32],
                 },
             )),
         };
@@ -9154,7 +9221,7 @@ mod tests {
         let mismatch = protocol::ServerFrame {
             payload: Some(protocol::server_frame::Payload::VersionError(
                 protocol::VersionError {
-                    supported_version: CONTRACT_VERSION,
+                    supported_version: GATEWAY_PROTOCOL_VERSION,
                 },
             )),
         };
@@ -9166,6 +9233,51 @@ mod tests {
             decode_server_hello(b"not protobuf"),
             Err(HandshakeError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn validates_gateway_authentication_response_and_device_signature() {
+        let secret = iroh::SecretKey::from_bytes(&[0x63; 32]);
+        let public_key = *secret.public().as_bytes();
+        let nonce = [0x74; 32];
+        let signature = secret.sign(&gateway_auth_payload(&public_key, &nonce));
+        assert_eq!(
+            public_key.as_slice(),
+            hex::decode("a7f6dfaf8f38b89ba8ce649b594f91e4d01fdc57f9c9493df43b5e50a9987367")
+                .unwrap()
+        );
+        assert_eq!(
+            signature.to_bytes().as_slice(),
+            hex::decode("a984b78474ab94d7ccf35fd00276c9922c9a5b1e8baa69c6d303c49fc6db501de202b9a31ca6e3675059a6b09c4e71906ff111bb59a37ad5ac554b45a444c404")
+                .unwrap()
+        );
+        secret
+            .public()
+            .verify(&gateway_auth_payload(&public_key, &nonce), &signature)
+            .expect("device signature verifies against its public key");
+
+        let authenticated = protocol::ServerFrame {
+            payload: Some(protocol::server_frame::Payload::Authenticated(
+                protocol::Authenticated {
+                    device_public_key: public_key.to_vec(),
+                    application_routes_available: false,
+                },
+            )),
+        };
+        assert!(decode_authenticated(&authenticated.encode_to_vec(), &public_key).is_ok());
+        assert!(decode_authenticated(&authenticated.encode_to_vec(), &[0x55; 32]).is_err());
+
+        let unauthorized_capability = protocol::ServerFrame {
+            payload: Some(protocol::server_frame::Payload::Authenticated(
+                protocol::Authenticated {
+                    device_public_key: public_key.to_vec(),
+                    application_routes_available: true,
+                },
+            )),
+        };
+        assert!(
+            decode_authenticated(&unauthorized_capability.encode_to_vec(), &public_key).is_err()
+        );
     }
 
     #[test]
