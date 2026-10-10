@@ -42,6 +42,11 @@ membership and verified device bindings, rejects quarantined groups and
 conflicting transfer IDs, and rechecks the group epoch before inserting. A
 200 MiB per-profile attachment quota is enforced before storing an
 offer, and the schema migration backfills sizes from existing offers. The
+MLS receiver recognizes the bounded attachment envelope only after OpenMLS
+authenticates and decrypts the application event. It commits the manifest in
+the same SQLCipher transaction as the ratchet, event, and transcript, before
+the peer ACK is allowed; exact redelivery is deduplicated. Received offers are
+now persisted correctly, but the app does not yet fetch or render their blobs.
 receive core stages plaintext in a temporary file and publishes it
 only after digest validation, without replacing an existing destination. Local
 two-endpoint tests cover authorized retrieval and rejection of an unauthorized

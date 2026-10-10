@@ -1,4 +1,4 @@
-use crate::file_transfer::{FileOffer, MAX_FILE_BYTES};
+use crate::file_transfer::{FileAttachmentOffer, FileOffer, MAX_FILE_BYTES};
 use crate::identity::MlsSigningKeyBinding;
 use directories::ProjectDirs;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -362,7 +362,7 @@ fn save_file_attachment_in(
     ciphertext_hash: [u8; 32],
     offer: &FileOffer,
 ) -> Result<(), String> {
-    let encoded_offer = offer.encode()?;
+    offer.encode()?;
     let (member_devices, group_epoch) = load_mls_group_member_devices_in(connection, &group_id)?;
     if !member_devices.contains(&author_device) {
         return Err("file attachment author is not a member of this MLS group".to_owned());
@@ -384,7 +384,27 @@ fn save_file_attachment_in(
         Some(_) => return Err("MLS group is quarantined".to_owned()),
         None => return Err("MLS group is not present on this device".to_owned()),
     }
-    let prior: Option<StoredPriorFileAttachment> = transaction
+    insert_file_attachment_in_transaction(
+        &transaction,
+        group_id,
+        author_device,
+        ciphertext_hash,
+        offer,
+    )?;
+    transaction
+        .commit()
+        .map_err(|error| format!("could not commit file attachment: {error}"))
+}
+
+fn insert_file_attachment_in_transaction(
+    connection: &Connection,
+    group_id: [u8; 16],
+    author_device: [u8; 32],
+    ciphertext_hash: [u8; 32],
+    offer: &FileOffer,
+) -> Result<(), String> {
+    let encoded_offer = offer.encode()?;
+    let prior: Option<StoredPriorFileAttachment> = connection
         .query_row(
             "SELECT group_id, author_device, ciphertext_hash, offer FROM local_file_attachments
              WHERE transfer_id = ?1",
@@ -403,7 +423,7 @@ fn save_file_attachment_in(
         }
         return Err("file transfer ID is already bound to another attachment".to_owned());
     }
-    let stored_bytes: i64 = transaction
+    let stored_bytes: i64 = connection
         .query_row(
             "SELECT COALESCE(SUM(total_bytes), 0) FROM local_file_attachments",
             [],
@@ -415,7 +435,7 @@ fn save_file_attachment_in(
     if stored_bytes.saturating_add(incoming_bytes) > MAX_LOCAL_ATTACHMENT_BYTES {
         return Err("local encrypted attachment quota of 200 MiB is full".to_owned());
     }
-    transaction
+    connection
         .execute(
             "INSERT INTO local_file_attachments
                  (transfer_id, group_id, author_device, ciphertext_hash, offer, total_bytes, created_at_unix)
@@ -431,9 +451,7 @@ fn save_file_attachment_in(
             ],
         )
         .map_err(|error| format!("could not save encrypted file attachment: {error}"))?;
-    transaction
-        .commit()
-        .map_err(|error| format!("could not commit file attachment: {error}"))
+    Ok(())
 }
 
 fn list_file_attachments_in(
@@ -2411,6 +2429,20 @@ fn process_inbound_mls_application_event_at(
             .map_err(|_| "MLS chat message is not valid UTF-8".to_owned())?;
         if plaintext_text.is_empty() || plaintext_text.len() > 16 * 1024 {
             return Err("MLS chat text must contain 1 to 16384 UTF-8 bytes".to_owned());
+        }
+        if let Some(attachment) = FileAttachmentOffer::decode_mls_text(&plaintext_text)? {
+            let group_id: [u8; 16] = event
+                .group_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| "MLS attachment group ID must contain 16 bytes".to_owned())?;
+            insert_file_attachment_in_transaction(
+                connection,
+                group_id,
+                sender_device,
+                attachment.ciphertext_hash,
+                &attachment.offer,
+            )?;
         }
         connection
             .execute(
@@ -7242,6 +7274,51 @@ mod tests {
             DirectMessageDirection::Received
         );
         assert_eq!(receiver_history[0].text, "MLS application payload");
+        let attachment_secrets = FileTransferSecrets::from_parts([0xa1; 16], [0xb2; 32]);
+        let attachment_text = FileAttachmentOffer {
+            offer: FileOffer::from_secrets(&attachment_secrets, 17, "map.png".to_owned())
+                .expect("MLS attachment offer should validate"),
+            ciphertext_hash: [0xc3; 32],
+        }
+        .encode_mls_text()
+        .expect("MLS attachment offer should encode");
+        let attachment_event = create_mls_application_event_in(
+            &mut sender,
+            &group.group_id,
+            attachment_text.as_bytes(),
+            2_000_000_000,
+            &sender_identity,
+        )
+        .expect("sender should encrypt the attachment reference in MLS");
+        assert_eq!(
+            process_inbound_mls_application_event_in(
+                &mut receiver,
+                &attachment_event.event,
+                &receiver_identity,
+            )
+            .expect("receiver should save the MLS attachment reference atomically"),
+            ProcessedMlsApplicationEvent::Received(attachment_text.as_bytes().to_vec())
+        );
+        let received_attachments =
+            list_file_attachments_in(&receiver, group.group_id.as_slice().try_into().unwrap())
+                .expect("authenticated attachment should be listed from SQLCipher");
+        assert_eq!(received_attachments.len(), 1);
+        assert_eq!(
+            received_attachments[0].author_device,
+            sender_identity.verifying_key().to_bytes()
+        );
+        assert_eq!(received_attachments[0].ciphertext_hash, [0xc3; 32]);
+        assert_eq!(received_attachments[0].offer.transfer_id, [0xa1; 16]);
+        assert_eq!(received_attachments[0].offer.content_key, [0xb2; 32]);
+        assert_eq!(
+            process_inbound_mls_application_event_in(
+                &mut receiver,
+                &attachment_event.event,
+                &receiver_identity,
+            )
+            .expect("duplicate attachment event should deduplicate with its manifest"),
+            ProcessedMlsApplicationEvent::Duplicate
+        );
         drop(receiver);
         drop(second_receiver);
         drop(sender);
