@@ -1195,12 +1195,22 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     if let Some(commands) = state.peer_session_commands.as_ref() {
                         let _ = commands.try_send(peer::PeerCommand::RequestDelegatedMlsCopies);
                     }
+                    let initiated_connection =
+                        matches!(state.peer_send_status, PeerSendStatus::Connecting);
+                    let relay_configured = !state.peer_relay_config.url.trim().is_empty();
+                    let relay_only_route =
+                        initiated_connection && state.peer_address.trim().is_empty();
                     let remember_route = !state.helper_listener_active
-                        && !state.peer_address.trim().is_empty()
-                        && matches!(state.peer_send_status, PeerSendStatus::Connecting);
+                        && ((initiated_connection && !state.peer_address.trim().is_empty())
+                            || relay_configured);
                     let route_task = if remember_route {
                         Task::perform(
-                            save_peer_route_task(*peer_id.as_bytes(), state.peer_address.clone()),
+                            save_peer_route_task(
+                                *peer_id.as_bytes(),
+                                state.peer_address.clone(),
+                                relay_only_route || !initiated_connection,
+                                !initiated_connection,
+                            ),
                             Message::PeerRouteSaved,
                         )
                     } else {
@@ -3705,9 +3715,17 @@ async fn load_peer_routes_task() -> Result<Vec<storage::StoredPeerRoute>, String
 async fn save_peer_route_task(
     peer_device: [u8; 32],
     address: String,
+    relay_only: bool,
+    only_if_missing: bool,
 ) -> Result<Vec<storage::StoredPeerRoute>, String> {
     tokio::task::spawn_blocking(move || {
-        storage::save_peer_route(peer_device, &address)?;
+        if relay_only && only_if_missing {
+            storage::ensure_peer_relay_route(peer_device)?;
+        } else if relay_only {
+            storage::save_peer_relay_route(peer_device)?;
+        } else {
+            storage::save_peer_route(peer_device, &address)?;
+        }
         storage::list_peer_routes()
     })
     .await
@@ -3954,9 +3972,11 @@ async fn fanout_mls_commits_task(group_id: Vec<u8>) -> Result<MlsCommitFanoutRep
     })
     .await
     .map_err(|error| format!("MLS fan-out preparation task failed: {error}"))??;
+    let relay_config = load_peer_relay_config_task().await?;
+    let relay = peer_relay_from_config(&relay_config)?;
     let route_by_device = routes
         .into_iter()
-        .map(|route| (route.device_public_key, route.address))
+        .map(|route| (route.device_public_key, route))
         .collect::<std::collections::HashMap<_, _>>();
     let mut recipients = statuses;
     recipients.sort_unstable();
@@ -3968,12 +3988,21 @@ async fn fanout_mls_commits_task(group_id: Vec<u8>) -> Result<MlsCommitFanoutRep
         failures: Vec::new(),
     };
     for peer_device in recipients {
-        let Some(address) = route_by_device.get(&peer_device).cloned() else {
+        let Some(route) = route_by_device.get(&peer_device) else {
             report.failures.push(format!(
                 "{}… sem rota salva",
                 hex_encode_bytes(&peer_device[..4])
             ));
             continue;
+        };
+        let address = match peer_route_socket(route) {
+            Ok(address) => address,
+            Err(error) => {
+                report
+                    .failures
+                    .push(format!("{}…: {error}", hex_encode_bytes(&peer_device[..4])));
+                continue;
+            }
         };
         loop {
             let commits = match load_mls_commits_for_peer_task(group_id.clone(), peer_device).await
@@ -3990,7 +4019,8 @@ async fn fanout_mls_commits_task(group_id: Vec<u8>) -> Result<MlsCommitFanoutRep
                 break;
             }
             let has_more = commits.len() == 100;
-            let outcome = fanout_mls_commits_to_peer(peer_device, address.clone(), commits).await;
+            let outcome =
+                fanout_mls_commits_to_peer(peer_device, address, relay.clone(), commits).await;
             report.commits_acked += outcome.commits_acked;
             if let Some(error) = outcome.failure {
                 report
@@ -4008,7 +4038,8 @@ async fn fanout_mls_commits_task(group_id: Vec<u8>) -> Result<MlsCommitFanoutRep
 
 async fn fanout_mls_commits_to_peer(
     peer_device: [u8; 32],
-    address: String,
+    address: Option<std::net::SocketAddr>,
+    relay: Option<peer::ParticipantRelay>,
     commits: Vec<storage::StoredMlsCommit>,
 ) -> MlsCommitFanoutPeerOutcome {
     let mut outcome = MlsCommitFanoutPeerOutcome::default();
@@ -4019,13 +4050,6 @@ async fn fanout_mls_commits_to_peer(
             return outcome;
         }
     };
-    let address = match address.parse::<std::net::SocketAddr>() {
-        Ok(address) if !address.ip().is_unspecified() && address.port() != 0 => address,
-        _ => {
-            outcome.failure = Some("saved route is not a reachable IP:port".to_owned());
-            return outcome;
-        }
-    };
     let local_identity = match load_peer_secret_key_task().await {
         Ok(identity) => identity,
         Err(error) => {
@@ -4033,13 +4057,14 @@ async fn fanout_mls_commits_to_peer(
             return outcome;
         }
     };
-    let session = match peer::connect_peer(local_identity, endpoint, address).await {
-        Ok(session) => session,
-        Err(error) => {
-            outcome.failure = Some(error);
-            return outcome;
-        }
-    };
+    let session =
+        match peer::connect_peer_with_relay(local_identity, endpoint, address, relay).await {
+            Ok(session) => session,
+            Err(error) => {
+                outcome.failure = Some(error);
+                return outcome;
+            }
+        };
     let (commands, receiver) = tokio::sync::mpsc::channel(8);
     let mut events = Box::pin(session.run(receiver));
     match tokio::time::timeout(Duration::from_secs(8), events.next()).await {
@@ -4171,9 +4196,11 @@ async fn fanout_mls_events_task(group_id: Vec<u8>) -> Result<MlsEventFanoutRepor
     })
     .await
     .map_err(|error| format!("MLS event fan-out preparation failed: {error}"))??;
+    let relay_config = load_peer_relay_config_task().await?;
+    let relay = peer_relay_from_config(&relay_config)?;
     let route_by_device = routes
         .into_iter()
-        .map(|route| (route.device_public_key, route.address))
+        .map(|route| (route.device_public_key, route))
         .collect::<std::collections::HashMap<_, _>>();
     let mut report = MlsEventFanoutReport {
         recipients: recipients.len(),
@@ -4183,7 +4210,7 @@ async fn fanout_mls_events_task(group_id: Vec<u8>) -> Result<MlsEventFanoutRepor
         failures: Vec::new(),
     };
     for peer_device in recipients.iter().copied() {
-        let Some(address) = route_by_device.get(&peer_device).cloned() else {
+        let Some(route) = route_by_device.get(&peer_device) else {
             let pending = load_all_mls_events_for_peer_task(group_id.clone(), peer_device).await?;
             if !pending.is_empty() {
                 let (held, failure) = fanout_mls_copies_to_helpers(
@@ -4191,6 +4218,7 @@ async fn fanout_mls_events_task(group_id: Vec<u8>) -> Result<MlsEventFanoutRepor
                     &pending,
                     &recipients,
                     &route_by_device,
+                    relay.clone(),
                 )
                 .await;
                 report.copies_held += held;
@@ -4202,6 +4230,15 @@ async fn fanout_mls_events_task(group_id: Vec<u8>) -> Result<MlsEventFanoutRepor
                 }
             }
             continue;
+        };
+        let address = match peer_route_socket(route) {
+            Ok(address) => address,
+            Err(error) => {
+                report
+                    .failures
+                    .push(format!("{}…: {error}", hex_encode_bytes(&peer_device[..4])));
+                continue;
+            }
         };
         let commits = load_mls_commits_for_peer_task(group_id.clone(), peer_device).await?;
         if !commits.is_empty() {
@@ -4226,7 +4263,8 @@ async fn fanout_mls_events_task(group_id: Vec<u8>) -> Result<MlsEventFanoutRepor
                 break;
             }
             let has_more = events.len() == 16;
-            let outcome = fanout_mls_events_to_peer(peer_device, address.clone(), events).await;
+            let outcome =
+                fanout_mls_events_to_peer(peer_device, address, relay.clone(), events).await;
             report.events_acked += outcome.0;
             if let Some(error) = outcome.1 {
                 let events_for_copy =
@@ -4236,6 +4274,7 @@ async fn fanout_mls_events_task(group_id: Vec<u8>) -> Result<MlsEventFanoutRepor
                     &events_for_copy,
                     &recipients,
                     &route_by_device,
+                    relay.clone(),
                 )
                 .await;
                 report.copies_held += held;
@@ -4268,7 +4307,8 @@ async fn fanout_mls_copies_to_helpers(
     target_device: [u8; 32],
     events: &[storage::StoredOutboundEvent],
     group_members: &[[u8; 32]],
-    routes: &std::collections::HashMap<[u8; 32], String>,
+    routes: &std::collections::HashMap<[u8; 32], storage::StoredPeerRoute>,
+    relay: Option<peer::ParticipantRelay>,
 ) -> (usize, Option<String>) {
     let mut last_failure = None;
     for helper_device in group_members.iter().copied() {
@@ -4279,11 +4319,24 @@ async fn fanout_mls_copies_to_helpers(
         {
             continue;
         }
-        let Some(address) = routes.get(&helper_device).cloned() else {
+        let Some(route) = routes.get(&helper_device) else {
             continue;
         };
-        let (stored, failure) =
-            fanout_mls_copies_to_helper(helper_device, address, target_device, events).await;
+        let address = match peer_route_socket(route) {
+            Ok(address) => address,
+            Err(error) => {
+                last_failure = Some(error);
+                continue;
+            }
+        };
+        let (stored, failure) = fanout_mls_copies_to_helper(
+            helper_device,
+            address,
+            relay.clone(),
+            target_device,
+            events,
+        )
+        .await;
         if stored == events.len() {
             return (stored, None);
         }
@@ -4301,7 +4354,8 @@ async fn fanout_mls_copies_to_helpers(
 
 async fn fanout_mls_copies_to_helper(
     helper_device: [u8; 32],
-    address: String,
+    address: Option<std::net::SocketAddr>,
+    relay: Option<peer::ParticipantRelay>,
     target_device: [u8; 32],
     events: &[storage::StoredOutboundEvent],
 ) -> (usize, Option<String>) {
@@ -4309,20 +4363,11 @@ async fn fanout_mls_copies_to_helper(
         Ok(endpoint) => endpoint,
         Err(error) => return (0, Some(format!("invalid helper identity: {error}"))),
     };
-    let address = match address.parse::<std::net::SocketAddr>() {
-        Ok(address) if !address.ip().is_unspecified() && address.port() != 0 => address,
-        _ => {
-            return (
-                0,
-                Some("saved helper route is not a reachable IP:port".to_owned()),
-            );
-        }
-    };
     let identity = match load_peer_secret_key_task().await {
         Ok(identity) => identity,
         Err(error) => return (0, Some(error)),
     };
-    let session = match peer::connect_peer(identity, endpoint, address).await {
+    let session = match peer::connect_peer_with_relay(identity, endpoint, address, relay).await {
         Ok(session) => session,
         Err(error) => return (0, Some(error)),
     };
@@ -4451,7 +4496,8 @@ fn peer_event_from_encrypted(event: &storage::EncryptedEvent) -> peer::MlsEventE
 
 async fn fanout_mls_events_to_peer(
     peer_device: [u8; 32],
-    address: String,
+    address: Option<std::net::SocketAddr>,
+    relay: Option<peer::ParticipantRelay>,
     events_to_send: Vec<storage::StoredOutboundEvent>,
 ) -> (usize, Option<String>) {
     let mut acked = 0;
@@ -4460,23 +4506,15 @@ async fn fanout_mls_events_to_peer(
         Ok(endpoint) => endpoint,
         Err(error) => return (acked, Some(format!("invalid pinned peer key: {error}"))),
     };
-    let address = match address.parse::<std::net::SocketAddr>() {
-        Ok(address) if !address.ip().is_unspecified() && address.port() != 0 => address,
-        _ => {
-            return (
-                acked,
-                Some("saved route is not a reachable IP:port".to_owned()),
-            );
-        }
-    };
     let local_identity = match load_peer_secret_key_task().await {
         Ok(identity) => identity,
         Err(error) => return (acked, Some(error)),
     };
-    let session = match peer::connect_peer(local_identity, endpoint, address).await {
-        Ok(session) => session,
-        Err(error) => return (acked, Some(error)),
-    };
+    let session =
+        match peer::connect_peer_with_relay(local_identity, endpoint, address, relay).await {
+            Ok(session) => session,
+            Err(error) => return (acked, Some(error)),
+        };
     let (commands, receiver) = tokio::sync::mpsc::channel(8);
     let mut stream = Box::pin(session.run(receiver));
     match tokio::time::timeout(Duration::from_secs(8), stream.next()).await {
@@ -5113,6 +5151,22 @@ fn peer_relay_from_config(
     }))
 }
 
+fn peer_route_socket(
+    route: &storage::StoredPeerRoute,
+) -> Result<Option<std::net::SocketAddr>, String> {
+    if route.relay_only {
+        return Ok(None);
+    }
+    let address = route
+        .address
+        .parse::<std::net::SocketAddr>()
+        .map_err(|_| "saved peer route is not an IP address and UDP port".to_owned())?;
+    if address.ip().is_unspecified() || address.port() == 0 {
+        return Err("saved peer route must use a reachable IP and nonzero port".to_owned());
+    }
+    Ok(Some(address))
+}
+
 fn parse_peer_id(value: &str) -> Result<iroh::EndpointId, String> {
     let bytes = hex_decode_key(value)?;
     iroh::EndpointId::from_bytes(&bytes)
@@ -5170,6 +5224,26 @@ mod tests {
             token: "local-development-token-0123456789".to_owned(),
         };
         assert!(validate_peer_relay_config(&local_development).is_ok());
+    }
+
+    #[test]
+    fn saved_relay_routes_do_not_require_a_direct_socket() {
+        let direct = storage::StoredPeerRoute {
+            device_public_key: [0x51; 32],
+            address: "192.168.1.42:45873".to_owned(),
+            relay_only: false,
+        };
+        assert_eq!(
+            peer_route_socket(&direct).unwrap(),
+            Some("192.168.1.42:45873".parse().unwrap())
+        );
+
+        let relay_only = storage::StoredPeerRoute {
+            device_public_key: [0x52; 32],
+            address: "via group relay".to_owned(),
+            relay_only: true,
+        };
+        assert_eq!(peer_route_socket(&relay_only).unwrap(), None);
     }
 
     #[test]

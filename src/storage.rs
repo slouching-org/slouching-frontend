@@ -25,7 +25,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 17;
+const PROFILE_SCHEMA_VERSION: u32 = 18;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 const MAX_DELEGATED_COPY_BYTES: usize = 32 * 1024;
@@ -291,6 +291,7 @@ pub struct StoredDirectMessage {
 pub struct StoredPeerRoute {
     pub device_public_key: [u8; 32],
     pub address: String,
+    pub relay_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,7 +343,33 @@ pub fn save_peer_route(peer_device: [u8; 32], address: &str) -> Result<(), Strin
         return Err("peer route must use a reachable IP and nonzero port".to_owned());
     }
     let mut connection = open_local_database()?;
-    save_peer_route_in(&mut connection, peer_device, &address.to_string())
+    save_peer_route_in(&mut connection, peer_device, &address.to_string(), false)
+}
+
+/// Saves that a pinned peer is reachable through the participant relay configured locally.
+pub fn save_peer_relay_route(peer_device: [u8; 32]) -> Result<(), String> {
+    if peer_device.iter().all(|byte| *byte == 0) {
+        return Err("peer route requires a nonzero pinned device key".to_owned());
+    }
+    let mut connection = open_local_database()?;
+    save_peer_route_in(&mut connection, peer_device, "via group relay", true)
+}
+
+/// Adds a relay route for a pinned peer only if no route was saved yet.
+pub fn ensure_peer_relay_route(peer_device: [u8; 32]) -> Result<(), String> {
+    if peer_device.iter().all(|byte| *byte == 0) {
+        return Err("peer route requires a nonzero pinned device key".to_owned());
+    }
+    let connection = open_local_database()?;
+    connection
+        .execute(
+            "INSERT INTO local_peer_routes (device_public_key, socket_address, relay_only)
+             VALUES (?1, 'via group relay', 1)
+             ON CONFLICT(device_public_key) DO NOTHING",
+            params![peer_device.as_slice()],
+        )
+        .map_err(|error| format!("could not add the pinned peer relay route: {error}"))?;
+    Ok(())
 }
 
 pub fn list_peer_routes() -> Result<Vec<StoredPeerRoute>, String> {
@@ -512,13 +539,16 @@ fn save_peer_route_in(
     connection: &mut Connection,
     peer_device: [u8; 32],
     address: &str,
+    relay_only: bool,
 ) -> Result<(), String> {
     connection
         .execute(
-            "INSERT INTO local_peer_routes (device_public_key, socket_address)
-             VALUES (?1, ?2)
-             ON CONFLICT(device_public_key) DO UPDATE SET socket_address = excluded.socket_address",
-            params![peer_device.as_slice(), address],
+            "INSERT INTO local_peer_routes (device_public_key, socket_address, relay_only)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(device_public_key) DO UPDATE SET
+                 socket_address = excluded.socket_address,
+                 relay_only = excluded.relay_only",
+            params![peer_device.as_slice(), address, relay_only],
         )
         .map_err(|error| format!("could not save pinned peer route: {error}"))?;
     Ok(())
@@ -527,21 +557,26 @@ fn save_peer_route_in(
 fn list_peer_routes_in(connection: &Connection) -> Result<Vec<StoredPeerRoute>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT device_public_key, socket_address FROM local_peer_routes
+            "SELECT device_public_key, socket_address, relay_only FROM local_peer_routes
              ORDER BY socket_address, device_public_key",
         )
         .map_err(|error| format!("could not prepare pinned peer route query: {error}"))?;
     let rows = statement
         .query_map([], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
         })
         .map_err(|error| format!("could not query pinned peer routes: {error}"))?;
     rows.map(|row| {
-        let (device_public_key, address) =
+        let (device_public_key, address, relay_only) =
             row.map_err(|error| format!("could not read pinned peer route: {error}"))?;
         Ok(StoredPeerRoute {
             device_public_key: fixed_bytes(device_public_key, "pinned peer route key")?,
             address,
+            relay_only,
         })
     })
     .collect()
@@ -5003,6 +5038,18 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
             )
             .map_err(|error| format!("could not create local relay settings: {error}"))?;
     }
+    if version < 18 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE local_peer_routes
+                     ADD COLUMN relay_only INTEGER NOT NULL DEFAULT 0
+                         CHECK (relay_only IN (0, 1));
+                 PRAGMA user_version = 18;",
+            )
+            .map_err(|error| {
+                format!("could not add relay routes to the encrypted route book: {error}")
+            })?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -5092,20 +5139,32 @@ mod tests {
         let mut connection =
             open_database(&path, &key).expect("encrypted peer route database should initialize");
 
-        save_peer_route_in(&mut connection, peer, "192.168.1.20:45873")
+        save_peer_route_in(&mut connection, peer, "192.168.1.20:45873", false)
             .expect("first pinned peer route should persist");
-        save_peer_route_in(&mut connection, peer, "192.168.1.21:45873")
+        save_peer_route_in(&mut connection, peer, "192.168.1.21:45873", false)
             .expect("updated address should replace the prior route");
-        save_peer_route_in(&mut connection, another_peer, "[fd00::2]:45874")
+        save_peer_route_in(&mut connection, another_peer, "[fd00::2]:45874", false)
             .expect("IPv6 peer route should persist");
+        let relay_peer = [0x63; 32];
+        save_peer_route_in(&mut connection, relay_peer, "via group relay", true)
+            .expect("relay-only peer route should persist");
 
         let routes = list_peer_routes_in(&connection).expect("pinned routes should reload");
-        assert_eq!(routes.len(), 2);
+        assert_eq!(routes.len(), 3);
         assert!(routes.iter().any(|route| {
-            route.device_public_key == peer && route.address == "192.168.1.21:45873"
+            route.device_public_key == peer
+                && route.address == "192.168.1.21:45873"
+                && !route.relay_only
         }));
         assert!(routes.iter().any(|route| {
-            route.device_public_key == another_peer && route.address == "[fd00::2]:45874"
+            route.device_public_key == another_peer
+                && route.address == "[fd00::2]:45874"
+                && !route.relay_only
+        }));
+        assert!(routes.iter().any(|route| {
+            route.device_public_key == relay_peer
+                && route.address == "via group relay"
+                && route.relay_only
         }));
         drop(connection);
         fs::remove_dir_all(directory).expect("temporary peer route database should be removed");

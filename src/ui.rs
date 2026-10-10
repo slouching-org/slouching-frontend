@@ -2080,7 +2080,11 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
                     format!(
                         "{}… · {}",
                         crate::hex_encode_bytes(&route.device_public_key[..4]),
-                        route.address
+                        if route.relay_only {
+                            "relay do grupo"
+                        } else {
+                            &route.address
+                        }
                     ),
                     10.0,
                     MUTED,

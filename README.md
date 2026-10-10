@@ -65,10 +65,12 @@ path.
    The connected status confirms an authenticated session; it does not claim
    that the route avoided the configured relay.
 
-A successful outbound connection saves the pinned device key and socket address
-in the encrypted local route book. The chat screen lists these routes, and the
-MLS screen can use them to distribute pending Commits to current group members.
-LAN addresses can become stale; peers without a saved route remain pending. The listener stays
+A successful connection saves the pinned device key and its direct socket or
+relay-only route in the encrypted local route book. The chat screen lists these
+routes, and MLS fan-out can use the saved route plus the configured relay to
+retry pending Commits and messages. LAN addresses can become stale; peers
+without a saved route remain pending. Relay-assisted MLS fan-out is implemented
+but has not yet had a separate end-to-end test. The listener stays
 available through the session. Either side can use **Desconectar sessão** to
 close it; start a new session to reconnect. The
 receiver saves an inbound message to its encrypted local history before ACK;
