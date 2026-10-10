@@ -550,10 +550,12 @@ cover every pending recipient event. On the recipient device, enable and save
 the same helper URL, then choose **Buscar cópias agora**. The client checks the
 recipient grant and event metadata, persists the MLS event locally, and only
 then ACKs deletion at the helper. The helper ACK confirms storage removal, not
-MLS delivery. Fetch is manual and limited to 16 copies per click; repeat it to
-continue. Loopback HTTP is accepted for development; remote helper URLs require
-HTTPS. Remote deployment and physical-device use remain unverified, and this
-mailbox does not create a live P2P route or traverse NAT.
+MLS delivery. Fetch is manual and follows every 16-copy page until the helper
+has no more copies. A cross-repository smoke test uploads 18 signed copies,
+reads both pages, and ACKs them through a live local Elixir helper. Loopback
+HTTP is accepted for development; remote helper URLs require HTTPS. Remote
+deployment and physical-device use remain unverified, and this mailbox does
+not create a live P2P route or traverse NAT.
 
 The MLS screen now detects authenticated committer equivocation. It verifies a
 conflicting historical Commit against a saved OpenMLS epoch snapshot, stores
