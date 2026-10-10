@@ -63,6 +63,16 @@ pub fn capture(id: u32) -> Result<CapturedScreen, String> {
 }
 
 pub fn enumerate_windows() -> Result<Vec<WindowSource>, String> {
+    #[cfg(target_os = "linux")]
+    if wayland_window_capture_unavailable(
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        std::env::var_os("DISPLAY").is_some(),
+    ) {
+        return Err(
+            "captura de janelas nativas não está disponível em Wayland puro; use uma sessão X11/Xorg ou uma janela executada por XWayland".to_owned(),
+        );
+    }
+
     let mut windows = Vec::new();
     for window in xcap::Window::all()
         .map_err(|error| format!("não foi possível enumerar janelas: {error}"))?
@@ -131,6 +141,11 @@ fn validate_dimensions(width: u32, height: u32) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn wayland_window_capture_unavailable(wayland_display: bool, x11_display: bool) -> bool {
+    wayland_display && !x11_display
+}
+
 #[cfg(test)]
 mod tests {
     use super::validate_dimensions;
@@ -140,5 +155,13 @@ mod tests {
         assert!(validate_dimensions(7680, 4320).is_ok());
         assert!(validate_dimensions(1, 720).is_err());
         assert!(validate_dimensions(7680, 4321).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pure_wayland_reports_x11_window_capture_requirement() {
+        assert!(super::wayland_window_capture_unavailable(true, false));
+        assert!(!super::wayland_window_capture_unavailable(true, true));
+        assert!(!super::wayland_window_capture_unavailable(false, false));
     }
 }

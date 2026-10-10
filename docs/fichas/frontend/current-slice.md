@@ -138,7 +138,8 @@ stream over the same video channel; only one source can be active. The window
 tab enumerates visible windows and supports explicit local preview or in-call
 H.264/SFrame sharing through that channel. Linux window enumeration uses
 X11/Xorg; pure Wayland enumeration is not supported by the current capture
-library. A two-frame
+library and the picker reports that requirement. Native Wayland windows need
+desktop-portal capture support. A two-frame
 queue and 1920 × 1080 capture bound limit camera buffering. Device enumeration
 works on this host, but opening a camera and remote playback still need physical
 validation. The call's room chat sends

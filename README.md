@@ -104,8 +104,10 @@ closed or its capture permission is revoked, the picker reports the failure;
 **Parar compartilhamento** stops the stream. Source names and dimensions come
 from the OS at enumeration time, and a refresh updates the list.
 On Linux, window enumeration uses the X11/Xorg backend; the current capture
-library does not enumerate windows in a pure Wayland session. The picker is
-available through XWayland when the app has a working X11 display connection.
+library does not enumerate windows in a pure Wayland session. The picker can
+list XWayland windows when the app has a working X11 display connection; native
+Wayland windows and portal-based selection are not implemented yet. A pure
+Wayland session now shows this limitation directly in the picker.
 
 ## Direct peer messages
 
