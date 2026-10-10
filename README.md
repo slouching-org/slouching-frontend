@@ -34,10 +34,15 @@ connection.
 The native client has an internal file-transfer crypto foundation: random
 per-file keys, authenticated 48 KiB chunks, a 100 MiB size bound, ciphertext
 digests, bounded streaming encryption/decryption, and a filename-only offer
-format. The receive core stages plaintext in a temporary file and publishes it
-only after digest validation, without replacing an existing destination. File
-sharing is not usable yet; the peer protocol, accept/save flow, and UI remain to
-be built.
+format. Encrypted blobs can be stored persistently and fetched over Iroh QUIC;
+the provider handler requires explicit peer authorization. The receive core
+stages plaintext in a temporary file and publishes it only after digest
+validation, without replacing an existing destination. Local two-endpoint
+tests cover authorized retrieval and rejection of an unauthorized peer. The app
+does not yet wire this service to MLS authorization, persist offer keys in the
+encrypted profile, or expose a send/accept/save flow in the UI. The pinned
+iroh-blobs 0.103.1 release is marked by its maintainers as not production
+quality, so this remains an experimental feature in this early build.
 
 The app also opens `ws://127.0.0.1:3707/ws` asynchronously, sends a binary
 protobuf `ClientHello` v1, and validates one binary `ServerHello` or

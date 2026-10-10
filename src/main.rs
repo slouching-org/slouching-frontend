@@ -1,6 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use iced::{Element, Task, Theme, task::Handle};
 
+pub mod blob_store;
 pub mod file_transfer;
 pub mod identity;
 mod peer;
