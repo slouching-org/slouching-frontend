@@ -672,13 +672,18 @@ Assets and font license/provenance notes are in [assets/README.md](assets/README
   ACK ledger, and retryable outbox. Membership Commit bytes are
   atomically journaled with group state; ordered direct delivery, per-device
   ACKs, predecessor recovery, and sequential multi-member fan-out over saved
-  pinned routes are available. Helper delivery, offline delivery, and media
-  remain in progress.
+  pinned routes are available. Best-effort copy delivery through opted-in peers
+  and the optional Elixir HTTPS mailbox is implemented; local call media paths
+  are also present. Remote helper deployment, physical-device media, and
+  cross-network behavior remain unverified.
 - **Server/backend:** Elixir in
   [`slouching-org/slouching-backend`](https://github.com/slouching-org/slouching-backend).
-- **Current boundary:** loopback HTTP status and binary protobuf WebSocket
-  handshake v1 and persistent Ping/Pong for development diagnostics. Authenticated production transport
-  and functional APIs remain open design work.
+- **Current boundary:** the Elixir helper provides loopback diagnostics,
+  experimental SPAKE2 rendezvous, and an optional signed-ciphertext mailbox API.
+  The Rust client uses these helper APIs for pairing and mailbox delivery; direct
+  chat and calls use peer transports. Remote deployment and physical-device
+  validation remain open. General contact discovery and a central messaging
+  gateway are not implemented or required for peer-first operation.
 - **Source of truth:** implemented backend and client-core state for identity,
   delivery, connections, capture, and calls. The UI must never invent them.
 
