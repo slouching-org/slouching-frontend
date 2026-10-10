@@ -3,6 +3,7 @@ use iced::{Element, Task, Theme, task::Handle};
 
 pub mod audio;
 pub mod blob_store;
+pub mod call_rtc;
 pub mod file_transfer;
 pub mod identity;
 pub mod media;
@@ -174,6 +175,20 @@ struct PendingMlsAttachmentBlob {
     ciphertext_hash: [u8; 32],
 }
 
+#[derive(Debug, Clone)]
+struct CallOfferReady {
+    group_id: [u8; 16],
+    epoch: u64,
+    peer_device: [u8; 32],
+    rtc: std::sync::Arc<call_rtc::CallRtcSession>,
+    offer: Vec<u8>,
+}
+
+type ProcessedCallSignal = (
+    Option<std::sync::Arc<call_rtc::CallRtcSession>>,
+    Option<Vec<u8>>,
+);
+
 #[derive(Debug, Clone, Copy)]
 struct PendingMlsAttachmentTransfer {
     event_id: [u8; 16],
@@ -285,6 +300,8 @@ struct Slouching {
     call_group_id: String,
     call_group_status: String,
     call_group_creating: bool,
+    call_rtc_session: Option<std::sync::Arc<call_rtc::CallRtcSession>>,
+    call_rtc_generation: u64,
     mls_fanout_running: bool,
     mls_event_fanout_running: bool,
     mls_pending_events: std::collections::HashMap<u64, ([u8; 16], [u8; 32])>,
@@ -468,6 +485,8 @@ impl Default for Slouching {
             call_group_id: String::new(),
             call_group_status: "Crie um grupo MLS isolado para preparar uma chamada.".to_owned(),
             call_group_creating: false,
+            call_rtc_session: None,
+            call_rtc_generation: 0,
             mls_fanout_running: false,
             mls_event_fanout_running: false,
             mls_pending_events: std::collections::HashMap::new(),
@@ -631,6 +650,16 @@ enum Message {
     CreateCallMlsGroup,
     CallMlsGroupCreated(Result<storage::CreatedMlsGroup, String>),
     OpenCallMlsGroup,
+    StartCall,
+    EndCall,
+    CallOfferCreated(Result<CallOfferReady, String>),
+    CallSignalProcessed(
+        u64,
+        u64,
+        peer::CallSignal,
+        Result<ProcessedCallSignal, String>,
+    ),
+    CallRtcStateChanged(u64, String),
     PrepareMlsKeyPackage,
     MlsKeyPackagePrepared(Result<storage::PreparedMlsKeyPackage, String>),
     AdmitMlsMember,
@@ -903,6 +932,188 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 return Task::batch([load_mls_history(state, group_id), load_mls_groups()]);
             }
             state.call_group_status = "Crie ou selecione um grupo MLS de chamada primeiro.".into();
+        }
+        Message::StartCall => {
+            let Some(peer_device) = state
+                .active_peer_device
+                .filter(|_| active_peer_is_pinned(state))
+            else {
+                state.call_group_status =
+                    "Conecte primeiro ao peer fixado em Texto direto · LAN/VPN.".into();
+                return Task::none();
+            };
+            let group_id = match hex_decode_bytes(&state.call_group_id) {
+                Ok(bytes) if bytes.len() == 16 => <[u8; 16]>::try_from(bytes.as_slice()).unwrap(),
+                _ => {
+                    state.call_group_status =
+                        "Crie ou selecione um grupo MLS de chamada válido.".into();
+                    return Task::none();
+                }
+            };
+            if state.call_rtc_session.is_some() {
+                state.call_group_status =
+                    "A sessão WebRTC já foi iniciada; aguarde a negociação ou encerre-a.".into();
+                return Task::none();
+            }
+            state.call_group_status = "Validando grupo MLS e reunindo candidatos WebRTC…".into();
+            return Task::perform(
+                prepare_call_offer_task(group_id, peer_device),
+                Message::CallOfferCreated,
+            );
+        }
+        Message::EndCall => {
+            if let Some(session) = state.call_rtc_session.take() {
+                let commands = state.peer_session_commands.clone();
+                let group_id = hex_decode_bytes(&state.call_group_id)
+                    .ok()
+                    .and_then(|bytes| <[u8; 16]>::try_from(bytes.as_slice()).ok());
+                let request_id = state.peer_next_request_id;
+                state.peer_next_request_id = state.peer_next_request_id.saturating_add(1);
+                state.call_rtc_generation = state.call_rtc_generation.saturating_add(1);
+                state.call_group_status = "Encerrando chamada direta…".into();
+                return Task::perform(
+                    async move {
+                        session.close().await?;
+                        if let (Some(commands), Some(group_id)) = (commands, group_id) {
+                            let context = tokio::task::spawn_blocking(move || {
+                                storage::load_call_media_context(&group_id)
+                            })
+                            .await
+                            .map_err(|error| format!("call context task failed: {error}"))??;
+                            commands
+                                .send(peer::PeerCommand::SendCallSignal {
+                                    request_id,
+                                    signal: peer::CallSignal {
+                                        group_id,
+                                        epoch: context.epoch,
+                                        kind: peer::CallSignalKind::End,
+                                        payload: Vec::new(),
+                                    },
+                                })
+                                .await
+                                .map_err(|error| {
+                                    format!("could not send call end signal: {error}")
+                                })?;
+                        }
+                        Ok::<(), String>(())
+                    },
+                    |result| {
+                        Message::CallRtcStateChanged(
+                            0,
+                            result.map_or_else(
+                                |e| format!("Falha ao encerrar chamada: {e}"),
+                                |_| "Chamada encerrada.".to_owned(),
+                            ),
+                        )
+                    },
+                );
+            }
+        }
+        Message::CallOfferCreated(result) => match result {
+            Ok(ready) => {
+                let Some(commands) = state.peer_session_commands.as_ref() else {
+                    state.call_group_status =
+                        "Sessão P2P foi encerrada antes de enviar a oferta.".into();
+                    return Task::none();
+                };
+                if !active_peer_is_pinned(state)
+                    || state.active_peer_device != Some(ready.peer_device)
+                {
+                    state.call_group_status =
+                        "Peer mudou durante a preparação; oferta descartada.".into();
+                    return Task::none();
+                }
+                let request_id = state.peer_next_request_id;
+                state.peer_next_request_id = state.peer_next_request_id.saturating_add(1);
+                state.call_rtc_session = Some(ready.rtc.clone());
+                state.call_rtc_generation = state.call_rtc_generation.saturating_add(1);
+                let generation = state.call_rtc_generation;
+                let rtc = ready.rtc.clone();
+                let signal = peer::CallSignal {
+                    group_id: ready.group_id,
+                    epoch: ready.epoch,
+                    kind: peer::CallSignalKind::Offer,
+                    payload: ready.offer,
+                };
+                if let Err(error) =
+                    commands.try_send(peer::PeerCommand::SendCallSignal { request_id, signal })
+                {
+                    state.call_rtc_session = None;
+                    state.call_group_status =
+                        format!("Não foi possível enviar a oferta pela sessão fixada: {error}");
+                    return Task::none();
+                }
+                state.call_group_status = "Oferta WebRTC enviada pelo canal QUIC pinado; aguardando resposta do peer (sem áudio/vídeo ainda).".into();
+                return watch_call_rtc_state(generation, rtc);
+            }
+            Err(error) => {
+                state.call_group_status = format!("Não foi possível iniciar a chamada: {error}")
+            }
+        },
+        Message::CallSignalProcessed(generation, sequence, signal, result) => match result {
+            Ok((session, answer)) => {
+                if let Some(commands) = state.peer_session_commands.as_ref() {
+                    if let Err(error) =
+                        commands.try_send(peer::PeerCommand::AcceptInbound { sequence })
+                    {
+                        state.call_group_status =
+                            format!("Sinal validado, mas o ACK não foi enviado: {error}");
+                        return Task::none();
+                    }
+                    if let Some(payload) = answer {
+                        let reply_id = state.peer_next_request_id;
+                        state.peer_next_request_id = state.peer_next_request_id.saturating_add(1);
+                        if let Err(error) = commands.try_send(peer::PeerCommand::SendCallSignal {
+                            request_id: reply_id,
+                            signal: peer::CallSignal {
+                                group_id: signal.group_id,
+                                epoch: signal.epoch,
+                                kind: peer::CallSignalKind::Answer,
+                                payload,
+                            },
+                        }) {
+                            state.call_group_status = format!(
+                                "Oferta aceita, mas não foi possível enviar a resposta WebRTC: {error}"
+                            );
+                            return Task::none();
+                        }
+                    }
+                }
+                if let Some(session) = session {
+                    state.call_rtc_session = Some(session.clone());
+                    state.call_rtc_generation = generation;
+                    state.call_group_status = match signal.kind {
+                        peer::CallSignalKind::Offer => "Resposta WebRTC enviada pelo canal QUIC pinado; ICE/DTLS conectando (sem mídia ainda).".into(),
+                        peer::CallSignalKind::Answer => "Resposta recebida; ICE/DTLS conectando (sem mídia ainda).".into(),
+                        peer::CallSignalKind::IceCandidate => "Candidato ICE validado e aplicado.".into(),
+                        peer::CallSignalKind::End => "Peer encerrou a chamada.".into(),
+                    };
+                    if signal.kind != peer::CallSignalKind::End {
+                        return watch_call_rtc_state(generation, session);
+                    }
+                } else {
+                    state.call_rtc_session = None;
+                    state.call_group_status = "Peer encerrou a chamada.".into();
+                }
+            }
+            Err(error) => {
+                if let Some(commands) = state.peer_session_commands.as_ref() {
+                    let _ = commands.try_send(peer::PeerCommand::RejectInbound {
+                        sequence,
+                        reason: error.clone(),
+                    });
+                }
+                state.call_group_status =
+                    format!("Sinal de chamada rejeitado; nenhuma negociação aplicada: {error}");
+            }
+        },
+        Message::CallRtcStateChanged(generation, state_name) => {
+            if generation == 0 || generation == state.call_rtc_generation {
+                state.call_group_status = state_name;
+                if generation == 0 {
+                    state.call_rtc_session = None;
+                }
+            }
         }
         Message::InviteChanged(value) => state.invite = value,
         Message::NameChanged(value) => state.name = value,
@@ -1959,6 +2170,67 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                             ));
                             state.mls_status = "Welcome recebido do committer fixado. Revise o convite e clique em Validar Welcome e entrar para salvar antes do ACK.".into();
                         }
+                    }
+                    peer::PeerEvent::CallSignalReceived {
+                        sequence,
+                        peer_id,
+                        signal,
+                    } => {
+                        let peer_device = *peer_id.as_bytes();
+                        let selected_group = hex_decode_bytes(&state.call_group_id).ok();
+                        let rejection = if !active_peer_is_pinned(state)
+                            || Some(peer_device) != state.active_peer_device
+                        {
+                            Some("call signaling requires the manually pinned active peer")
+                        } else if selected_group.as_deref() != Some(signal.group_id.as_slice()) {
+                            Some("select the matching call MLS group before accepting signaling")
+                        } else if state.call_rtc_session.is_none()
+                            && signal.kind != peer::CallSignalKind::Offer
+                            && signal.kind != peer::CallSignalKind::End
+                        {
+                            Some("received call signal without an active WebRTC negotiation")
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = rejection {
+                            if let Some(commands) = state.peer_session_commands.as_ref() {
+                                let _ = commands.try_send(peer::PeerCommand::RejectInbound {
+                                    sequence,
+                                    reason: reason.to_owned(),
+                                });
+                            }
+                            state.call_group_status =
+                                format!("Sinal de chamada recusado: {reason}.");
+                            return Task::none();
+                        }
+                        let generation = if signal.kind == peer::CallSignalKind::Offer {
+                            state.call_rtc_generation.saturating_add(1)
+                        } else {
+                            state.call_rtc_generation
+                        };
+                        let existing = state.call_rtc_session.clone();
+                        state.call_group_status =
+                            "Validando época e membro MLS antes de aplicar sinal WebRTC…".into();
+                        return Task::perform(
+                            process_call_signal_task(signal.clone(), peer_device, existing),
+                            move |result| {
+                                Message::CallSignalProcessed(generation, sequence, signal, result)
+                            },
+                        );
+                    }
+                    peer::PeerEvent::CallSignalAcknowledged { request_id } => {
+                        state.call_group_status = format!(
+                            "Sinal de chamada {request_id} foi aceito pelo peer; aguardando estado WebRTC."
+                        );
+                    }
+                    peer::PeerEvent::CallSignalRejected { request_id, reason } => {
+                        state.call_group_status =
+                            format!("Sinal de chamada {request_id} rejeitado pelo peer: {reason}");
+                    }
+                    peer::PeerEvent::CallSignalDeliveryUnknown { request_id } => {
+                        state.call_group_status = format!(
+                            "Entrega do sinal {request_id} é desconhecida; chamada não confirmada."
+                        );
                     }
                     peer::PeerEvent::MlsCommitRequested {
                         peer_id,
@@ -4317,6 +4589,16 @@ fn boot() -> (Slouching, Task<Message>) {
             text: attachment,
         }];
     }
+    if args.iter().any(|arg| arg == "--capture-call-negotiation") {
+        state.screen = Screen::Call;
+        state.identity_status = IdentityStatus::Ready([0x11; 32]);
+        state.active_peer_device = Some([0x22; 32]);
+        state.peer_public_key = hex_encode_key(&[0x22; 32]);
+        state.call_group_id = "5f8d4d2a7c314e6a9b0f123456789abc".to_owned();
+        state.call_group_status =
+            "Pronto para negociar com o peer MLS fixado · áudio/vídeo ainda não conectados."
+                .to_owned();
+    }
     if capture_peer_verification {
         let peer_key = [0x22; 32];
         state.screen = Screen::Verify;
@@ -4757,6 +5039,92 @@ async fn create_call_mls_group_task() -> Result<storage::CreatedMlsGroup, String
     })
     .await
     .map_err(|error| format!("call MLS group task failed: {error}"))?
+}
+
+async fn prepare_call_offer_task(
+    group_id: [u8; 16],
+    peer_device: [u8; 32],
+) -> Result<CallOfferReady, String> {
+    let context = tokio::task::spawn_blocking(move || storage::load_call_media_context(&group_id))
+        .await
+        .map_err(|error| format!("call MLS context task failed: {error}"))??;
+    let epoch = context.epoch;
+    if context.member_index(&peer_device).is_none() {
+        return Err("o peer pinado não pertence ao grupo MLS de chamada ativo".to_owned());
+    }
+    let rtc = std::sync::Arc::new(call_rtc::CallRtcSession::new().await?);
+    let offer = rtc.create_offer().await?;
+    Ok(CallOfferReady {
+        group_id,
+        epoch,
+        peer_device,
+        rtc,
+        offer,
+    })
+}
+
+async fn process_call_signal_task(
+    signal: peer::CallSignal,
+    peer_device: [u8; 32],
+    existing: Option<std::sync::Arc<call_rtc::CallRtcSession>>,
+) -> Result<ProcessedCallSignal, String> {
+    let group_id = signal.group_id;
+    let context = tokio::task::spawn_blocking(move || storage::load_call_media_context(&group_id))
+        .await
+        .map_err(|error| format!("call MLS context task failed: {error}"))??;
+    if context.epoch != signal.epoch {
+        return Err(format!(
+            "sinal usa epoch {}, mas o grupo MLS está no epoch {}",
+            signal.epoch, context.epoch
+        ));
+    }
+    if context.member_index(&peer_device).is_none() {
+        return Err("autor do sinal não é membro autenticado do grupo MLS de chamada".to_owned());
+    }
+    match signal.kind {
+        peer::CallSignalKind::Offer => {
+            if existing.is_some() {
+                return Err("já existe uma sessão WebRTC para este peer".to_owned());
+            }
+            let rtc = std::sync::Arc::new(call_rtc::CallRtcSession::new().await?);
+            let answer = rtc.accept_offer(&signal.payload).await?;
+            Ok((Some(rtc), Some(answer)))
+        }
+        peer::CallSignalKind::Answer => {
+            let rtc = existing.ok_or_else(|| "resposta recebida sem oferta local".to_owned())?;
+            rtc.accept_answer(&signal.payload).await?;
+            Ok((Some(rtc), None))
+        }
+        peer::CallSignalKind::IceCandidate => {
+            let rtc =
+                existing.ok_or_else(|| "candidato ICE recebido sem sessão WebRTC".to_owned())?;
+            rtc.add_ice_candidate(&signal.payload).await?;
+            Ok((Some(rtc), None))
+        }
+        peer::CallSignalKind::End => {
+            if !signal.payload.is_empty() {
+                return Err("sinal de encerramento deve ter payload vazio".to_owned());
+            }
+            if let Some(rtc) = existing {
+                rtc.close().await?;
+            }
+            Ok((None, None))
+        }
+    }
+}
+
+fn watch_call_rtc_state(
+    generation: u64,
+    rtc: std::sync::Arc<call_rtc::CallRtcSession>,
+) -> Task<Message> {
+    let events = async_stream::stream! {
+        let mut state = rtc.connection_state();
+        yield Message::CallRtcStateChanged(generation, format!("WebRTC: {} · áudio/vídeo ainda não conectados.", *state.borrow()));
+        while state.changed().await.is_ok() {
+            yield Message::CallRtcStateChanged(generation, format!("WebRTC: {} · áudio/vídeo ainda não conectados.", *state.borrow()));
+        }
+    };
+    Task::run(events, |message| message)
 }
 
 async fn create_mls_key_package_task() -> Result<storage::PreparedMlsKeyPackage, String> {

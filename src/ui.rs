@@ -1171,6 +1171,20 @@ fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 true
             ),
             l.control(
+                "headphones",
+                if state.call_rtc_session.is_some() {
+                    "Encerrar chamada"
+                } else {
+                    "Negociar WebRTC"
+                },
+                Some(if state.call_rtc_session.is_some() {
+                    Message::EndCall
+                } else {
+                    Message::StartCall
+                }),
+                state.call_rtc_session.is_some() || state.active_peer_device.is_some()
+            ),
+            l.control(
                 "plus",
                 "Preparar outra chamada",
                 Some(Message::CreateCallMlsGroup),
@@ -1184,7 +1198,15 @@ fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
         l.label("GRUPO MLS DA CHAMADA", 11.0, GOLD),
         call_group_controls,
         l.label(&state.call_group_status, 10.0, MUTED),
-        l.label("ÁUDIO E VÍDEO · ainda não conectados", 9.0, VIOLET),
+        l.label(
+            if state.call_rtc_session.is_some() {
+                "WEBRTC · negociação em andamento; mídia ainda não conectada"
+            } else {
+                "ÁUDIO E VÍDEO · ainda não conectados"
+            },
+            9.0,
+            VIOLET
+        ),
         rule(LINE, 1.0),
         l.label("PRÉVIA VISUAL", 10.0, MUTED),
         scrollable(samples).height(Fill)

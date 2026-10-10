@@ -358,7 +358,7 @@ be installed and available in the user session.
 
 ![Actual native Iced peer verification screen after importing a QR, with separate LAN and VPN address choices; all values are capture fixtures](docs/design/runtime/native-vhs/08-verify-invite-imported.png)
 
-![Native Iced group-call preview captured before the MLS group setup controls were added; media and sample messages are illustrative](docs/design/runtime/native-vhs/10-call.png)
+![Native Iced call preview captured before the current MLS group and WebRTC negotiation controls; media and sample messages are illustrative](docs/design/runtime/native-vhs/10-call.png)
 
 ![Actual 934 × 1000 native Iced MLS screen showing pending, approved, and rejected self-update proposal review controls; proposal rows are capture fixtures](docs/design/runtime/native-vhs/11-mls.png)
 
@@ -408,6 +408,7 @@ SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-capture
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-verification
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-invite
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-invite-imported
+SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 10-call --capture-call-negotiation
 ```
 
 The capture command renders all twelve screens, saves screenshots through
@@ -432,6 +433,8 @@ screen capture; they are fixtures, not identities from the keyring.
 in the identity screen; its keys and address are fixtures.
 `--capture-peer-invite-imported` shows the selectable LAN and VPN addresses
 after QR import; all values are fixtures.
+`--capture-call-negotiation` shows call controls with sample identity, peer, and
+group values; they do not represent a live MLS group or WebRTC session.
 
 Assets and font license/provenance notes are in [assets/README.md](assets/README.md).
 

@@ -115,11 +115,14 @@ The audio settings enumerate the host's real input/output devices and let the
 user choose one in the running app. **Testar microfone localmente** explicitly
 opens the selected input and shows an RMS level meter; samples are not saved or
 sent, and the test stops when leaving the audio tab or screen. The device
-choice is not persisted or used by calls yet. Character scenes and call views
-remain visual previews. Call MLS groups and SFrame member binding are implemented, and the pinned QUIC
-protocol now carries bounded call-signaling frames. The UI rejects those frames
-until its WebRTC controller is ready. Camera capture, live audio transport,
-screen capture, contact discovery, QR pairing, and guaranteed offline delivery
+choice is not persisted or used by calls yet. Character scenes remain visual
+previews. Call MLS groups and authenticated SFrame member binding are
+implemented. The call screen can start and end a WebRTC offer/answer negotiation
+over pinned QUIC after validating the peer's current call-group membership and
+epoch; gathered host candidates are included in SDP. Local ICE/DTLS loopback is
+tested, but audio/video tracks, microphone/camera capture, SFrame frame transport,
+and a two-machine VPN call are not implemented or verified. Screen capture,
+contact discovery, QR pairing, and guaranteed offline delivery
 are not implemented. The older web UI under
 `prototypes/web/` is a design benchmark, not the product runtime.
 

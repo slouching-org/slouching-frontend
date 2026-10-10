@@ -72,10 +72,13 @@ The home view keeps the supplied night scenery and call controls, with an
 icon-based feature strip. Its frog mage and gnome foreground cutouts have been
 removed to keep the scene open.
 
-The call screen now creates a call-specific MLS group, copies its ID, and opens
-the existing MLS member-invitation screen. The committed `10-call.png` still
-shows the earlier preview because this environment has no graphical display to
-capture the updated Iced window; its sample people and chat remain illustrative.
+The call screen creates a call-specific MLS group, copies its ID, opens the MLS
+member-invitation screen, and can negotiate WebRTC offer/answer signaling over
+the pinned peer session. The committed `10-call.png` still shows the earlier
+preview because this environment has no graphical display to capture the
+updated Iced window; its sample people and chat remain illustrative. Use
+`--capture-call-negotiation` with `--capture-screen 10-call` to supply fixture
+identity, peer, and group values for a future native capture.
 
 Reproduce with `cargo run -- --capture-dir /tmp/slouching-captures`.
 Request a size with `SLOUCHING_WINDOW_SIZE=1280x800`; a tiling compositor may
