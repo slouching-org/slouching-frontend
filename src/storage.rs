@@ -1758,12 +1758,23 @@ pub fn sign_delivery_http_request(
     nonce: &[u8; 32],
     body: &[u8],
 ) -> Result<([u8; 32], [u8; 64]), String> {
-    let payload = delivery_http_request_payload(method, path, timestamp, nonce, body)?;
     let entry = identity_key_entry()?;
     let secret = entry
         .get_secret()
         .map_err(|error| format!("could not load the device identity key: {error}"))?;
     let identity = signing_key_from_secret(secret)?;
+    sign_delivery_http_request_with_identity(&identity, method, path, timestamp, nonce, body)
+}
+
+pub(crate) fn sign_delivery_http_request_with_identity(
+    identity: &SigningKey,
+    method: &str,
+    path: &str,
+    timestamp: &str,
+    nonce: &[u8; 32],
+    body: &[u8],
+) -> Result<([u8; 32], [u8; 64]), String> {
+    let payload = delivery_http_request_payload(method, path, timestamp, nonce, body)?;
     let signature = identity.sign(&payload).to_bytes();
     Ok((identity.verifying_key().to_bytes(), signature))
 }
@@ -3559,7 +3570,7 @@ pub fn sign_delegated_mls_copy_grant(
     sign_delegated_mls_copy_grant_with_identity(event, recipient_device, &identity)
 }
 
-fn sign_delegated_mls_copy_grant_with_identity(
+pub(crate) fn sign_delegated_mls_copy_grant_with_identity(
     event: &EncryptedEvent,
     recipient_device: [u8; 32],
     identity: &SigningKey,

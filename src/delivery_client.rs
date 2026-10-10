@@ -167,6 +167,24 @@ pub async fn list_copies(
     after_id: i64,
     limit: usize,
 ) -> Result<MailboxPage, String> {
+    list_copies_with_signer(
+        helper_url,
+        after_id,
+        limit,
+        crate::storage::sign_delivery_http_request,
+    )
+    .await
+}
+
+async fn list_copies_with_signer<F>(
+    helper_url: &str,
+    after_id: i64,
+    limit: usize,
+    signer: F,
+) -> Result<MailboxPage, String>
+where
+    F: FnOnce(&str, &str, &str, &[u8; 32], &[u8]) -> Result<([u8; 32], [u8; 64]), String>,
+{
     if after_id < 0 || limit == 0 {
         return Err("mailbox cursor or page size is invalid".into());
     }
@@ -174,7 +192,14 @@ pub async fn list_copies(
     let query = format!("after_id={after_id}&limit={limit}");
     let path = format!("/api/delivery/copies?{query}");
     let endpoint = endpoint(helper_url, &path)?;
-    let request = signed_request(client()?, reqwest::Method::GET, &endpoint, &path, &[])?;
+    let request = signed_request_with(
+        client()?,
+        reqwest::Method::GET,
+        &endpoint,
+        &path,
+        &[],
+        signer,
+    )?;
     let response = request
         .send()
         .await
@@ -217,9 +242,32 @@ pub async fn list_copies(
 }
 
 pub async fn acknowledge_copy(helper_url: &str, event_id: &[u8; 16]) -> Result<(), String> {
+    acknowledge_copy_with_signer(
+        helper_url,
+        event_id,
+        crate::storage::sign_delivery_http_request,
+    )
+    .await
+}
+
+async fn acknowledge_copy_with_signer<F>(
+    helper_url: &str,
+    event_id: &[u8; 16],
+    signer: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&str, &str, &str, &[u8; 32], &[u8]) -> Result<([u8; 32], [u8; 64]), String>,
+{
     let path = format!("/api/delivery/copies/{}/ack", hex::encode(event_id));
     let endpoint = endpoint(helper_url, &path)?;
-    let request = signed_request(client()?, reqwest::Method::POST, &endpoint, &path, &[])?;
+    let request = signed_request_with(
+        client()?,
+        reqwest::Method::POST,
+        &endpoint,
+        &path,
+        &[],
+        signer,
+    )?;
     let response = request
         .send()
         .await
@@ -245,13 +293,17 @@ fn client() -> Result<reqwest::Client, String> {
         .map_err(|error| format!("could not create mailbox HTTP client: {error}"))
 }
 
-fn signed_request(
+fn signed_request_with<F>(
     client: reqwest::Client,
     method: reqwest::Method,
     endpoint: &Url,
     path: &str,
     body: &[u8],
-) -> Result<reqwest::RequestBuilder, String> {
+    signer: F,
+) -> Result<reqwest::RequestBuilder, String>
+where
+    F: FnOnce(&str, &str, &str, &[u8; 32], &[u8]) -> Result<([u8; 32], [u8; 64]), String>,
+{
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| format!("system clock is before Unix epoch: {error}"))?
@@ -260,13 +312,7 @@ fn signed_request(
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce)
         .map_err(|error| format!("could not create request nonce: {error}"))?;
-    let (device, signature) = crate::storage::sign_delivery_http_request(
-        method.as_str(),
-        path,
-        &timestamp,
-        &nonce,
-        body,
-    )?;
+    let (device, signature) = signer(method.as_str(), path, &timestamp, &nonce, body)?;
     Ok(client
         .request(method, endpoint.clone())
         .header("x-slouching-device", hex::encode(device))
@@ -289,6 +335,7 @@ async fn read_api_error(response: reqwest::Response, operation: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
 
     #[test]
     fn remote_mailbox_requires_https_but_loopback_http_is_available_for_development() {
@@ -298,5 +345,103 @@ mod tests {
         assert!(validate_helper_url("http://mailbox.crew.example").is_err());
         assert!(validate_helper_url("https://user:pass@mailbox.crew.example").is_err());
         assert!(validate_helper_url("https://mailbox.crew.example/nested").is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Elixir mailbox; run scripts/smoke-delivery-mailbox-e2e.sh"]
+    async fn signed_mailbox_client_round_trips_against_live_helper() {
+        let helper_url = std::env::var("SLOUCHING_DELIVERY_MAILBOX_URL")
+            .expect("the mailbox smoke script should provide the helper URL");
+        let author = SigningKey::from_bytes(&[0x61; 32]);
+        let recipient = SigningKey::from_bytes(&[0x62; 32]);
+        let expires_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_secs() as i64
+            + 3_600;
+        let event = crate::storage::EncryptedEvent {
+            event_id: [0x63; 16],
+            author_device: author.verifying_key().to_bytes(),
+            group_id: vec![0x64; 16],
+            epoch: 7,
+            checkpoint: Some(vec![0x65; 8]),
+            expires_at_unix,
+            ciphertext: b"mailbox cross-repository ciphertext".to_vec(),
+        };
+        let grant = crate::storage::sign_delegated_mls_copy_grant_with_identity(
+            &event,
+            recipient.verifying_key().to_bytes(),
+            &author,
+        )
+        .expect("the author should sign the recipient-bound event copy");
+        let payload = encode_copy(&grant, &event).expect("copy envelope should encode");
+
+        let mut tampered = payload.clone();
+        let signature_offset = 154;
+        tampered[signature_offset] ^= 1;
+        assert!(upload_copy(&helper_url, &tampered).await.is_err());
+        assert!(
+            !upload_copy(&helper_url, &payload)
+                .await
+                .expect("Elixir should accept the signed copy")
+        );
+        assert!(
+            upload_copy(&helper_url, &payload)
+                .await
+                .expect("identical upload should be idempotent")
+        );
+
+        let recipient_seed = [0x62; 32];
+        let page = list_copies_with_signer(
+            &helper_url,
+            0,
+            16,
+            move |method, path, timestamp, nonce, body| {
+                let identity = SigningKey::from_bytes(&recipient_seed);
+                crate::storage::sign_delivery_http_request_with_identity(
+                    &identity, method, path, timestamp, nonce, body,
+                )
+            },
+        )
+        .await
+        .expect("the helper should authenticate and return a recipient page");
+        assert_eq!(page.copies.len(), 1);
+        assert_eq!(page.next_after_id, None);
+        assert_eq!(page.copies[0].event_id, grant.event_id);
+        assert_eq!(page.copies[0].expires_at_unix, grant.expires_at_unix);
+        assert_eq!(
+            decode_copy(&page.copies[0].payload).unwrap(),
+            (grant.clone(), event)
+        );
+
+        let recipient_seed = [0x62; 32];
+        acknowledge_copy_with_signer(
+            &helper_url,
+            &grant.event_id,
+            move |method, path, timestamp, nonce, body| {
+                let identity = SigningKey::from_bytes(&recipient_seed);
+                crate::storage::sign_delivery_http_request_with_identity(
+                    &identity, method, path, timestamp, nonce, body,
+                )
+            },
+        )
+        .await
+        .expect("the authenticated helper ACK should remove the retained copy");
+
+        let recipient_seed = [0x62; 32];
+        let empty = list_copies_with_signer(
+            &helper_url,
+            0,
+            16,
+            move |method, path, timestamp, nonce, body| {
+                let identity = SigningKey::from_bytes(&recipient_seed);
+                crate::storage::sign_delivery_http_request_with_identity(
+                    &identity, method, path, timestamp, nonce, body,
+                )
+            },
+        )
+        .await
+        .expect("the helper should allow a fresh authenticated list request");
+        assert!(empty.copies.is_empty());
     }
 }
