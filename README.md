@@ -31,6 +31,11 @@ This diagnostic confirms only that the local backend process responds. It
 does not authenticate peers, start messaging, or establish a secure network
 connection.
 
+The native client has an internal file-transfer crypto foundation: random
+per-file keys, authenticated 48 KiB chunks, a 100 MiB size bound, ciphertext
+digests, and a filename-only offer format. File sharing is not usable yet; the
+peer protocol, accept/save flow, streaming disk I/O, and UI remain to be built.
+
 The app also opens `ws://127.0.0.1:3707/ws` asynchronously, sends a binary
 protobuf `ClientHello` v1, and validates one binary `ServerHello` or
 `VersionError` response. A compatible development transport stays open with

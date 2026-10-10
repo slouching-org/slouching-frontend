@@ -17,6 +17,7 @@ tokio-tungstenite = { version = "=0.30.0", default-features = false, features = 
 image_codec = { package = "image", version = "=0.25.10", default-features = false, features = ["png"] }
 directories = "=6.0.0"
 blake3 = "=1.8.7"
+chacha20poly1305 = "=0.10.1"
 ed25519-dalek = "=2.2.0"
 getrandom = "=0.3.4"
 iroh = { version = "=1.3.0", default-features = false, features = ["tls-ring"] }
