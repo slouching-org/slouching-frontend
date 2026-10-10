@@ -2465,9 +2465,43 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
     )
     .padding([l.px(12.0), l.px(16.0)])
     .style(|_, status| button_style(status, false, false));
-    let quarantine_banner: Element<'_, Message> =
-        if let Some(reason) = state.mls_quarantine_reason.as_ref() {
-            container(
+    let recovery_action: Element<'_, Message> = if state.mls_recovery_creating {
+        l.label("Criando grupo substituto…", 10.0, PAPER).into()
+    } else if state.mls_recovery_confirmation {
+        column![
+            l.label(
+                "Confirme para criar outro grupo local. Você precisará convidar novamente cada dispositivo verificado.",
+                10.0,
+                PAPER
+            ),
+            row![
+                button(l.label("Criar grupo substituto", 10.0, NIGHT))
+                    .on_press(Message::ConfirmMlsRecovery)
+                    .padding([l.px(7.0), l.px(10.0)])
+                    .style(|_, status| button_style(status, true, false)),
+                button(l.label("Cancelar", 10.0, PAPER))
+                    .on_press(Message::CancelMlsRecovery)
+                    .padding([l.px(7.0), l.px(10.0)])
+                    .style(|_, status| button_style(status, false, false)),
+            ]
+            .spacing(l.px(6.0))
+        ]
+        .spacing(l.px(5.0))
+        .into()
+    } else {
+        button(l.label("Iniciar recuperação em grupo novo", 10.0, NIGHT))
+            .on_press_maybe(
+                matches!(state.identity_status, crate::IdentityStatus::Ready(_))
+                    .then_some(Message::RequestMlsRecovery),
+            )
+            .padding([l.px(7.0), l.px(10.0)])
+            .style(|_, status| button_style(status, true, false))
+            .into()
+    };
+    let quarantine_banner: Element<'_, Message> = if let Some(reason) =
+        state.mls_quarantine_reason.as_ref()
+    {
+        container(
                 column![
                     l.label("ALERTA DE SEGURANÇA · GRUPO EM QUARENTENA", 11.0, GOLD),
                     l.label(reason.clone(), 11.0, PAPER),
@@ -2476,6 +2510,12 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
                         10.0,
                         PAPER
                     ),
+                    l.label(
+                        "O grupo e o histórico antigo serão preservados. O grupo novo não herda membros nem mensagens; verificações locais continuam vinculadas às chaves.",
+                        10.0,
+                        PAPER
+                    ),
+                    recovery_action,
                 ]
                 .spacing(l.px(4.0)),
             )
@@ -2491,9 +2531,9 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 ..Default::default()
             })
             .into()
-        } else {
-            space().height(l.px(0.0)).into()
-        };
+    } else {
+        space().height(l.px(0.0)).into()
+    };
     let proposal_review = column(
         std::iter::once(
             l.label(

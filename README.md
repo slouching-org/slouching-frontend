@@ -435,8 +435,11 @@ verifies that Commit against the saved state, records both signed Commit values,
 and quarantines the group locally. The accepted epoch remains unchanged, and
 the UI shows a persistent security alert while blocking MLS sends, retries,
 and further Commit distribution for that group. Invalid Commit bytes do not
-quarantine the group. This client currently has no automated recovery or rekey
-flow for a quarantined group.
+quarantine the group. From that alert, the user can confirm creation of a new
+group. The quarantined group and its transcript remain saved; the new group has
+no inherited members or messages, so devices must be invited again. Existing
+local verification decisions stay bound to their exact device keys and do not
+add members automatically. There is no same-group rekey or automatic recovery.
 
 Familiar selection, invitation/draft fields, screen navigation, settings
 tabs, illustrative share-source selection, and interface texture work locally.
@@ -567,10 +570,16 @@ conflicting historical Commit against a saved OpenMLS epoch snapshot, stores
 both Commit values in the encrypted database, and quarantines that group on
 the device. Its accepted epoch remains intact, and reopening the group restores
 the visible security alert. MLS message creation, event retries, member admission,
-and Commit delivery or manual application are blocked until a recovery or rekey
-flow is implemented. Regression coverage runs an exact redelivery and valid
+and Commit delivery or manual application remain blocked. The alert can start a
+confirmed replacement group; this preserves the old group and transcript but
+does not copy members or messages. Existing local trust remains bound to exact
+device keys and does not add members automatically. Same-group rekey remains unsupported.
+Regression coverage runs an exact redelivery and valid
 conflict simultaneously through two independent SQLite connections; the group
 ends quarantined at its accepted epoch without a transient lock failure.
+The rendered recovery screen uses `--capture-mls-quarantine`. Capture was
+attempted in this checkout, but Iced could not start because there is no
+Wayland or X11 display; the screenshot must be refreshed in a graphical session.
 
 The eleven design-board views and additional MLS screen are captured in [native-vhs](docs/design/runtime/native-vhs/).
 These are a first implementation of the visual direction, with comparison
@@ -619,6 +628,8 @@ default is a compact 1100 × 720 window.
 illustrate the review controls; they are fixtures, not live MLS state.
 `--capture-mls-member-removal` shows sample device keys and the explicit
 confirmation state for member removal; they are fixtures, not live group data.
+`--capture-mls-quarantine` shows the persistent quarantine alert and explicit
+new-group recovery action with fixture state; it does not modify stored groups.
 Refresh the MLS screenshots from a graphical Wayland or X11 session. This
 checkout environment has no display server, so this update could not produce a
 fresh rendered screenshot.

@@ -336,6 +336,8 @@ struct Slouching {
     mls_ratchet_tree: String,
     mls_status: String,
     mls_quarantine_reason: Option<String>,
+    mls_recovery_confirmation: bool,
+    mls_recovery_creating: bool,
     mls_groups: Vec<storage::StoredMlsGroup>,
     mls_groups_error: Option<String>,
     mls_message_draft: String,
@@ -555,6 +557,8 @@ impl Default for Slouching {
             mls_ratchet_tree: String::new(),
             mls_status: "Crie uma identidade do dispositivo para começar.".to_owned(),
             mls_quarantine_reason: None,
+            mls_recovery_confirmation: false,
+            mls_recovery_creating: false,
             mls_groups: Vec::new(),
             mls_groups_error: None,
             mls_message_draft: String::new(),
@@ -821,6 +825,10 @@ enum Message {
     MlsMessageDraftChanged(String),
     MlsHistoryLoaded(Vec<u8>, Result<Vec<storage::StoredMlsMessage>, String>),
     MlsQuarantineLoaded(Vec<u8>, Result<Option<String>, String>),
+    RequestMlsRecovery,
+    CancelMlsRecovery,
+    ConfirmMlsRecovery,
+    MlsRecoveryGroupCreated(Result<storage::CreatedMlsGroup, String>),
     MlsCommitsLoaded(Vec<u8>, Result<Vec<storage::StoredMlsCommit>, String>),
     MlsCommitRecipientsLoaded(
         Vec<u8>,
@@ -3793,6 +3801,51 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             }
             Err(error) => state.mls_status = format!("Falha ao criar grupo: {error}"),
         },
+        Message::RequestMlsRecovery => {
+            if state.mls_quarantine_reason.is_none() {
+                state.mls_status =
+                    "Selecione um grupo em quarentena para iniciar a recuperação.".into();
+            } else if !matches!(state.identity_status, IdentityStatus::Ready(_)) {
+                state.mls_status =
+                    "Carregue a identidade deste dispositivo antes de criar outro grupo.".into();
+            } else {
+                state.mls_recovery_confirmation = true;
+            }
+        }
+        Message::CancelMlsRecovery => state.mls_recovery_confirmation = false,
+        Message::ConfirmMlsRecovery => {
+            if !state.mls_recovery_confirmation || state.mls_quarantine_reason.is_none() {
+                return Task::none();
+            }
+            if !matches!(state.identity_status, IdentityStatus::Ready(_)) {
+                state.mls_recovery_confirmation = false;
+                state.mls_status =
+                    "Carregue a identidade deste dispositivo antes de criar outro grupo.".into();
+                return Task::none();
+            }
+            state.mls_recovery_confirmation = false;
+            state.mls_recovery_creating = true;
+            state.mls_status =
+                "Criando um grupo substituto; o grupo em quarentena será preservado…".into();
+            return Task::perform(create_mls_group_task(), Message::MlsRecoveryGroupCreated);
+        }
+        Message::MlsRecoveryGroupCreated(result) => {
+            state.mls_recovery_creating = false;
+            match result {
+                Ok(group) => {
+                    state.mls_group_id = hex_encode_bytes(&group.group_id);
+                    state.mls_status = format!(
+                        "Grupo substituto criado no epoch {}. Convide novamente os dispositivos verificados; membros e histórico não foram copiados.",
+                        group.epoch
+                    );
+                    let history = load_mls_history(state, group.group_id);
+                    return Task::batch([history, load_mls_groups()]);
+                }
+                Err(error) => {
+                    state.mls_status = format!("Falha ao criar grupo substituto: {error}");
+                }
+            }
+        }
         Message::PrepareMlsKeyPackage => {
             if !matches!(state.identity_status, IdentityStatus::Ready(_)) {
                 state.mls_status = "Crie ou carregue a identidade do dispositivo primeiro.".into();
@@ -5798,6 +5851,28 @@ fn boot() -> (Slouching, Task<Message>) {
         state.mls_status =
             "Remover este dispositivo do grupo? O acesso termina quando a nova época chegar."
                 .to_owned();
+    }
+    if args.iter().any(|arg| arg == "--capture-mls-quarantine") {
+        state.screen = Screen::Mls;
+        let group_id: [u8; 16] = hex_decode_bytes("5f8d4d2a7c314e6a9b0f123456789abc")
+            .expect("capture group ID should be hexadecimal")
+            .try_into()
+            .expect("capture group ID should contain 16 bytes");
+        state.identity_status = IdentityStatus::Ready([0x11; 32]);
+        state.mls_group_id = hex_encode_bytes(&group_id);
+        state.mls_history_group = Some(group_id.to_vec());
+        state.mls_quarantine_reason = Some(
+            "Commits válidos e conflitantes foram assinados pelo committer deste grupo.".to_owned(),
+        );
+        state.mls_groups = vec![storage::StoredMlsGroup {
+            group_id,
+            epoch: 12,
+            active: true,
+            quarantined: true,
+            purpose: peer::MlsGroupPurpose::Conversation,
+            designated_committer_device: [0x11; 32],
+        }];
+        state.mls_status = "O grupo foi preservado em quarentena.".to_owned();
     }
     if args.iter().any(|arg| arg == "--capture-mls-attachment") {
         state.screen = Screen::Mls;
