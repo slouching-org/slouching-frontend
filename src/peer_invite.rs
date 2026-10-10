@@ -19,6 +19,18 @@ pub struct PeerInvite {
     pub issued_at: u64,
 }
 
+pub fn route_kind(address: SocketAddr) -> &'static str {
+    match address.ip() {
+        IpAddr::V4(ip) if (ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1])) => {
+            "VPN / CGNAT"
+        }
+        IpAddr::V4(ip) if ip.is_private() => "LAN / rede privada",
+        IpAddr::V6(ip) if (ip.segments()[0] & 0xfe00) == 0xfc00 => "VPN / IPv6 privado",
+        IpAddr::V6(_) => "IPv6 roteável",
+        IpAddr::V4(_) => "IPv4 roteável",
+    }
+}
+
 pub fn create(
     secret: &iroh::SecretKey,
     addresses: &[SocketAddr],
@@ -345,6 +357,13 @@ mod tests {
 
         assert_eq!(invite.device_key, *signer.public().as_bytes());
         assert_eq!(invite.addresses, addresses);
+        assert_eq!(route_kind(addresses[0]), "LAN / rede privada");
+        assert_eq!(route_kind(addresses[1]), "VPN / CGNAT");
+        assert_eq!(
+            route_kind(addr("[fd7a:115c:a1e0::1]:45873")),
+            "VPN / IPv6 privado"
+        );
+        assert_eq!(route_kind(addr("8.8.8.8:45873")), "IPv4 roteável");
     }
 
     #[test]

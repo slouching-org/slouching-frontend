@@ -336,6 +336,18 @@ sent message, including partial delivery and expiry. Device confirmation means
 the event was persisted; it does not mean a person read it.
 Peer and mailbox copy counts are reported separately by the fan-out result and
 do not count as recipient delivery.
+
+For two devices on different networks, put both devices on the same VPN
+(Tailscale is one option). On the listening device, start **Aguardar peer**
+and keep the listener open. Share the address labeled **VPN / CGNAT** (usually
+`100.x.x.x`) together with the displayed UDP port; allow inbound UDP on that
+port in the device firewall and VPN ACL. On the connecting device, pin the
+listener's public device key, enter that VPN address and port, then connect.
+An imported QR lists route types so the VPN address can be selected when both
+LAN and VPN addresses are present. The peer also needs its own device key
+pinned by the listener. This removes the need for router port forwarding when
+the VPN provides a reachable route, but a two-machine VPN session has not yet
+been validated for this release.
 Membership Commits are also saved atomically with the
 group epoch in a separate local outbox; the latest pending Commit is restored
 from SQLCipher and can be sent from the MLS screen over an active direct

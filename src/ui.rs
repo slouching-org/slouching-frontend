@@ -2740,6 +2740,11 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
             MUTED
         ),
         l.label(
+            "Redes diferentes: escolha o endereço da VPN (como Tailscale 100.x), mantenha o listener aberto e libere UDP nessa porta no firewall do listener.",
+            10.0,
+            MUTED
+        ),
+        l.label(
             if state.peer_public_key.is_empty() {
                 "NENHUMA CHAVE DE PEER SELECIONADA"
             } else if state.peer_key_verified {
@@ -2827,14 +2832,23 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
             } else {
                 let addresses = direct
                     .iter()
-                    .map(ToString::to_string)
+                    .map(|address| {
+                        format!("{} · {address}", crate::peer_invite::route_kind(**address))
+                    })
                     .collect::<Vec<_>>()
                     .join("  ou  ");
                 let mut copy_buttons = column![];
                 for address in &direct {
                     copy_buttons = copy_buttons.push(
                         column![
-                            l.label(address.to_string(), 11.0, GREEN),
+                            l.label(
+                                format!(
+                                    "{} · {address}",
+                                    crate::peer_invite::route_kind(**address)
+                                ),
+                                11.0,
+                                GREEN
+                            ),
                             l.control(
                                 "key",
                                 "Copiar este endereço",
@@ -3430,7 +3444,14 @@ fn verification(state: &Slouching, l: Layout) -> Element<'_, Message> {
         let selected = state.peer_address == *address;
         address_choices = address_choices.push(
             button(l.label(
-                format!("{} {address}", if selected { "✓" } else { "Usar" }),
+                format!(
+                    "{} · {} {address}",
+                    address
+                        .parse()
+                        .map(crate::peer_invite::route_kind)
+                        .unwrap_or("Rota"),
+                    if selected { "✓" } else { "Usar" }
+                ),
                 10.0,
                 if selected { GOLD } else { PAPER },
             ))
