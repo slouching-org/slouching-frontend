@@ -124,18 +124,19 @@ path.
 
 1. Start the app on both devices and create a device identity if needed. On
    Linux, the system Secret Service must be available to create or load it.
-2. On each device, open **Conferir identidade do peer → Mostrar convite QR**.
-   Capture the displayed QR as a PNG, transfer that image through a channel
-   you trust, and import it on the other device with **Importar convite QR de
-   PNG**. Repeat in the other direction. This exchanges public keys; importing
-   alone does not mark a contact verified. Live camera scanning is not part of
-   this version.
+2. On the sending device, open **Conferir identidade do peer → Mostrar convite
+   QR**. On the receiving device, either click **Escanear QR** and point its
+   camera at the displayed invitation, or capture the QR as a PNG, transfer it
+   through a channel you trust, and use **Importar QR de PNG**. Repeat in the
+   other direction. This exchanges public keys; importing alone does not mark
+   a contact verified. The local scanner stops after a valid invite or 30
+   seconds; camera frames are not stored or sent.
 3. On the intended listener, choose a UDP port (for example `45873`) and click
    **Aguardar peer**. Open the verification screen again and show a fresh QR;
    while listening, it includes the announced addresses and expires in 10
-   minutes. Capture and transfer that PNG to the initiator. On import, choose
-   the address that is reachable from the initiator's network; the app keeps
-   all addresses from the invite available as choices.
+   minutes. Scan the fresh QR from the initiator or capture and transfer it as
+   a PNG. Choose an address reachable from the initiator's network; the app
+   keeps all addresses from the invite available as choices.
 4. Optionally configure the same participant-operated relay URL and shared
    token in **Relay do grupo** on both devices, then save it before sending.
    On the initiator, enter the listener's address if it was not imported, type a
@@ -236,7 +237,9 @@ key, but does not prove the person behind a transferred image. Import never
 marks trust automatically; press **Marcar como conferida** only after
 authenticating the QR source. That decision is local to this encrypted profile
 and exact key. It does not verify a display name, and a replacement key must be
-verified again. Camera scanning and short verification codes are not available.
+verified again. Short verification codes are not available. Camera scanning
+uses an explicit, temporary local capture and follows the same signature,
+expiry, self-invite, and trust checks as PNG import.
 
 To operate a relay, run the Iroh Relay `1.3.0` server on a host the group
 controls, configure HTTPS and `access.shared_token`, and enter that HTTPS URL
@@ -402,8 +405,7 @@ the system credential store. The direct-text trust screen creates a signed
 10-minute QR invitation containing the public key and optional listener
 addresses, then imports it from PNG and lets the user choose a route. The QR
 does not auto-verify human identity; a changed key has no inherited trust.
-Camera scanning, short verification codes, and contact discovery are not
-implemented. OpenMLS credentials
+Short verification codes and contact discovery are not implemented. OpenMLS credentials
 include a versioned binding signed by the durable device key. One-use
 KeyPackages and private MLS state are stored in SQLCipher. The direct-chat
 screen separately pins device public keys. Character scenes remain visual
@@ -464,6 +466,10 @@ be installed and available in the user session.
 ![Actual 934 × 1000 native Iced identity screen with a signed device invitation QR; device keys and VPN address are capture fixtures](docs/design/runtime/native-vhs/08-verify.png)
 
 ![Actual native Iced peer verification screen after importing a QR, with separate LAN and VPN address choices; all values are capture fixtures](docs/design/runtime/native-vhs/08-verify-invite-imported.png)
+
+These identity captures predate the camera-scan control. Refresh them with
+`--capture-peer-verification` in a graphical session; this TTY environment
+cannot create an Iced window.
 
 ![Native Iced call screen capture from before protected Opus RTP integration; a fresh capture needs a Wayland or X11 display](docs/design/runtime/native-vhs/10-call.png)
 

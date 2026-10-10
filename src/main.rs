@@ -303,6 +303,8 @@ struct Slouching {
     identity_key_copied: bool,
     peer_invite_qr: Option<iced::widget::image::Handle>,
     peer_invite_status: String,
+    peer_invite_camera_scan_active: bool,
+    peer_invite_camera_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     mls_group_id: String,
     mls_key_package: String,
     mls_invite_key_package: String,
@@ -505,6 +507,8 @@ impl Default for Slouching {
             peer_invite_qr: None,
             peer_invite_status: "Convite QR importa a chave; a confiança continua manual."
                 .to_owned(),
+            peer_invite_camera_scan_active: false,
+            peer_invite_camera_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mls_group_id: String::new(),
             mls_key_package: String::new(),
             mls_invite_key_package: String::new(),
@@ -637,6 +641,9 @@ enum Message {
     PeerInviteQrCreated(Result<iced::widget::image::Handle, String>),
     ClosePeerInviteQr,
     ImportPeerInviteQr,
+    StartPeerInviteCameraScan,
+    StopPeerInviteCameraScan,
+    PeerInviteCameraScanCompleted(Result<peer_invite::PeerInvite, String>),
     PeerInviteQrPath(Option<std::path::PathBuf>),
     PeerInviteImported(Result<peer_invite::PeerInvite, String>),
     SelectPeerInviteAddress(String),
@@ -972,6 +979,12 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         Message::Navigate(screen) => {
             if screen != state.screen {
                 stop_audio_monitor(state);
+                if state.peer_invite_camera_scan_active {
+                    state
+                        .peer_invite_camera_stop
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    state.peer_invite_camera_scan_active = false;
+                }
             }
             state.screen = screen;
             state.show_gallery = false;
@@ -1974,6 +1987,12 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     "Pare o listener antes de importar outro peer.".to_owned();
                 return Task::none();
             }
+            if state.peer_invite_camera_scan_active {
+                state
+                    .peer_invite_camera_stop
+                    .store(true, std::sync::atomic::Ordering::Release);
+                state.peer_invite_camera_scan_active = false;
+            }
             state.peer_invite_status =
                 "Selecione a imagem PNG que contém o QR do convite…".to_owned();
             return Task::perform(
@@ -1986,6 +2005,52 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 },
                 Message::PeerInviteQrPath,
             );
+        }
+        Message::StartPeerInviteCameraScan => {
+            if state.peer_listener_handle.is_some() {
+                state.peer_invite_status =
+                    "Pare o listener antes de importar outro peer.".to_owned();
+                return Task::none();
+            }
+            state
+                .peer_invite_camera_stop
+                .store(false, std::sync::atomic::Ordering::Release);
+            state.peer_invite_camera_scan_active = true;
+            state.peer_invite_status =
+                "Aponte a câmera para um convite Slouching. A leitura ocorre apenas neste dispositivo.".to_owned();
+            return Task::perform(
+                scan_peer_invite_camera_task(
+                    state.selected_camera.clone(),
+                    std::sync::Arc::clone(&state.peer_invite_camera_stop),
+                ),
+                Message::PeerInviteCameraScanCompleted,
+            );
+        }
+        Message::StopPeerInviteCameraScan => {
+            state
+                .peer_invite_camera_stop
+                .store(true, std::sync::atomic::Ordering::Release);
+            state.peer_invite_camera_scan_active = false;
+            state.peer_invite_status = "Leitura pela câmera cancelada.".to_owned();
+        }
+        Message::PeerInviteCameraScanCompleted(result) => {
+            if !state.peer_invite_camera_scan_active {
+                return Task::none();
+            }
+            state.peer_invite_camera_scan_active = false;
+            state
+                .peer_invite_camera_stop
+                .store(true, std::sync::atomic::Ordering::Release);
+            match result {
+                Ok(invite) => {
+                    state.peer_invite_status =
+                        "QR lido; validando assinatura, chave e validade…".to_owned();
+                    return update(state, Message::PeerInviteImported(Ok(invite)));
+                }
+                Err(error) => {
+                    state.peer_invite_status = format!("Leitura pela câmera falhou: {error}");
+                }
+            }
         }
         Message::PeerInviteQrPath(Some(path)) => {
             state.peer_invite_status =
@@ -5467,6 +5532,53 @@ async fn import_peer_invite_qr_task(
     .map_err(|error| format!("QR import task failed: {error}"))?
 }
 
+async fn scan_peer_invite_camera_task(
+    selected_camera: Option<nokhwa::utils::CameraIndex>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<peer_invite::PeerInvite, String> {
+    let result = async {
+        let camera = match selected_camera {
+            Some(camera) => camera,
+            None => {
+                tokio::task::spawn_blocking(camera_capture::enumerate)
+                    .await
+                    .map_err(|error| format!("tarefa de enumeração de câmeras falhou: {error}"))??
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "Nenhuma câmera foi encontrada pelo sistema.".to_owned())?
+                    .id
+            }
+        };
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("Leitura cancelada.".to_owned());
+        }
+        let mut frames = camera_capture::stream(camera, std::sync::Arc::clone(&stop)).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("Leitura cancelada.".to_owned());
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err("Nenhum convite QR foi lido em 30 segundos.".to_owned());
+            }
+            let frame = tokio::time::timeout(remaining, frames.recv())
+                .await
+                .map_err(|_| "Nenhum convite QR foi lido em 30 segundos.".to_owned())?
+                .ok_or_else(|| "A câmera encerrou a captura.".to_owned())??;
+            let now = peer_invite::unix_time_seconds()?;
+            if let Some(invite) =
+                peer_invite::scan_rgba(frame.width, frame.height, &frame.rgba, now)?
+            {
+                return Ok(invite);
+            }
+        }
+    }
+    .await;
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    result
+}
+
 fn audio_monitor_task(device_id: String, generation: u64) -> (Task<Message>, Handle) {
     Task::run(
         audio_monitor_events(device_id, generation),
@@ -7631,6 +7743,22 @@ mod tests {
         assert_eq!(state.familiar, "Gnomo");
         assert!(state.familiar_image_png.is_none());
         assert!(matches!(state.profile_status, ProfileStatus::Empty));
+    }
+
+    #[test]
+    fn leaving_identity_screen_stops_camera_invite_scanning() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut state = Slouching {
+            screen: Screen::Verify,
+            peer_invite_camera_scan_active: true,
+            peer_invite_camera_stop: std::sync::Arc::clone(&stop),
+            ..Slouching::default()
+        };
+
+        let _ = update(&mut state, Message::Navigate(Screen::Chat));
+
+        assert!(!state.peer_invite_camera_scan_active);
+        assert!(stop.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]

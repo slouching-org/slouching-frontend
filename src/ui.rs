@@ -3202,12 +3202,35 @@ fn verification(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 (!listener_active)
                     .then_some(Message::PeerPublicKeyChanged as fn(String) -> Message)
             ),
-            l.control(
-                "key",
-                "Importar convite QR de PNG",
-                (!listener_active).then_some(Message::ImportPeerInviteQr),
-                false
-            ),
+            row![
+                l.control(
+                    "key",
+                    "Importar QR de PNG",
+                    (!listener_active).then_some(Message::ImportPeerInviteQr),
+                    false
+                ),
+                l.control(
+                    if state.peer_invite_camera_scan_active {
+                        "close"
+                    } else {
+                        "camera"
+                    },
+                    if state.peer_invite_camera_scan_active {
+                        "Parar leitura"
+                    } else {
+                        "Escanear QR"
+                    },
+                    if listener_active {
+                        None
+                    } else if state.peer_invite_camera_scan_active {
+                        Some(Message::StopPeerInviteCameraScan)
+                    } else {
+                        Some(Message::StartPeerInviteCameraScan)
+                    },
+                    false
+                )
+            ]
+            .spacing(l.px(6.0)),
             l.label(state.peer_invite_status.clone(), 10.0, MUTED),
             invite_addresses,
             l.label(

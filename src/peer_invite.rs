@@ -129,19 +129,48 @@ pub fn decode_png(bytes: &[u8], now: u64) -> Result<PeerInvite, String> {
     if width == 0 || height == 0 || width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
         return Err("Imagem excede o limite de 4096 × 4096 pixels".to_owned());
     }
+    scan_image(image, now)?.ok_or_else(|| "Nenhum QR encontrado na imagem".to_owned())
+}
+
+pub fn scan_rgba(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    now: u64,
+) -> Result<Option<PeerInvite>, String> {
+    let expected_bytes = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| "Quadro da câmera excede o limite permitido".to_owned())?;
+    if width == 0
+        || height == 0
+        || width > MAX_IMAGE_DIMENSION
+        || height > MAX_IMAGE_DIMENSION
+        || expected_bytes > MAX_IMAGE_BYTES
+        || rgba.len() != expected_bytes
+    {
+        return Err("Quadro da câmera inválido ou acima do limite permitido".to_owned());
+    }
+    let image = image_codec::RgbaImage::from_raw(width, height, rgba.to_vec())
+        .ok_or_else(|| "Não foi possível preparar o quadro da câmera".to_owned())?;
+    scan_image(image_codec::DynamicImage::ImageRgba8(image), now)
+}
+
+fn scan_image(image: image_codec::DynamicImage, now: u64) -> Result<Option<PeerInvite>, String> {
     let mut prepared = rqrr::PreparedImage::prepare(image.to_luma8());
     let grids = prepared.detect_grids();
-    if grids.len() != 1 {
-        return Err(if grids.is_empty() {
-            "Nenhum QR encontrado na imagem".to_owned()
-        } else {
-            "A imagem deve conter exatamente um QR".to_owned()
-        });
+    if grids.is_empty() {
+        return Ok(None);
     }
-    let (_, text) = grids[0]
-        .decode()
-        .map_err(|error| format!("não foi possível ler o QR: {error}"))?;
-    decode(&text, now)
+    if grids.len() != 1 {
+        return Err("A imagem deve conter exatamente um QR".to_owned());
+    }
+    let (_, text) = match grids[0].decode() {
+        Ok(decoded) => decoded,
+        Err(_) => return Ok(None),
+    };
+    decode(&text, now).map(Some)
 }
 
 fn normalize_addresses(addresses: &[SocketAddr]) -> Result<Vec<SocketAddr>, String> {
@@ -372,6 +401,29 @@ mod tests {
         let invite = decode_png(png.get_ref(), 1_800_000_001).unwrap();
         assert_eq!(invite.device_key, *signer.public().as_bytes());
         assert_eq!(invite.addresses, [addr("100.64.0.8:45873")]);
+    }
+
+    #[test]
+    fn camera_frame_scanner_finds_signed_invite_and_ignores_empty_frames() {
+        let signer = key(12);
+        let encoded = create(&signer, &[addr("192.168.1.12:45873")], 1_800_000_000).unwrap();
+        let (size, rgba) = qr_rgba(&encoded).unwrap();
+        let invite = scan_rgba(size, size, &rgba, 1_800_000_001)
+            .unwrap()
+            .expect("camera scanner should detect the signed invite");
+        assert_eq!(invite.device_key, *signer.public().as_bytes());
+        assert_eq!(invite.addresses, [addr("192.168.1.12:45873")]);
+
+        let blank = vec![255; 32 * 32 * 4];
+        assert!(scan_rgba(32, 32, &blank, 1_800_000_001).unwrap().is_none());
+        assert!(scan_rgba(0, 32, &[], 1_800_000_001).is_err());
+
+        let mut tampered = encoded.into_bytes();
+        let last = tampered.last_mut().unwrap();
+        *last = if *last == b'0' { b'1' } else { b'0' };
+        let tampered = String::from_utf8(tampered).unwrap();
+        let (size, rgba) = qr_rgba(&tampered).unwrap();
+        assert!(scan_rgba(size, size, &rgba, 1_800_000_001).is_err());
     }
 
     #[test]
