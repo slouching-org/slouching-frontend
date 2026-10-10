@@ -339,8 +339,9 @@ do not count as recipient delivery.
 
 For two devices on different networks, put both devices on the same VPN
 (Tailscale is one option). On the listening device, start **Aguardar peer**
-and keep the listener open. Share the address labeled **VPN / CGNAT** (usually
-`100.x.x.x`) together with the displayed UDP port; allow inbound UDP on that
+and keep the listener open. Share its VPN address together with the displayed
+UDP port. Tailscale addresses usually use `100.64.0.0/10`; other VPNs may use a
+private address, so select the route known to belong to the VPN. Allow inbound UDP on that
 port in the device firewall and VPN ACL. On the connecting device, pin the
 listener's public device key, enter that VPN address and port, then connect.
 An imported QR lists route types so the VPN address can be selected when both
@@ -647,6 +648,9 @@ the requested window size; float/resize that window before the capture delay.
 Set `SLOUCHING_CAPTURE_DELAY_MS` to extend the default six-second delay when
 needed. `--capture-peer-addresses` supplies illustrative LAN and VPN socket
 addresses for the direct-chat capture; they are fixtures, not live interfaces.
+The route labels were updated after the current `06-chat.png` capture; this
+headless checkout cannot refresh it because Iced requires a Wayland or X11
+display.
 `SLOUCHING_WINDOW_SIZE` only requests an initial size. The normal
 default is a compact 1100 × 720 window.
 `--capture-mls-review` adds sample pending, approved, and rejected proposals to

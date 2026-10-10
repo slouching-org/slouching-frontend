@@ -2740,7 +2740,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
             MUTED
         ),
         l.label(
-            "Redes diferentes: escolha o endereço da VPN (como Tailscale 100.x), mantenha o listener aberto e libere UDP nessa porta no firewall do listener.",
+            "Redes diferentes: use o IP da VPN (Tailscale costuma usar 100.x), mantenha o listener aberto e libere UDP nessa porta no firewall do listener.",
             10.0,
             MUTED
         ),
