@@ -34,8 +34,10 @@ connection.
 The native client has an internal file-transfer crypto foundation: random
 per-file keys, authenticated 48 KiB chunks, a 100 MiB size bound, ciphertext
 digests, bounded streaming encryption/decryption, and a filename-only offer
-format. File sharing is not usable yet; the peer protocol, accept/save flow,
-disk integration, and UI remain to be built.
+format. The receive core stages plaintext in a temporary file and publishes it
+only after digest validation, without replacing an existing destination. File
+sharing is not usable yet; the peer protocol, accept/save flow, and UI remain to
+be built.
 
 The app also opens `ws://127.0.0.1:3707/ws` asynchronously, sends a binary
 protobuf `ClientHello` v1, and validates one binary `ServerHello` or

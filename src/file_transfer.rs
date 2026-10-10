@@ -10,6 +10,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
 };
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
@@ -68,6 +69,11 @@ impl FileOffer {
     /// Encode only for transmission inside a pinned, authenticated QUIC session.
     pub fn encode(&self) -> Result<Vec<u8>, String> {
         validate_filename(&self.filename)?;
+        if self.transfer_id.iter().all(|byte| *byte == 0)
+            || self.content_key.iter().all(|byte| *byte == 0)
+        {
+            return Err("file offer contains an invalid zero identifier or key".to_owned());
+        }
         let expected_chunks = chunk_count(self.total_bytes)?;
         if expected_chunks != self.chunk_count {
             return Err("file offer chunk count does not match its declared size".to_owned());
@@ -126,6 +132,139 @@ impl FileOffer {
             chunk_count: declared_chunk_count,
             filename,
         })
+    }
+}
+
+/// A sequential receiver that keeps plaintext in a same-directory temporary
+/// file until every chunk and the ciphertext digest have been verified.
+pub struct IncomingFileWriter {
+    offer: FileOffer,
+    destination: PathBuf,
+    temporary: Option<PathBuf>,
+    file: Option<std::fs::File>,
+    digest: blake3::Hasher,
+    next_chunk: u32,
+    written_bytes: u64,
+}
+
+impl std::fmt::Debug for IncomingFileWriter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IncomingFileWriter")
+            .field("transfer_id", &self.offer.transfer_id)
+            .field("destination", &self.destination)
+            .field("next_chunk", &self.next_chunk)
+            .field("written_bytes", &self.written_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for IncomingFileWriter {
+    fn drop(&mut self) {
+        self.file.take();
+        if let Some(path) = self.temporary.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+impl IncomingFileWriter {
+    /// Create a private temporary file beside the user-selected destination.
+    /// The destination itself is created only after full verification and is
+    /// never replaced if it already exists.
+    pub fn create(offer: FileOffer, destination: impl AsRef<Path>) -> Result<Self, String> {
+        offer.encode()?;
+        let destination = destination.as_ref().to_path_buf();
+        let filename = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "save destination must have a valid file name".to_owned())?;
+        validate_filename(filename)?;
+        let parent = destination
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        if !parent.is_dir() {
+            return Err("save destination directory does not exist".to_owned());
+        }
+        let transfer_id = offer
+            .transfer_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let temporary = parent.join(format!(".slouching-{transfer_id}.part"));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| format!("could not create temporary received file: {error}"))?;
+        Ok(Self {
+            offer,
+            destination,
+            temporary: Some(temporary),
+            file: Some(file),
+            digest: blake3::Hasher::new(),
+            next_chunk: 0,
+            written_bytes: 0,
+        })
+    }
+
+    pub fn write_chunk(&mut self, index: u32, ciphertext: &[u8]) -> Result<(), String> {
+        if index != self.next_chunk {
+            return Err("file chunks must arrive once and in order".to_owned());
+        }
+        let mut plaintext = Zeroizing::new(decrypt_chunk(
+            &self.offer.transfer_id,
+            &self.offer.content_key,
+            self.offer.total_bytes,
+            index,
+            ciphertext,
+        )?);
+        self.file
+            .as_mut()
+            .ok_or_else(|| "temporary receive file is already closed".to_owned())?
+            .write_all(&plaintext)
+            .map_err(|error| format!("could not write received file chunk: {error}"))?;
+        self.digest.update(ciphertext);
+        self.written_bytes = self
+            .written_bytes
+            .checked_add(plaintext.len() as u64)
+            .ok_or_else(|| "received file size overflow".to_owned())?;
+        plaintext.zeroize();
+        self.next_chunk = self
+            .next_chunk
+            .checked_add(1)
+            .ok_or_else(|| "received file chunk counter overflow".to_owned())?;
+        Ok(())
+    }
+
+    /// Flush and verify, then atomically publish without replacing another file.
+    pub fn finish(mut self, expected_ciphertext_digest: &[u8; 32]) -> Result<PathBuf, String> {
+        if self.next_chunk != self.offer.chunk_count || self.written_bytes != self.offer.total_bytes
+        {
+            return Err("received file is incomplete".to_owned());
+        }
+        if self.digest.finalize().as_bytes() != expected_ciphertext_digest {
+            return Err("encrypted file digest does not match the offer".to_owned());
+        }
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| "temporary receive file is already closed".to_owned())?;
+        file.sync_all()
+            .map_err(|error| format!("could not flush received file to disk: {error}"))?;
+        drop(file);
+        let temporary = self
+            .temporary
+            .as_ref()
+            .ok_or_else(|| "temporary receive path is missing".to_owned())?;
+        std::fs::hard_link(temporary, &self.destination).map_err(|error| {
+            format!("could not publish received file without replacing a destination: {error}")
+        })?;
+        if let Some(temporary) = self.temporary.take() {
+            let _ = std::fs::remove_file(temporary);
+        }
+        Ok(self.destination.clone())
     }
 }
 
@@ -679,5 +818,82 @@ mod tests {
             .unwrap_err()
             .contains("beyond its declared size")
         );
+    }
+
+    fn test_directory(label: &str) -> std::path::PathBuf {
+        let secrets = FileTransferSecrets::generate().unwrap();
+        let suffix = secrets
+            .transfer_id()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let directory =
+            std::env::temp_dir().join(format!("slouching-{label}-{}-{suffix}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn incoming_file_is_published_only_after_ordered_chunks_and_digest_verify() {
+        let directory = test_directory("received");
+        let destination = directory.join("received.bin");
+        let secrets = FileTransferSecrets::from_parts([0x31; 16], [0x52; 32]);
+        let source = vec![0x7b; FILE_CHUNK_PLAINTEXT_BYTES + 3];
+        let total_bytes = source.len() as u64;
+        let offer = FileOffer::from_secrets(&secrets, total_bytes, "received.bin".into()).unwrap();
+        let mut receiver = IncomingFileWriter::create(offer, &destination).unwrap();
+        let mut digest = blake3::Hasher::new();
+        for (index, plaintext) in source.chunks(FILE_CHUNK_PLAINTEXT_BYTES).enumerate() {
+            let ciphertext = encrypt_chunk(
+                secrets.transfer_id(),
+                secrets.content_key(),
+                total_bytes,
+                index as u32,
+                plaintext,
+            )
+            .unwrap();
+            digest.update(&ciphertext);
+            receiver.write_chunk(index as u32, &ciphertext).unwrap();
+        }
+        let published = receiver.finish(digest.finalize().as_bytes()).unwrap();
+        assert_eq!(published, destination);
+        assert_eq!(std::fs::read(&published).unwrap(), source);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn incoming_file_rejects_out_of_order_chunks_bad_digest_and_existing_destinations() {
+        let directory = test_directory("rejected");
+        let destination = directory.join("received.bin");
+        let secrets = FileTransferSecrets::from_parts([0x31; 16], [0x52; 32]);
+        let offer = FileOffer::from_secrets(&secrets, 1, "received.bin".into()).unwrap();
+        let mut receiver = IncomingFileWriter::create(offer, &destination).unwrap();
+        assert!(
+            receiver
+                .write_chunk(1, b"invalid")
+                .unwrap_err()
+                .contains("in order")
+        );
+        drop(receiver);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+
+        let offer = FileOffer::from_secrets(&secrets, 1, "received.bin".into()).unwrap();
+        let mut receiver = IncomingFileWriter::create(offer, &destination).unwrap();
+        let ciphertext =
+            encrypt_chunk(secrets.transfer_id(), secrets.content_key(), 1, 0, b"x").unwrap();
+        receiver.write_chunk(0, &ciphertext).unwrap();
+        assert!(receiver.finish(&[0; 32]).unwrap_err().contains("digest"));
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+
+        std::fs::write(&destination, b"keep me").unwrap();
+        let offer = FileOffer::from_secrets(&secrets, 1, "received.bin".into()).unwrap();
+        let mut receiver = IncomingFileWriter::create(offer, &destination).unwrap();
+        receiver.write_chunk(0, &ciphertext).unwrap();
+        let digest = blake3::hash(&ciphertext);
+        assert!(receiver.finish(digest.as_bytes()).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"keep me");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
