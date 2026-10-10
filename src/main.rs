@@ -11,6 +11,7 @@ pub mod camera_capture;
 pub mod familiar_image;
 pub mod file_transfer;
 pub mod identity;
+pub mod lan_discovery;
 pub mod media;
 mod peer;
 mod peer_invite;
@@ -278,6 +279,9 @@ struct Slouching {
     helper_listener_active: bool,
     peer_listener_port: Option<u16>,
     peer_listener_addresses: Vec<std::net::SocketAddr>,
+    discovered_lan_peers: Vec<lan_discovery::LanPeer>,
+    lan_discovery_status: String,
+    lan_discovery_running: bool,
     peer_routes: Vec<storage::StoredPeerRoute>,
     peer_routes_error: Option<String>,
     peer_listen_port: String,
@@ -423,6 +427,7 @@ enum PeerMessageDirection {
 enum PeerListenEvent {
     Bound {
         addresses: Vec<std::net::SocketAddr>,
+        discovery_error: Option<String>,
     },
     SessionCommands(tokio::sync::mpsc::Sender<peer::PeerCommand>),
     Session(peer::PeerEvent),
@@ -483,6 +488,9 @@ impl Default for Slouching {
             helper_listener_active: false,
             peer_listener_port: None,
             peer_listener_addresses: Vec::new(),
+            discovered_lan_peers: Vec::new(),
+            lan_discovery_status: "Descoberta local desativada até você procurar.".to_owned(),
+            lan_discovery_running: false,
             peer_routes: Vec::new(),
             peer_routes_error: None,
             peer_listen_port: "45873".to_owned(),
@@ -576,6 +584,9 @@ enum Message {
     TransportEvent(u64, TransportEvent),
     Navigate(Screen),
     OpenNetworkSettings,
+    DiscoverLanPeers,
+    LanPeersDiscovered(Result<Vec<lan_discovery::LanPeer>, String>),
+    SelectDiscoveredLanRoute(String),
     InviteChanged(String),
     NameChanged(String),
     ChooseFamiliar(&'static str),
@@ -1011,6 +1022,67 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.screen = Screen::Settings;
             state.show_gallery = false;
             state.note = None;
+        }
+        Message::DiscoverLanPeers => {
+            if state.lan_discovery_running {
+                return Task::none();
+            }
+            state.lan_discovery_running = true;
+            state.lan_discovery_status = "Procurando listeners Slouching nesta LAN…".to_owned();
+            state.discovered_lan_peers.clear();
+            return Task::perform(
+                lan_discovery::discover(
+                    Duration::from_secs(4),
+                    state.peer_listener_addresses.clone(),
+                ),
+                Message::LanPeersDiscovered,
+            );
+        }
+        Message::LanPeersDiscovered(Ok(peers)) => {
+            let count = peers.iter().map(|peer| peer.addresses.len()).sum::<usize>();
+            state.lan_discovery_running = false;
+            state.discovered_lan_peers = peers;
+            state.lan_discovery_status =
+                format!("Busca concluída · {count} rota(s) encontrada(s).");
+        }
+        Message::LanPeersDiscovered(Err(error)) => {
+            state.lan_discovery_running = false;
+            state.lan_discovery_status = format!("Falha na descoberta local: {error}");
+        }
+        Message::SelectDiscoveredLanRoute(address) => {
+            if matches!(state.peer_listen_status, PeerListenStatus::Connected) {
+                if let Some(commands) = state.peer_session_commands.take() {
+                    let _ = commands.try_send(peer::PeerCommand::Disconnect);
+                }
+                if let Some(handle) = state.peer_listener_handle.take() {
+                    handle.abort();
+                }
+                state.peer_listener_generation = state.peer_listener_generation.saturating_add(1);
+                state.active_peer_device = None;
+                state.peer_listener_port = None;
+                state.peer_listener_addresses.clear();
+                if state.peer_pending_sends.is_empty() {
+                    state.peer_send_status = PeerSendStatus::Idle;
+                } else {
+                    state.peer_pending_sends.clear();
+                    state.peer_send_status = PeerSendStatus::Failed(
+                        "Conexão encerrada ao trocar de rota; entrega pendente desconhecida."
+                            .into(),
+                    );
+                }
+                state.peer_listen_status = PeerListenStatus::Idle;
+            }
+            state.peer_address = address;
+            state.peer_public_key.clear();
+            state.peer_verification_loaded_for = None;
+            state.peer_key_verified = false;
+            state.peer_invite_addresses.clear();
+            state.peer_verification_status =
+                "Informe a chave pública correspondente à rota descoberta.".to_owned();
+            state.screen = Screen::Chat;
+            state.show_gallery = false;
+            state.note =
+                Some("Rota preenchida. Confira a chave pública do peer antes de conectar.");
         }
         Message::CreateCallMlsGroup => {
             if !matches!(state.identity_status, IdentityStatus::Ready(_)) {
@@ -2523,7 +2595,10 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             if generation == state.peer_listener_generation =>
         {
             match event {
-                PeerListenEvent::Bound { addresses } => {
+                PeerListenEvent::Bound {
+                    addresses,
+                    discovery_error,
+                } => {
                     let port = match state.peer_listen_status {
                         PeerListenStatus::Starting { port } => port,
                         PeerListenStatus::Listening { port, .. } => port,
@@ -2531,6 +2606,13 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     };
                     state.peer_listen_status = PeerListenStatus::Listening { port, addresses };
                     state.peer_listener_port = Some(port);
+                    if let Some(error) = discovery_error {
+                        state.lan_discovery_status =
+                            format!("Listener ativo; anúncio LAN indisponível: {error}");
+                    } else {
+                        state.lan_discovery_status =
+                            "Listener anunciado na LAN; busca local disponível.".to_owned();
+                    }
                     if let PeerListenStatus::Listening { addresses, .. } = &state.peer_listen_status
                     {
                         state.peer_listener_addresses = addresses.clone();
@@ -5353,6 +5435,7 @@ fn boot() -> (Slouching, Task<Message>) {
     let capture_share_camera = args.iter().any(|arg| arg == "--capture-share-camera");
     let capture_share_window = args.iter().any(|arg| arg == "--capture-share-window");
     let capture_peer_verification = args.iter().any(|arg| arg == "--capture-peer-verification");
+    let capture_lan_discovery = args.iter().any(|arg| arg == "--capture-lan-discovery");
     if let Some(pos) = args.iter().position(|s| s == "--screen")
         && let Some(name) = args.get(pos + 1)
         && let Some(screen) = Screen::ALL.into_iter().find(|s| s.slug() == name)
@@ -5506,6 +5589,16 @@ fn boot() -> (Slouching, Task<Message>) {
         state.peer_key_verified = true;
         state.peer_verification_status =
             "Chave conferida e marcada como verificada neste dispositivo.".to_owned();
+    }
+    if capture_lan_discovery {
+        state.screen = Screen::Connecting;
+        state.identity_status = IdentityStatus::Ready([0x11; 32]);
+        state.lan_discovery_status = "Busca concluída · 1 rota encontrada.".to_owned();
+        state.discovered_lan_peers = vec![lan_discovery::LanPeer {
+            discovery_id: "0123456789abcdef".to_owned(),
+            service_name: "fixture._slouching._udp.local.".to_owned(),
+            addresses: vec!["192.168.1.42:45873".parse().expect("valid LAN fixture")],
+        }];
     }
     if args.iter().any(|arg| arg == "--capture-peer-invite") {
         let own_key = [0x11; 32];
@@ -7325,7 +7418,12 @@ fn peer_listener_task(
             }
         };
         let addresses = listener.direct_addresses();
-        yield PeerListenEvent::Bound { addresses };
+        let (advertiser, discovery_error) = match lan_discovery::LanAdvertiser::start(&addresses) {
+            Ok(advertiser) => (Some(advertiser), None),
+            Err(error) => (None, Some(error)),
+        };
+        let _advertiser = advertiser;
+        yield PeerListenEvent::Bound { addresses, discovery_error };
         loop {
             match listener.accept_session().await {
                 Ok(session) => {
@@ -7878,6 +7976,67 @@ mod tests {
         assert_eq!(state.screen, Screen::Settings);
         assert_eq!(state.settings_tab, 2);
         assert!(!state.show_gallery);
+    }
+
+    #[test]
+    fn discovered_route_requires_a_fresh_peer_key() {
+        let mut state = Slouching {
+            screen: Screen::Connecting,
+            peer_public_key: hex_encode_key(&[0x22; 32]),
+            peer_verification_loaded_for: Some(hex_encode_key(&[0x22; 32])),
+            peer_key_verified: true,
+            ..Slouching::default()
+        };
+
+        let _ = update(
+            &mut state,
+            Message::SelectDiscoveredLanRoute("192.168.1.42:45873".to_owned()),
+        );
+
+        assert_eq!(state.screen, Screen::Chat);
+        assert_eq!(state.peer_address, "192.168.1.42:45873");
+        assert!(state.peer_public_key.is_empty());
+        assert!(state.peer_verification_loaded_for.is_none());
+        assert!(!state.peer_key_verified);
+    }
+
+    #[test]
+    fn choosing_discovered_route_disconnects_the_previous_peer() {
+        let (commands, mut received) = tokio::sync::mpsc::channel(1);
+        let mut state = Slouching {
+            screen: Screen::Connecting,
+            peer_listen_status: PeerListenStatus::Connected,
+            peer_listener_generation: 7,
+            peer_listener_port: Some(45873),
+            peer_session_commands: Some(commands),
+            active_peer_device: Some([0x22; 32]),
+            ..Slouching::default()
+        };
+
+        let _ = update(
+            &mut state,
+            Message::SelectDiscoveredLanRoute("192.168.1.42:45873".to_owned()),
+        );
+
+        assert!(matches!(
+            received.try_recv(),
+            Ok(peer::PeerCommand::Disconnect)
+        ));
+        assert_eq!(state.peer_listener_generation, 8);
+        assert!(matches!(state.peer_listen_status, PeerListenStatus::Idle));
+        assert!(state.active_peer_device.is_none());
+    }
+
+    #[test]
+    fn lan_discovery_search_is_bounded_to_one_active_request() {
+        let mut state = Slouching::default();
+
+        let _ = update(&mut state, Message::DiscoverLanPeers);
+        let _ = update(&mut state, Message::DiscoverLanPeers);
+
+        assert!(state.lan_discovery_running);
+        assert!(state.discovered_lan_peers.is_empty());
+        assert!(state.lan_discovery_status.contains("Procurando"));
     }
 
     #[test]

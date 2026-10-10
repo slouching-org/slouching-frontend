@@ -20,6 +20,7 @@ hex = "=0.4.3"
 image_codec = { package = "image", version = "=0.25.10", default-features = false, features = ["png"] }
 directories = "=6.0.0"
 blake3 = "=1.8.7"
+mdns-sd = "=0.21.5"
 chacha20poly1305 = "=0.10.1"
 ed25519-dalek = "=2.2.0"
 getrandom = "=0.3.4"

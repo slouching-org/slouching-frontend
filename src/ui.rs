@@ -1511,6 +1511,11 @@ fn connecting(state: &Slouching, l: Layout) -> Element<'static, Message> {
     ].spacing(l.px(12.0));
     let actions = column![
         l.label("ABRIR UM FLUXO FUNCIONAL", 10.0, GOLD),
+        l.control("search", "Procurar peers na LAN", Some(Message::DiscoverLanPeers), false),
+        l.label(state.lan_discovery_status.clone(), 11.0, MUTED),
+        l.label("ROTAS DESCOBERTAS · NÃO VERIFICADAS", 9.0, GOLD),
+        discovered_lan_routes(state, l),
+        l.label("A rota não confirma a identidade. Informe a chave do peer no chat.", 10.0, MUTED),
         l.control("chat", "Texto direto · LAN/VPN", Some(Message::Navigate(Screen::Chat)), true),
         l.control("users", "Grupo MLS", Some(Message::Navigate(Screen::Mls)), false),
         l.control("headphones", "Chamada", Some(Message::Navigate(Screen::Call)), false),
@@ -1525,6 +1530,43 @@ fn connecting(state: &Slouching, l: Layout) -> Element<'static, Message> {
     .width(Fill)
     .height(Fill)
     .into()
+}
+
+fn discovered_lan_routes(state: &Slouching, l: Layout) -> Element<'static, Message> {
+    let mut routes = column![].spacing(l.px(6.0));
+    let mut route_count = 0;
+    for peer in &state.discovered_lan_peers {
+        for address in &peer.addresses {
+            let route = address.to_string();
+            let content = row![
+                l.icon("wifi", PAPER, 18.0),
+                l.label(format!("Usar rota · {route}"), 12.0, PAPER)
+            ]
+            .spacing(l.px(10.0))
+            .align_y(iced::Center);
+            routes = routes.push(
+                button(container(content).center_x(Fill))
+                    .on_press(Message::SelectDiscoveredLanRoute(route))
+                    .padding([l.px(10.0), l.px(14.0)])
+                    .width(Fill)
+                    .style(|_, status| button_style(status, false, false)),
+            );
+            route_count += 1;
+            if route_count >= 2 {
+                return routes.into();
+            }
+        }
+    }
+    if state.discovered_lan_peers.is_empty() && !state.lan_discovery_running {
+        routes = routes.push(l.label(
+            "Nenhum listener Slouching encontrado nesta busca.",
+            10.0,
+            MUTED,
+        ));
+    } else if state.discovered_lan_peers.is_empty() {
+        routes = routes.push(l.label("A busca está em andamento…", 10.0, MUTED));
+    }
+    routes.into()
 }
 
 fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {

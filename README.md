@@ -412,7 +412,10 @@ in the operating system credential store. PNG import is explicit, limited to
 512 KiB bound. Selecting a supplied familiar removes the custom avatar.
 Saving fails closed when that store is unavailable. The
 screen can also explicitly create and retain an Ed25519 device signing key in
-the system credential store. The direct-text trust screen creates a signed
+the system credential store. The connection screen can search for active Slouching listeners on the LAN via
+mDNS and fill a discovered route into direct chat. Discovery is an untrusted
+route hint: it does not publish a device key or replace manual identity
+verification. mDNS discovery across VPNs is not supported. The direct-text trust screen creates a signed
 10-minute QR invitation containing the public key and optional listener
 addresses, then imports it from PNG and lets the user choose a route. The QR
 does not auto-verify human identity; a changed key has no inherited trust.
@@ -536,6 +539,7 @@ SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-capture
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 11-mls --capture-mls-attachment
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 02-settings --settings-tab 1
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-verification
+SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 04-connecting --capture-lan-discovery
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-invite
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-invite-imported
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 10-call --capture-call-negotiation
@@ -565,6 +569,8 @@ they are fixtures, not a transferred file or live peer session.
 The audio-settings capture uses real device enumeration from the current
 session; device names vary by machine. Selected devices feed live call capture
 and playback, but not this illustrative capture.
+`--capture-lan-discovery` shows a sample mDNS result; it is a fixture, not a
+live listener.
 `--capture-peer-verification` supplies sample local and peer keys for the trust
 screen capture and its derived 12-digit safety code; they are fixtures, not
 identities from the keyring. Refresh the identity screenshot from a graphical
