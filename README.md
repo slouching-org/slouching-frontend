@@ -46,7 +46,9 @@ MLS receiver recognizes the bounded attachment envelope only after OpenMLS
 authenticates and decrypts the application event. It commits the manifest in
 the same SQLCipher transaction as the ratchet, event, and transcript, before
 the peer ACK is allowed; exact redelivery is deduplicated. Received offers are
-now persisted correctly, but the app does not yet fetch or render their blobs.
+now persisted correctly. The sender likewise commits its local manifest with
+the outbound ratchet and retryable outbox event. The app does not yet fetch or
+render the referenced blobs.
 receive core stages plaintext in a temporary file and publishes it
 only after digest validation, without replacing an existing destination. Local
 two-endpoint tests cover authorized retrieval and rejection of an unauthorized

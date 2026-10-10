@@ -1835,6 +1835,7 @@ fn create_mls_application_event_in(
     }
     let plaintext_text = std::str::from_utf8(plaintext)
         .map_err(|_| "MLS chat text must be valid UTF-8".to_owned())?;
+    let attachment = FileAttachmentOffer::decode_mls_text(plaintext_text)?;
     let author_device = device_identity.verifying_key().to_bytes();
     let group_id = GroupId::from_slice(group_id);
     connection
@@ -1920,6 +1921,20 @@ fn create_mls_application_event_in(
             };
             (event, wire_message, recipients)
         };
+        if let Some(attachment) = attachment.as_ref() {
+            let group_id: [u8; 16] = event
+                .group_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| "MLS attachment group ID must contain 16 bytes".to_owned())?;
+            insert_file_attachment_in_transaction(
+                connection,
+                group_id,
+                event.author_device,
+                attachment.ciphertext_hash,
+                &attachment.offer,
+            )?;
+        }
         let digest = blake3::hash(&event.ciphertext);
         connection
             .execute(
@@ -7290,6 +7305,16 @@ mod tests {
             &sender_identity,
         )
         .expect("sender should encrypt the attachment reference in MLS");
+        let sent_attachments =
+            list_file_attachments_in(&sender, group.group_id.as_slice().try_into().unwrap())
+                .expect("sender should save its attachment manifest with the MLS outbox event");
+        assert_eq!(sent_attachments.len(), 1);
+        assert_eq!(
+            sent_attachments[0].author_device,
+            sender_identity.verifying_key().to_bytes()
+        );
+        assert_eq!(sent_attachments[0].ciphertext_hash, [0xc3; 32]);
+        assert_eq!(sent_attachments[0].offer.transfer_id, [0xa1; 16]);
         assert_eq!(
             process_inbound_mls_application_event_in(
                 &mut receiver,
