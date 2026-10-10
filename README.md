@@ -87,8 +87,9 @@ An additional **Grupo MLS** screen supports two-device group setup. Create the
 group on one device and share its ID. The invitee can send its public KeyPackage
 over the active pinned session, or copy it through a trusted channel. The
 committer reviews and admits the package; the receiver checks that its device
-key matches the pinned peer before saving the Commit. The Welcome and ratchet
-tree still return through a trusted channel. After both devices join, open
+key matches the pinned peer before saving the Commit. After admission, the committer sends the Welcome and ratchet tree through the
+same pinned session. The invitee validates them and stores the group before
+ACK; copy/paste fields remain available if delivery is unknown. After both devices join, open
 **Texto direto · LAN** and connect them using the usual
 pinned-key and LAN-address flow. In **Grupo MLS**, select the same group ID on
 both devices; MLS messages are encrypted and sent over that active direct
@@ -113,8 +114,8 @@ Commit's predecessor snapshot, including Commits already marked delivered.
 The MLS screen
 shows each eligible device's persisted adoption ACK. Storage regression tests
 build a two-Commit chain, verify epoch order, and confirm that the next Commit
-remains queued after the first recipient ACK and a database reopen. New members join with the
-matching Welcome and ratchet tree. The transcript reloads locally, and **Reenviar pendentes**
+remains queued after the first recipient ACK and a database reopen. New members join with the matching Welcome and ratchet tree delivered over the
+pinned session after the committer admits their KeyPackage. The transcript reloads locally, and **Reenviar pendentes**
 sends queued events for the selected group after reconnecting.
 
 The MLS screen lists groups saved in the local SQLCipher database with their
@@ -178,7 +179,7 @@ be installed and available in the user session.
 
 ![Actual native Iced group-call preview; media and sample messages are illustrative](docs/design/runtime/native-vhs/10-call.png)
 
-![Actual 1884 × 1000 native Iced MLS screen showing group setup and the visible control for sending a KeyPackage through the connected committer session](docs/design/runtime/native-vhs/11-mls.png)
+![Actual 1884 × 1000 native Iced MLS screen describing the direct KeyPackage and Welcome session flow](docs/design/runtime/native-vhs/11-mls.png)
 
 The MLS screen now detects authenticated committer equivocation. It verifies a
 conflicting historical Commit against a saved OpenMLS epoch snapshot, stores
@@ -195,7 +196,7 @@ These are a first implementation of the visual direction, with comparison
 at 1280 × 800 and a compact 960 × 640 window. Exact visual parity,
 accessibility, and live media integration remain to be completed.
 The current direct transport and MLS recovery frames are specified in the
-[v6 peer protocol](docs/fichas/transport/lan-peer-v6.md).
+[v7 peer protocol](docs/fichas/transport/lan-peer-v7.md).
 
 ## Reproduce native captures
 

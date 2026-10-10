@@ -2790,6 +2790,30 @@ pub fn join_mls_group_from_welcome(
         serialized_welcome,
         serialized_ratchet_tree,
         &device_identity,
+        None,
+        None,
+    )
+}
+
+pub fn join_mls_group_from_pinned_peer(
+    serialized_welcome: &[u8],
+    serialized_ratchet_tree: &[u8],
+    expected_committer_device: [u8; 32],
+    expected_group_id: [u8; 16],
+) -> Result<JoinedMlsGroup, String> {
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let device_identity = signing_key_from_secret(secret)?;
+    let mut connection = open_local_database()?;
+    join_mls_group_from_welcome_in(
+        &mut connection,
+        serialized_welcome,
+        serialized_ratchet_tree,
+        &device_identity,
+        Some(expected_committer_device),
+        Some(expected_group_id),
     )
 }
 
@@ -2798,6 +2822,8 @@ fn join_mls_group_from_welcome_in(
     serialized_welcome: &[u8],
     serialized_ratchet_tree: &[u8],
     device_identity: &SigningKey,
+    expected_committer_device: Option<[u8; 32]>,
+    expected_group_id: Option<[u8; 16]>,
 ) -> Result<JoinedMlsGroup, String> {
     use openmls::prelude::tls_codec::Deserialize as TlsCodecDeserialize;
 
@@ -2850,9 +2876,17 @@ fn join_mls_group_from_welcome_in(
             ) {
                 return Err("Welcome sender MLS key does not match its device binding".to_owned());
             }
+            if expected_committer_device
+                .is_some_and(|expected| sender_binding.device_public_key != expected)
+            {
+                return Err("Welcome sender does not match the pinned committer device".to_owned());
+            }
             let group = staged
                 .into_group(&provider)
                 .map_err(|error| format!("could not persist joined MLS group: {error:?}"))?;
+            if expected_group_id.is_some_and(|expected| group.group_id().as_slice() != expected) {
+                return Err("Welcome MLS group ID does not match its transport envelope".to_owned());
+            }
             JoinedMlsGroup {
                 group_id: group.group_id().to_vec(),
                 ciphersuite: group.ciphersuite() as u16,
@@ -4166,6 +4200,8 @@ mod tests {
             &admission.welcome,
             &admission.ratchet_tree,
             &member_identity,
+            None,
+            None,
         )
         .expect("member should join with its Welcome");
 
@@ -4422,11 +4458,23 @@ mod tests {
             (0, 1)
         );
 
+        let wrong_committer = join_mls_group_from_welcome_in(
+            &mut invitee,
+            &admission.welcome,
+            &admission.ratchet_tree,
+            &invitee_identity,
+            Some([0xabu8; 32]),
+            Some(group.group_id.as_slice().try_into().unwrap()),
+        )
+        .expect_err("Welcome must match the direct session's pinned committer");
+        assert!(wrong_committer.contains("pinned committer device"));
         let joined = join_mls_group_from_welcome_in(
             &mut invitee,
             &admission.welcome,
             &admission.ratchet_tree,
             &invitee_identity,
+            Some(creator_public_key),
+            Some(group.group_id.as_slice().try_into().unwrap()),
         )
         .expect("invitee should process Welcome using its stored KeyPackage bundle");
         assert_eq!(joined.group_id, group.group_id);
@@ -4957,6 +5005,8 @@ mod tests {
             &admission.welcome,
             &admission.ratchet_tree,
             &receiver_identity,
+            None,
+            None,
         )
         .expect("receiver should join group");
 

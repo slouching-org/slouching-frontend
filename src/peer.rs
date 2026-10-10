@@ -10,9 +10,9 @@ use tokio::{
 };
 
 /// Direct-only protocol version used for persistent paired-device text sessions.
-pub const PEER_ALPN: &[u8] = b"org.slouching.peer/6";
+pub const PEER_ALPN: &[u8] = b"org.slouching.peer/7";
 const FRAME_MAGIC: &[u8; 4] = b"SLCH";
-const FRAME_VERSION: u16 = 6;
+const FRAME_VERSION: u16 = 7;
 const FRAME_DATA: u8 = 1;
 const FRAME_ACK: u8 = 2;
 const FRAME_CLOSE: u8 = 3;
@@ -23,6 +23,7 @@ const FRAME_REJECT: u8 = 7;
 const FRAME_MLS_COMMIT_REQUEST: u8 = 8;
 const FRAME_MLS_PROPOSAL: u8 = 9;
 const FRAME_MLS_KEY_PACKAGE: u8 = 10;
+const FRAME_MLS_WELCOME: u8 = 11;
 const MLS_EVENT_MAGIC: &[u8; 4] = b"SLME";
 const MLS_EVENT_VERSION: u16 = 1;
 const MLS_COMMIT_MAGIC: &[u8; 4] = b"SLMC";
@@ -31,11 +32,14 @@ const MLS_PROPOSAL_MAGIC: &[u8; 4] = b"SLMP";
 const MLS_PROPOSAL_VERSION: u16 = 1;
 const MLS_KEY_PACKAGE_MAGIC: &[u8; 4] = b"SLKP";
 const MLS_KEY_PACKAGE_VERSION: u16 = 1;
+const MLS_WELCOME_MAGIC: &[u8; 4] = b"SLMW";
+const MLS_WELCOME_VERSION: u16 = 1;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
 const MAX_MLS_EVENT_BYTES: usize = 64 * 1024;
 const MAX_MLS_COMMIT_BYTES: usize = 64 * 1024;
 const MAX_MLS_PROPOSAL_BYTES: usize = 64 * 1024;
 const MAX_MLS_KEY_PACKAGE_BYTES: usize = 64 * 1024;
+const MAX_MLS_WELCOME_BYTES: usize = 256 * 1024;
 const MAX_CHECKPOINT_BYTES: usize = 16 * 1024;
 pub const MAX_PENDING_MESSAGES: usize = 16;
 const MAX_MLS_COMMIT_REQUESTS_PER_SESSION: u8 = 16;
@@ -87,6 +91,15 @@ pub struct MlsKeyPackageEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlsWelcomeEnvelope {
+    pub event_id: [u8; 16],
+    pub invitee_device: [u8; 32],
+    pub group_id: Vec<u8>,
+    pub welcome: Vec<u8>,
+    pub ratchet_tree: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerAcceptError {
     Unauthorized(EndpointId),
     Failed(String),
@@ -113,6 +126,10 @@ pub enum PeerCommand {
     SendMlsKeyPackage {
         request_id: u64,
         key_package: MlsKeyPackageEnvelope,
+    },
+    SendMlsWelcome {
+        request_id: u64,
+        welcome: MlsWelcomeEnvelope,
     },
     RequestMlsCommit {
         group_id: Vec<u8>,
@@ -160,6 +177,11 @@ pub enum PeerEvent {
         peer_id: EndpointId,
         key_package: MlsKeyPackageEnvelope,
     },
+    MlsWelcomeReceived {
+        sequence: u64,
+        peer_id: EndpointId,
+        welcome: MlsWelcomeEnvelope,
+    },
     MlsCommitRequested {
         peer_id: EndpointId,
         group_id: Vec<u8>,
@@ -177,6 +199,9 @@ pub enum PeerEvent {
     MlsKeyPackageAcknowledged {
         request_id: u64,
     },
+    MlsWelcomeAcknowledged {
+        request_id: u64,
+    },
     MlsEventRejected {
         request_id: u64,
         reason: String,
@@ -190,6 +215,10 @@ pub enum PeerEvent {
         reason: String,
     },
     MlsKeyPackageRejected {
+        request_id: u64,
+        reason: String,
+    },
+    MlsWelcomeRejected {
         request_id: u64,
         reason: String,
     },
@@ -213,6 +242,9 @@ pub enum PeerEvent {
     MlsKeyPackageDeliveryUnknown {
         request_id: u64,
     },
+    MlsWelcomeDeliveryUnknown {
+        request_id: u64,
+    },
     #[allow(dead_code)]
     Unauthorized {
         peer_id: EndpointId,
@@ -233,6 +265,7 @@ enum PendingOutbound {
     MlsCommit { request_id: u64 },
     MlsProposal { request_id: u64 },
     MlsKeyPackage { request_id: u64 },
+    MlsWelcome { request_id: u64 },
 }
 
 pub struct DirectPeerSession {
@@ -264,6 +297,10 @@ enum Frame {
     MlsKeyPackage {
         sequence: u64,
         key_package: MlsKeyPackageEnvelope,
+    },
+    MlsWelcome {
+        sequence: u64,
+        welcome: MlsWelcomeEnvelope,
     },
     MlsCommitRequest {
         group_id: Vec<u8>,
@@ -357,21 +394,25 @@ impl DirectPeerListener {
                 | PeerEvent::MlsCommitReceived { .. }
                 | PeerEvent::MlsProposalReceived { .. }
                 | PeerEvent::MlsKeyPackageReceived { .. }
+                | PeerEvent::MlsWelcomeReceived { .. }
                 | PeerEvent::MlsCommitRequested { .. }
                 | PeerEvent::MlsEventAcknowledged { .. }
                 | PeerEvent::MlsCommitAcknowledged { .. }
                 | PeerEvent::MlsProposalAcknowledged { .. }
                 | PeerEvent::MlsKeyPackageAcknowledged { .. }
+                | PeerEvent::MlsWelcomeAcknowledged { .. }
                 | PeerEvent::MlsEventRejected { .. }
                 | PeerEvent::MlsCommitRejected { .. }
                 | PeerEvent::MlsProposalRejected { .. }
                 | PeerEvent::MlsKeyPackageRejected { .. }
+                | PeerEvent::MlsWelcomeRejected { .. }
                 | PeerEvent::Rejected { .. }
                 | PeerEvent::DeliveryUnknown { .. }
                 | PeerEvent::MlsEventDeliveryUnknown { .. }
                 | PeerEvent::MlsCommitDeliveryUnknown { .. }
                 | PeerEvent::MlsProposalDeliveryUnknown { .. }
-                | PeerEvent::MlsKeyPackageDeliveryUnknown { .. } => {}
+                | PeerEvent::MlsKeyPackageDeliveryUnknown { .. }
+                | PeerEvent::MlsWelcomeDeliveryUnknown { .. } => {}
             }
         }
         received.ok_or_else(|| "peer session ended before receiving text".to_owned())
@@ -401,13 +442,25 @@ impl DirectPeerSession {
             let mut seen_commit_requests = std::collections::HashSet::new();
             let mut closing = false;
             let mut close_deadline = Box::pin(tokio::time::sleep(CLOSE_TIMEOUT));
+            let mut receive = self.receive;
+            let (frame_sender, mut frame_receiver) = mpsc::channel(1);
+            // Keep partial QUIC frame reads alive while the session handles commands.
+            let _reader = tokio::spawn(async move {
+                loop {
+                    let frame = read_frame(&mut receive).await;
+                    let finished = frame.is_err();
+                    if frame_sender.send(frame).await.is_err() || finished {
+                        break;
+                    }
+                }
+            });
             yield PeerEvent::Connected { peer_id: self.peer_id };
 
             let disconnect_reason = 'session: loop {
                 tokio::select! {
-                    frame = read_frame(&mut self.receive) => {
+                    frame = frame_receiver.recv() => {
                         match frame {
-                            Ok(Frame::Data { sequence, text }) => {
+                            Some(Ok(Frame::Data { sequence, text })) => {
                                 if closing {
                                     break 'session "peer sent application data while disconnecting".to_owned();
                                 }
@@ -424,7 +477,7 @@ impl DirectPeerSession {
                                 pending_inbound.insert(sequence);
                                 yield PeerEvent::Received { sequence, text };
                             }
-                            Ok(Frame::MlsEvent { sequence, event }) => {
+                            Some(Ok(Frame::MlsEvent { sequence, event })) => {
                                 if closing {
                                     break 'session "peer sent application data while disconnecting".to_owned();
                                 }
@@ -441,7 +494,7 @@ impl DirectPeerSession {
                                 pending_inbound.insert(sequence);
                                 yield PeerEvent::MlsEventReceived { sequence, event };
                             }
-                            Ok(Frame::MlsCommit { sequence, commit }) => {
+                            Some(Ok(Frame::MlsCommit { sequence, commit })) => {
                                 if closing {
                                     break 'session "peer sent application data while disconnecting".to_owned();
                                 }
@@ -458,7 +511,7 @@ impl DirectPeerSession {
                                 pending_inbound.insert(sequence);
                                 yield PeerEvent::MlsCommitReceived { sequence, commit };
                             }
-                            Ok(Frame::MlsProposal { sequence, proposal }) => {
+                            Some(Ok(Frame::MlsProposal { sequence, proposal })) => {
                                 if closing {
                                     break 'session "peer sent application data while disconnecting".to_owned();
                                 }
@@ -479,7 +532,7 @@ impl DirectPeerSession {
                                     proposal,
                                 };
                             }
-                            Ok(Frame::MlsKeyPackage { sequence, key_package }) => {
+                            Some(Ok(Frame::MlsKeyPackage { sequence, key_package })) => {
                                 if closing {
                                     break 'session "peer sent application data while disconnecting".to_owned();
                                 }
@@ -500,7 +553,28 @@ impl DirectPeerSession {
                                     key_package,
                                 };
                             }
-                            Ok(Frame::MlsCommitRequest { group_id, predecessor_epoch }) => {
+                            Some(Ok(Frame::MlsWelcome { sequence, welcome })) => {
+                                if closing {
+                                    break 'session "peer sent application data while disconnecting".to_owned();
+                                }
+                                if sequence != next_in_sequence {
+                                    break 'session format!("peer data sequence {sequence} did not match expected {next_in_sequence}");
+                                }
+                                if pending_inbound.len() >= MAX_PENDING_MESSAGES {
+                                    break 'session "peer exceeded the inbound pending-message limit".to_owned();
+                                }
+                                let Some(next) = next_in_sequence.checked_add(1) else {
+                                    break 'session "inbound message sequence exhausted".to_owned();
+                                };
+                                next_in_sequence = next;
+                                pending_inbound.insert(sequence);
+                                yield PeerEvent::MlsWelcomeReceived {
+                                    sequence,
+                                    peer_id: self.peer_id,
+                                    welcome,
+                                };
+                            }
+                            Some(Ok(Frame::MlsCommitRequest { group_id, predecessor_epoch })) => {
                                 received_commit_requests = received_commit_requests.saturating_add(1);
                                 if received_commit_requests > MAX_MLS_COMMIT_REQUESTS_PER_SESSION {
                                     break 'session "peer exceeded the MLS predecessor request limit".to_owned();
@@ -514,7 +588,7 @@ impl DirectPeerSession {
                                     predecessor_epoch,
                                 };
                             }
-                            Ok(Frame::Ack { sequence }) => {
+                            Some(Ok(Frame::Ack { sequence })) => {
                                 let Some(pending) = pending_sends.remove(&sequence) else {
                                     break 'session format!("peer acknowledged sequence {sequence} that is not outstanding");
                                 };
@@ -535,9 +609,12 @@ impl DirectPeerSession {
                                     PendingOutbound::MlsKeyPackage { request_id } => {
                                         yield PeerEvent::MlsKeyPackageAcknowledged { request_id };
                                     }
+                                    PendingOutbound::MlsWelcome { request_id } => {
+                                        yield PeerEvent::MlsWelcomeAcknowledged { request_id };
+                                    }
                                 }
                             }
-                            Ok(Frame::Reject { sequence, reason }) => {
+                            Some(Ok(Frame::Reject { sequence, reason })) => {
                                 let Some(pending) = pending_sends.remove(&sequence) else {
                                     break 'session format!("peer rejected sequence {sequence} that is not outstanding");
                                 };
@@ -547,9 +624,10 @@ impl DirectPeerSession {
                                     PendingOutbound::MlsCommit { request_id } => yield PeerEvent::MlsCommitRejected { request_id, reason },
                                     PendingOutbound::MlsProposal { request_id } => yield PeerEvent::MlsProposalRejected { request_id, reason },
                                     PendingOutbound::MlsKeyPackage { request_id } => yield PeerEvent::MlsKeyPackageRejected { request_id, reason },
+                                    PendingOutbound::MlsWelcome { request_id } => yield PeerEvent::MlsWelcomeRejected { request_id, reason },
                                 }
                             }
-                            Ok(Frame::Close) => {
+                            Some(Ok(Frame::Close)) => {
                                 if write_frame(&mut self.send, FRAME_CLOSE_ACK, 0, &[]).await.is_err() {
                                     break 'session "could not acknowledge peer disconnect".to_owned();
                                 }
@@ -559,13 +637,14 @@ impl DirectPeerSession {
                                 let _ = tokio::time::timeout(CLOSE_TIMEOUT, self.send.stopped()).await;
                                 break 'session "peer disconnected".to_owned();
                             }
-                            Ok(Frame::CloseAck) if closing => {
+                            Some(Ok(Frame::CloseAck)) if closing => {
                                 break 'session "local disconnect completed".to_owned();
                             }
-                            Ok(Frame::CloseAck) => {
+                            Some(Ok(Frame::CloseAck)) => {
                                 break 'session "unsolicited disconnect acknowledgement".to_owned();
                             }
-                            Err(error) => break 'session error,
+                            Some(Err(error)) => break 'session error,
+                            None => break 'session "peer session reader stopped".to_owned(),
                         }
                     }
                     command = commands.recv(), if !closing => {
@@ -695,6 +774,31 @@ impl DirectPeerSession {
                                 }
                                 next_out_sequence = next;
                             }
+                            Some(PeerCommand::SendMlsWelcome { request_id, welcome }) => {
+                                let payload = match encode_mls_welcome(&welcome) {
+                                    Ok(payload) => payload,
+                                    Err(reason) => {
+                                        yield PeerEvent::MlsWelcomeRejected { request_id, reason };
+                                        continue;
+                                    }
+                                };
+                                if pending_sends.len() >= MAX_PENDING_MESSAGES {
+                                    yield PeerEvent::MlsWelcomeRejected {
+                                        request_id,
+                                        reason: format!("at most {MAX_PENDING_MESSAGES} messages may await acknowledgement"),
+                                    };
+                                    continue;
+                                }
+                                let sequence = next_out_sequence;
+                                let Some(next) = next_out_sequence.checked_add(1) else {
+                                    break 'session "outbound message sequence exhausted".to_owned();
+                                };
+                                pending_sends.insert(sequence, PendingOutbound::MlsWelcome { request_id });
+                                if let Err(error) = write_frame(&mut self.send, FRAME_MLS_WELCOME, sequence, &payload).await {
+                                    break 'session format!("could not send MLS Welcome: {error}");
+                                }
+                                next_out_sequence = next;
+                            }
                             Some(PeerCommand::RequestMlsCommit { group_id, predecessor_epoch }) => {
                                 if group_id.len() != 16 || predecessor_epoch > i64::MAX as u64 {
                                     continue;
@@ -764,6 +868,9 @@ impl DirectPeerSession {
                     }
                     PendingOutbound::MlsKeyPackage { request_id } => {
                         yield PeerEvent::MlsKeyPackageDeliveryUnknown { request_id };
+                    }
+                    PendingOutbound::MlsWelcome { request_id } => {
+                        yield PeerEvent::MlsWelcomeDeliveryUnknown { request_id };
                     }
                 }
             }
@@ -873,15 +980,18 @@ pub async fn send_once(
             | PeerEvent::MlsCommitReceived { .. }
             | PeerEvent::MlsProposalReceived { .. }
             | PeerEvent::MlsKeyPackageReceived { .. }
+            | PeerEvent::MlsWelcomeReceived { .. }
             | PeerEvent::MlsCommitRequested { .. }
             | PeerEvent::MlsEventAcknowledged { .. }
             | PeerEvent::MlsCommitAcknowledged { .. }
             | PeerEvent::MlsProposalAcknowledged { .. }
             | PeerEvent::MlsKeyPackageAcknowledged { .. }
+            | PeerEvent::MlsWelcomeAcknowledged { .. }
             | PeerEvent::MlsEventRejected { .. }
             | PeerEvent::MlsCommitRejected { .. }
             | PeerEvent::MlsProposalRejected { .. }
             | PeerEvent::MlsKeyPackageRejected { .. }
+            | PeerEvent::MlsWelcomeRejected { .. }
             | PeerEvent::Unauthorized { .. } => {}
             PeerEvent::MlsEventDeliveryUnknown { .. } => {
                 return Err("MLS event delivery could not be confirmed".to_owned());
@@ -894,6 +1004,9 @@ pub async fn send_once(
             }
             PeerEvent::MlsKeyPackageDeliveryUnknown { .. } => {
                 return Err("MLS KeyPackage delivery could not be confirmed".to_owned());
+            }
+            PeerEvent::MlsWelcomeDeliveryUnknown { .. } => {
+                return Err("MLS Welcome delivery could not be confirmed".to_owned());
             }
         }
     }
@@ -1012,6 +1125,22 @@ where
             Ok(Frame::MlsKeyPackage {
                 sequence,
                 key_package: decode_mls_key_package(&bytes)?,
+            })
+        }
+        FRAME_MLS_WELCOME => {
+            if length == 0 || length > MAX_MLS_WELCOME_BYTES {
+                return Err(format!(
+                    "MLS Welcome length must be between 1 and {MAX_MLS_WELCOME_BYTES}"
+                ));
+            }
+            let mut bytes = vec![0_u8; length];
+            reader
+                .read_exact(&mut bytes)
+                .await
+                .map_err(|error| format!("could not read MLS Welcome frame: {error}"))?;
+            Ok(Frame::MlsWelcome {
+                sequence,
+                welcome: decode_mls_welcome(&bytes)?,
             })
         }
         FRAME_MLS_COMMIT_REQUEST if length == 24 && sequence == 0 => {
@@ -1198,6 +1327,101 @@ fn decode_mls_key_package(bytes: &[u8]) -> Result<MlsKeyPackageEnvelope, String>
         group_id,
         key_package,
     })
+}
+
+fn encode_mls_welcome(envelope: &MlsWelcomeEnvelope) -> Result<Vec<u8>, String> {
+    let total_artifact_len = envelope
+        .welcome
+        .len()
+        .saturating_add(envelope.ratchet_tree.len());
+    let mut hash = blake3::Hasher::new();
+    hash.update(&(envelope.welcome.len() as u32).to_be_bytes());
+    hash.update(&envelope.welcome);
+    hash.update(&(envelope.ratchet_tree.len() as u32).to_be_bytes());
+    hash.update(&envelope.ratchet_tree);
+    if envelope.event_id.iter().all(|byte| *byte == 0)
+        || envelope.invitee_device.iter().all(|byte| *byte == 0)
+        || envelope.group_id.len() != 16
+        || envelope.welcome.is_empty()
+        || envelope.ratchet_tree.is_empty()
+        || total_artifact_len > MAX_MLS_WELCOME_BYTES
+        || envelope.event_id.as_slice() != &hash.finalize().as_bytes()[..16]
+    {
+        return Err("MLS Welcome has an invalid or oversized envelope".to_owned());
+    }
+    let mut output = Vec::with_capacity(78 + total_artifact_len);
+    output.extend_from_slice(MLS_WELCOME_MAGIC);
+    output.extend_from_slice(&MLS_WELCOME_VERSION.to_be_bytes());
+    output.extend_from_slice(&envelope.event_id);
+    output.extend_from_slice(&envelope.invitee_device);
+    output.extend_from_slice(&envelope.group_id);
+    output.extend_from_slice(&(envelope.welcome.len() as u32).to_be_bytes());
+    output.extend_from_slice(&envelope.welcome);
+    output.extend_from_slice(&(envelope.ratchet_tree.len() as u32).to_be_bytes());
+    output.extend_from_slice(&envelope.ratchet_tree);
+    if output.len() > MAX_MLS_WELCOME_BYTES {
+        return Err("serialized MLS Welcome exceeds the transport limit".to_owned());
+    }
+    Ok(output)
+}
+
+fn decode_mls_welcome(bytes: &[u8]) -> Result<MlsWelcomeEnvelope, String> {
+    const FIXED: usize = 4 + 2 + 16 + 32 + 16 + 4 + 4;
+    if bytes.len() < FIXED
+        || bytes.len() > MAX_MLS_WELCOME_BYTES
+        || &bytes[..4] != MLS_WELCOME_MAGIC
+    {
+        return Err("invalid or oversized MLS Welcome envelope".to_owned());
+    }
+    let version = u16::from_be_bytes(bytes[4..6].try_into().unwrap());
+    if version != MLS_WELCOME_VERSION {
+        return Err(format!(
+            "unsupported MLS Welcome envelope version: {version}"
+        ));
+    }
+    let mut cursor = 6;
+    let event_id = bytes[cursor..cursor + 16].try_into().unwrap();
+    cursor += 16;
+    let invitee_device = bytes[cursor..cursor + 32].try_into().unwrap();
+    cursor += 32;
+    let group_id = bytes[cursor..cursor + 16].to_vec();
+    cursor += 16;
+    let welcome_len = u32::from_be_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+    cursor += 4;
+    if welcome_len == 0
+        || cursor
+            .checked_add(welcome_len + 4)
+            .is_none_or(|end| end > bytes.len())
+    {
+        return Err("MLS Welcome length is invalid".to_owned());
+    }
+    let welcome = bytes[cursor..cursor + welcome_len].to_vec();
+    cursor += welcome_len;
+    let tree_len = u32::from_be_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+    cursor += 4;
+    if tree_len == 0 || cursor.checked_add(tree_len) != Some(bytes.len()) {
+        return Err("MLS ratchet tree length is invalid".to_owned());
+    }
+    let ratchet_tree = bytes[cursor..].to_vec();
+    let envelope = MlsWelcomeEnvelope {
+        event_id,
+        invitee_device,
+        group_id,
+        welcome,
+        ratchet_tree,
+    };
+    let mut hash = blake3::Hasher::new();
+    hash.update(&(envelope.welcome.len() as u32).to_be_bytes());
+    hash.update(&envelope.welcome);
+    hash.update(&(envelope.ratchet_tree.len() as u32).to_be_bytes());
+    hash.update(&envelope.ratchet_tree);
+    if envelope.event_id.iter().all(|byte| *byte == 0)
+        || envelope.invitee_device.iter().all(|byte| *byte == 0)
+        || envelope.event_id.as_slice() != &hash.finalize().as_bytes()[..16]
+    {
+        return Err("MLS Welcome envelope identity or content digest is invalid".to_owned());
+    }
+    Ok(envelope)
 }
 
 fn encode_mls_commit(commit: &MlsCommitEnvelope) -> Result<Vec<u8>, String> {
@@ -1757,6 +1981,68 @@ mod tests {
         let mut invalid = envelope;
         invalid.group_id.pop();
         assert!(encode_mls_key_package(&invalid).is_err());
+    }
+
+    #[test]
+    fn mls_welcome_envelope_round_trips_and_binds_both_artifacts() {
+        let welcome = vec![0x75; 64];
+        let ratchet_tree = vec![0x76; 32];
+        let mut digest = blake3::Hasher::new();
+        digest.update(&(welcome.len() as u32).to_be_bytes());
+        digest.update(&welcome);
+        digest.update(&(ratchet_tree.len() as u32).to_be_bytes());
+        digest.update(&ratchet_tree);
+        let mut event_id = [0; 16];
+        event_id.copy_from_slice(&digest.finalize().as_bytes()[..16]);
+        let envelope = MlsWelcomeEnvelope {
+            event_id,
+            invitee_device: [0x72; 32],
+            group_id: [0x73; 16].to_vec(),
+            welcome,
+            ratchet_tree,
+        };
+        let encoded = encode_mls_welcome(&envelope).expect("valid Welcome should serialize");
+        assert_eq!(decode_mls_welcome(&encoded).unwrap(), envelope);
+
+        let mut tampered = envelope.clone();
+        tampered.ratchet_tree[0] ^= 1;
+        assert!(encode_mls_welcome(&tampered).is_err());
+
+        let mut invalid = envelope;
+        invalid.group_id.pop();
+        assert!(encode_mls_welcome(&invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn strict_session_parser_round_trips_mls_welcome_frame() {
+        let welcome = vec![0x84; 48];
+        let ratchet_tree = vec![0x85; 16];
+        let mut digest = blake3::Hasher::new();
+        digest.update(&(welcome.len() as u32).to_be_bytes());
+        digest.update(&welcome);
+        digest.update(&(ratchet_tree.len() as u32).to_be_bytes());
+        digest.update(&ratchet_tree);
+        let mut event_id = [0; 16];
+        event_id.copy_from_slice(&digest.finalize().as_bytes()[..16]);
+        let welcome = MlsWelcomeEnvelope {
+            event_id,
+            invitee_device: [0x82; 32],
+            group_id: [0x83; 16].to_vec(),
+            welcome,
+            ratchet_tree,
+        };
+        let payload = encode_mls_welcome(&welcome).unwrap();
+        let (mut writer, mut reader) = duplex(1024);
+        write_frame(&mut writer, FRAME_MLS_WELCOME, 4, &payload)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_frame(&mut reader).await.unwrap(),
+            Frame::MlsWelcome {
+                sequence: 4,
+                welcome,
+            }
+        );
     }
 
     #[tokio::test]

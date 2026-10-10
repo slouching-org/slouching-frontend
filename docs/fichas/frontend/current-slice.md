@@ -4,8 +4,10 @@
 LAN chat uses pinned Ed25519 device identities and persistent Iroh/QUIC
 sessions. MLS group setup can send a device-bound KeyPackage over the active
 pinned session; the committer reviews and admits it after matching the package
-identity to the transport peer. Welcome and ratchet-tree exchange remain
-manual over a trusted channel. For an already joined group, MLS application
+identity to the transport peer. After admission, the committer sends Welcome
+and ratchet tree over the pinned session. The invitee validates the target
+device, group, local KeyPackage and pinned committer, saves the joined group,
+then ACKs. Copy/paste fields remain available when delivery is unknown. For an already joined group, MLS application
 messages are encrypted with OpenMLS and sent over the active direct session.
 The receiver validates the sender binding and event metadata, advances the
 ratchet, stores ciphertext and the local transcript in SQLCipher, then ACKs.
@@ -30,8 +32,8 @@ native Iced views, original art, icons, embedded fonts, and texture effects.
 The **Telas** gallery reaches each screen. The MLS view creates groups,
 prepares and admits device-bound KeyPackages, processes Welcome and ratchet
 tree data, loads a bounded local transcript, sends application messages, and
-retries queued outbox events for the selected group unless it is quarantined. Group invitations still
-require a separately trusted channel. Both devices must have joined the same
+retries queued outbox events for the selected group unless it is quarantined. Group invitations require a separately trusted device-key pin and an explicit
+committer admission. Both devices must have joined the same
 group, select its ID, and establish a direct LAN session to exchange messages.
 Groups saved on this device appear with their current epoch and quarantine
 status; selecting one reloads its local transcript and security state.
@@ -66,5 +68,5 @@ screen capture, contact discovery, verified pairing, multi-peer group fan-out,
 relay, and offline delivery are not implemented. The older web UI under
 `prototypes/web/` is a design benchmark, not the product runtime.
 
-See [direct peer transport v6](../transport/lan-peer-v6.md) for the direct session
+See [direct peer transport v7](../transport/lan-peer-v7.md) for the direct session
 contract and [the Iced design plan](iced-design.md) for visual references.

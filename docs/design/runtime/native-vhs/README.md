@@ -18,9 +18,12 @@ messages, and comparison words are marked as illustrative. No peer route,
 media capture, messaging, or call is established by these images.
 Exact parity and accessibility remain open.
 
-The MLS screen lets two devices manually exchange a public KeyPackage,
-Welcome, and ratchet tree through a separately trusted channel. Joined devices
-send encrypted MLS messages over their active pinned Iroh/QUIC session. The
+The MLS screen lets an invitee send a public KeyPackage over the active pinned
+Iroh/QUIC session. After explicit committer admission, the Welcome and ratchet
+tree travel over that session too; the invitee validates and stores the group
+before acknowledging. Copy/paste fields remain as a fallback if delivery is
+unknown. Joined devices send encrypted MLS messages over their active pinned
+Iroh/QUIC session. The
 receiver persists the ratchet update and transcript before ACK. The group view
 lists locally saved group IDs, epochs, and quarantine state so a group and its
 transcript can be reopened from SQLCipher. It displays a persistent security

@@ -1440,7 +1440,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
     let invitee = column![
         l.title("2 · Entrar em um grupo", 21.0),
         l.label(
-            "Prepare o pacote neste dispositivo e envie ao committer.",
+            "Envie o KeyPackage ao committer; o Welcome volta por esta sessão.",
             11.0,
             MUTED
         ),
@@ -1645,7 +1645,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
         row![
             column![l.title("Grupo MLS", 28.0), l.label("OpenMLS · SQLCipher · Iroh/QUIC direto", 11.0, MUTED)].spacing(l.px(5.0)),
             space().width(Fill),
-            l.label("INVITE MANUAL · CHAVES NÃO SAEM DO DISPOSITIVO", 10.0, GOLD)
+            l.label("CONVITE DIRETO · CHAVES PRIVADAS LOCAIS", 10.0, GOLD)
         ].align_y(iced::Center),
         rule(LINE, 1.0),
         quarantine_banner,

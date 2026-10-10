@@ -1,7 +1,4 @@
-# Direct peer transport v4
-
-> Historical contract. The active client uses v7; see
-> [lan-peer-v7.md](lan-peer-v7.md) for the current wire format.
+# Direct peer transport v7
 
 This client-only protocol carries direct pairwise text and opaque OpenMLS
 application events between two Rust clients on a reachable LAN. The Iced chat
@@ -21,14 +18,14 @@ Relay mode is disabled and callers supply direct socket addresses.
 
 ## Session framing
 
-ALPN: `org.slouching.peer/4`. One QUIC bidirectional stream stays open for a
+ALPN: `org.slouching.peer/7`. One QUIC bidirectional stream stays open for a
 session. Every frame has a 19-byte header followed by its payload:
 
 | Field | Size | Encoding |
 | --- | ---: | --- |
 | Marker | 4 bytes | ASCII `SLCH` |
-| Version | 2 bytes | Unsigned big-endian integer, `4` |
-| Kind | 1 byte | DATA=1, ACK=2, CLOSE=3, CLOSE_ACK=4, MLS_EVENT=5, MLS_COMMIT=6, REJECT=7, MLS_COMMIT_REQUEST=8 |
+| Version | 2 bytes | Unsigned big-endian integer, `7` |
+| Kind | 1 byte | DATA=1, ACK=2, CLOSE=3, CLOSE_ACK=4, MLS_EVENT=5, MLS_COMMIT=6, REJECT=7, MLS_COMMIT_REQUEST=8, MLS_PROPOSAL=9, MLS_KEY_PACKAGE=10, MLS_WELCOME=11 |
 | Sequence | 8 bytes | Unsigned big-endian; application frames advance monotonically, control requests use zero |
 | Payload length | 4 bytes | Unsigned big-endian byte count |
 
@@ -38,6 +35,13 @@ group ID (16), epoch (u64), expiry timestamp (i64), optional checkpoint (up to
 16 KiB), and nonempty serialized MLS ciphertext. The envelope is length
 checked and capped at 64 KiB. The MLS ciphertext is already protected by MLS;
 QUIC also encrypts the transport connection.
+
+MLS_PROPOSAL carries a `SLMP` version 1 envelope: event ID (16 bytes), author
+device key (32), group ID (16), current epoch (u64), and nonempty serialized
+proposal. Its payload is capped at 64 KiB. The event ID is the first 16 bytes
+of BLAKE3 over the proposal bytes. OpenMLS verifies the proposal's member
+credential before storage; the authenticated QUIC session protects it in
+transit.
 
 The receiver accepts only the next sequence and keeps at most 16 unacknowledged
 inbound deliveries. The application must persist an inbound text message or
@@ -49,6 +53,40 @@ that ACK; it does not mean a person read the message. On disconnect, pending
 sends have unknown delivery. Queued MLS outbox events can be explicitly
 retried from the group screen after reconnecting.
 
+The MLS screen can send a freshly generated self-update proposal to the
+designated committer over the same pinned session. The receiver checks that
+the envelope author matches the pinned Iroh device, then OpenMLS verifies the
+member credential, group, epoch, and self-update proposal before saving it in
+the encrypted local database. Only after that storage operation succeeds does
+the client ACK. Exact redelivery is deduplicated. If the connection closes
+before ACK, delivery is unknown and the member can resend the same proposal;
+the receiver's event ID makes that retry idempotent. This path supports
+self-update proposals only; proposal approval and other proposal types remain
+unimplemented.
+
+MLS_KEY_PACKAGE carries a `SLKP` version 1 envelope: event ID (16 bytes),
+invitee device key (32), group ID (16), and public KeyPackage bytes. The event
+ID is the first 16 bytes of BLAKE3 over the package. Payloads are capped at
+64 KiB. The receiving UI requires the envelope's invitee key to equal the
+authenticated pinned peer and requires the same group to be selected. It
+holds the frame until the designated committer approves **Validar e admitir
+membro**. The ACK follows the transaction that saves the membership Commit
+and Welcome locally. It then sends the Welcome and ratchet tree in an
+MLS_WELCOME frame. The invitee checks the target device and group, validates
+the MLS Welcome against its local KeyPackage and the pinned committer identity,
+persists the group, and only then ACKs. A rejected or disconnected invite
+requires checking local group state before retry; there is no durable Welcome
+outbox.
+
+MLS_WELCOME carries an `SLMW` version 1 envelope: event ID (16), invitee
+device key (32), group ID (16), Welcome length and bytes, then ratchet-tree
+length and bytes. The content ID is the first 16 BLAKE3 bytes over both
+length-prefixed artifacts. The payload is bounded to 256 KiB. The receiver
+requires the local device and pending group to match the envelope, then
+OpenMLS verifies the Welcome against the local KeyPackage. The sender's
+device-bound MLS credential must match the pinned Iroh peer before the joined
+group can commit to SQLCipher.
+
 ## Using the Iced app on a LAN
 
 Create an identity on each device and exchange the displayed public keys out
@@ -59,8 +97,14 @@ that address and connects. Either side can then send pairwise text in the
 **Texto direto · LAN** view.
 
 To use MLS, create a group on one device. Generate a KeyPackage on the other,
-exchange it over a separately trusted channel, admit it, then return the
-Welcome and ratchet tree to the joining client. Both devices open **Grupo MLS**
+select the same group ID, and connect directly to the designated committer.
+Click **Enviar KeyPackage ao committer conectado**. The committer reviews the
+incoming peer-bound package and admits it with **Validar e admitir membro**.
+After storing the membership Commit and Welcome, it ACKs the KeyPackage and
+sends the Welcome plus ratchet tree through the same pinned session. The new
+member clicks **Validar Welcome e entrar**; it saves the group before ACKing the
+Welcome. The copy/paste fields remain available if the direct Welcome delivery
+is unknown. Both devices open **Grupo MLS**
 and select the same group ID. Establish the pinned direct LAN session in
 **Texto direto · LAN**, then return to the group screen to send or retry
 messages. Messages are retained in each device's local SQLCipher database.
@@ -77,7 +121,11 @@ idempotent. Each next Commit waits for the previous persisted ACK. The same
 chain can also be started manually from the MLS screen. The new member joins
 with the matching Welcome and ratchet tree. Connecting to every member still
 requires a separate peer session; simultaneous multi-peer fan-out and helper
-delivery are not implemented.
+delivery are not implemented. To update a member's credential, select that
+group on the member device, generate a self-update proposal, connect directly
+to the designated committer, and use **Enviar proposta ao committer conectado**.
+After the committer reports that it stored the proposal, it can create and
+deliver the resulting Commit through the existing member flow.
 
 Allow the selected UDP port through each device's firewall. Wildcard addresses
 such as `0.0.0.0` cannot be shared. If no LAN address is announced, inspect the
@@ -94,20 +142,22 @@ cannot fetch it. Requests are limited to 16 per session.
 ## Automated checks
 
 `cargo test --test peer_process` launches separate operating system processes.
-It exchanges text, opaque MLS events, MLS Commit frames, and predecessor
-requests between separate processes; checks positive ACK, explicit rejection,
-and wrong-pin rejection; then disconnects with pending sends to verify that
-delivery remains unknown. Storage coverage verifies that a recipient can
-recover a previously ACKed Commit after database reopen, while a device absent
-from its recipient snapshot receives no data.
+It exchanges text, opaque MLS events, MLS Commit frames, predecessor requests,
+proposals, KeyPackages, and Welcome bundles between separate processes; checks
+positive ACK, explicit rejection, and wrong-pin rejection; then disconnects with pending text,
+event, Commit, and proposal sends to verify delivery is reported unknown. Storage
+coverage verifies that a recipient can recover a previously ACKed Commit after
+database reopen, while a device absent from its recipient snapshot receives no
+data. Codec tests cover the proposal envelope and bounds.
 
 ## Limits
 
 This is direct-LAN-only. It has no relay, address discovery, NAT traversal,
 offline delivery, group event distribution service, automatic multi-member
-Commit fan-out, or cross-device history sync. MLS group setup and new-member
-Welcome exchange remain manual. Existing members can receive and atomically
-apply a Commit over the direct session; new members join through the matching
-Welcome/ratchet tree. The protocol v4 ALPN and frame version are not compatible
-with v3 peers. The older command-line
+Commit fan-out, or cross-device history sync. Group creation and admission
+require explicit user actions. Welcome and ratchet-tree transfer use the
+direct pinned session after admission, with copy/paste retained as a fallback.
+Existing members can receive and atomically apply a Commit over the direct
+session. The protocol v7 ALPN and frame version are not compatible with v6 or
+older peers. The older command-line
 helpers are diagnostic; the supported user-facing flow is in Iced.

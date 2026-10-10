@@ -12,7 +12,7 @@ Its Elixir server/backend core and Rust/Iced client direction are retained.
 | Server/backend | Elixir, separately versioned backend repo | Development status and protobuf handshake implemented |
 | State boundary | Versioned protocol | Asynchronous loopback HTTP status and binary protobuf WebSocket handshake v1 integrated; production boundary pending |
 | Browser UI | HTML/CSS/JavaScript | Historical visual prototype in `prototypes/web/`; not product runtime |
-| Identity, MLS, storage, transport, calls | Client and server responsibilities per source PDF | Device-bound MLS signer, pinned-session KeyPackage delivery with committer review, manual Welcome exchange, local group persistence, designated-committer admission, authenticated application messages over the active peer session, and SQLCipher transcript/outbox; automatic Welcome delivery, group discovery, fingerprint verification, relay, offline delivery, and calls remain unimplemented |
+| Identity, MLS, storage, transport, calls | Client and server responsibilities per source PDF | Device-bound MLS signer, pinned-session KeyPackage delivery with committer review, pinned-session Welcome delivery after explicit invitee validation, local group persistence, designated-committer admission, authenticated application messages over the active peer session, and SQLCipher transcript/outbox; durable Welcome retry, group discovery, fingerprint verification, relay, offline delivery, and calls remain unimplemented |
 
 The frontend must render authoritative implemented state. It must not generate
 security claims, route badges, presence, or capture status independently.
@@ -33,7 +33,7 @@ multiple bounded UTF-8 messages over one session stream, with sequence
 acknowledgements and relay mode disabled. This provides
 direct pairwise transport encryption and pinned endpoint authentication only;
 it does not create an MLS group or establish contact pairing. See the
-[direct peer transport v6 contract](../transport/lan-peer-v6.md).
+[direct peer transport v7 contract](../transport/lan-peer-v7.md).
 
 See [ADR 0003](adr-0003-native-client.md) and the
 [backend stack ficha](https://github.com/slouching-org/slouching-backend/blob/main/docs/fichas/architecture/tech-stack.md).

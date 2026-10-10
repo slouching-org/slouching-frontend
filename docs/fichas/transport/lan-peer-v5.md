@@ -1,7 +1,7 @@
 # Direct peer transport v5
 
-> Historical contract. The active client uses v6; see
-> [lan-peer-v6.md](lan-peer-v6.md) for the current wire format.
+> Historical contract. The active client uses v7; see
+> [lan-peer-v7.md](lan-peer-v7.md) for the current wire format.
 
 This client-only protocol carries direct pairwise text and opaque OpenMLS
 application events between two Rust clients on a reachable LAN. The Iced chat
