@@ -29,7 +29,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 23;
+const PROFILE_SCHEMA_VERSION: u32 = 24;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 const MAX_DELEGATED_COPY_BYTES: usize = 32 * 1024;
@@ -1704,6 +1704,7 @@ pub enum ProcessedMlsCommit {
 pub struct LocalProfile {
     pub display_name: String,
     pub familiar: String,
+    pub familiar_image_png: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1744,14 +1745,19 @@ pub fn load_profile() -> Result<Option<LocalProfile>, String> {
         return Ok(None);
     }
     let connection = open_database(&path, &key)?;
+    load_profile_in(&connection)
+}
+
+fn load_profile_in(connection: &Connection) -> Result<Option<LocalProfile>, String> {
     connection
         .query_row(
-            "SELECT display_name, familiar FROM local_profile WHERE id = 1",
+            "SELECT display_name, familiar, familiar_image_png FROM local_profile WHERE id = 1",
             [],
             |row| {
                 Ok(LocalProfile {
                     display_name: row.get(0)?,
                     familiar: row.get(1)?,
+                    familiar_image_png: row.get(2)?,
                 })
             },
         )
@@ -1760,17 +1766,28 @@ pub fn load_profile() -> Result<Option<LocalProfile>, String> {
 }
 
 pub fn save_profile(profile: &LocalProfile) -> Result<(), String> {
+    let connection = open_local_database()?;
+    save_profile_in(&connection, profile)
+}
+
+fn save_profile_in(connection: &Connection, profile: &LocalProfile) -> Result<(), String> {
     let display_name = profile.display_name.trim();
     if display_name.is_empty() || display_name.chars().count() > 40 {
         return Err("local display name must contain between 1 and 40 characters".to_owned());
     }
-    let connection = open_local_database()?;
+    if profile
+        .familiar_image_png
+        .as_ref()
+        .is_some_and(|bytes| bytes.len() > 512 * 1024)
+    {
+        return Err("familiar image exceeds the 512 KiB storage limit".to_owned());
+    }
     connection
         .execute(
-            "INSERT INTO local_profile (id, display_name, familiar) VALUES (1, ?1, ?2)
+            "INSERT INTO local_profile (id, display_name, familiar, familiar_image_png) VALUES (1, ?1, ?2, ?3)
              ON CONFLICT(id) DO UPDATE SET display_name = excluded.display_name,
-                 familiar = excluded.familiar",
-            params![display_name, profile.familiar],
+                 familiar = excluded.familiar, familiar_image_png = excluded.familiar_image_png",
+            params![display_name, profile.familiar, profile.familiar_image_png],
         )
         .map_err(|error| format!("could not save encrypted local profile: {error}"))?;
     Ok(())
@@ -5796,6 +5813,16 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
             )
             .map_err(|error| format!("could not add MLS group purpose: {error}"))?;
     }
+    if version < 24 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE local_profile
+                     ADD COLUMN familiar_image_png BLOB
+                     CHECK (familiar_image_png IS NULL OR length(familiar_image_png) <= 524288);
+                 PRAGMA user_version = 24;",
+            )
+            .map_err(|error| format!("could not add encrypted familiar image storage: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -5866,6 +5893,68 @@ mod tests {
             peer_identity.public().as_bytes(),
             device_identity.verifying_key().as_bytes()
         );
+    }
+
+    #[test]
+    fn custom_familiar_png_persists_in_the_encrypted_local_profile() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-custom-familiar-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary database directory should be created");
+        let path = directory.join("profile.sqlite3");
+        let key = [0x42; PROFILE_DB_KEY_LEN];
+        let avatar_png = {
+            let avatar =
+                image_codec::RgbaImage::from_pixel(32, 24, image_codec::Rgba([200, 140, 50, 255]));
+            let mut encoded = std::io::Cursor::new(Vec::new());
+            image_codec::DynamicImage::ImageRgba8(avatar)
+                .write_to(&mut encoded, image_codec::ImageFormat::Png)
+                .expect("test avatar should encode");
+            encoded.into_inner()
+        };
+        let expected = LocalProfile {
+            display_name: "Mara".to_owned(),
+            familiar: "frog".to_owned(),
+            familiar_image_png: Some(avatar_png),
+        };
+
+        {
+            let connection =
+                open_database(&path, &key).expect("encrypted profile database should initialize");
+            save_profile_in(&connection, &expected).expect("custom familiar should persist");
+        }
+        let connection = open_database(&path, &key).expect("encrypted profile should reopen");
+        let loaded = load_profile_in(&connection)
+            .expect("custom familiar should load")
+            .expect("saved profile should exist");
+        assert_eq!(loaded.display_name, expected.display_name);
+        assert_eq!(loaded.familiar, expected.familiar);
+        assert_eq!(loaded.familiar_image_png, expected.familiar_image_png);
+        drop(connection);
+
+        let connection = open_database(&path, &key).expect("schema 24 should reopen");
+        connection
+            .execute_batch(
+                "ALTER TABLE local_profile DROP COLUMN familiar_image_png;
+                 PRAGMA user_version = 23;",
+            )
+            .expect("test should restore the prior profile schema");
+        drop(connection);
+        let connection = open_database(&path, &key)
+            .expect("existing schema 23 profiles should migrate to avatar storage");
+        let migrated = load_profile_in(&connection)
+            .expect("older profile should load after migration")
+            .expect("older profile should remain present");
+        assert_eq!(migrated.display_name, expected.display_name);
+        assert_eq!(migrated.familiar, expected.familiar);
+        assert!(migrated.familiar_image_png.is_none());
+        drop(connection);
+        fs::remove_dir_all(directory).expect("temporary profile files should be removed");
     }
 
     #[test]
@@ -5947,6 +6036,7 @@ mod tests {
             .execute_batch(
                 "DROP TABLE local_verified_peers;
                  DROP TABLE local_file_attachments;
+                 ALTER TABLE local_profile DROP COLUMN familiar_image_png;
                  ALTER TABLE local_mls_groups DROP COLUMN purpose;
                  ALTER TABLE local_mls_welcome_receipts DROP COLUMN purpose;
                  PRAGMA user_version = 19;",
@@ -8204,7 +8294,8 @@ mod tests {
         connection
             .execute_batch(
                 "ALTER TABLE local_mls_groups DROP COLUMN purpose;
-                 ALTER TABLE local_mls_welcome_receipts DROP COLUMN purpose;",
+                 ALTER TABLE local_mls_welcome_receipts DROP COLUMN purpose;
+                 ALTER TABLE local_profile DROP COLUMN familiar_image_png;",
             )
             .expect("test should restore the version 21 MLS schema");
         connection

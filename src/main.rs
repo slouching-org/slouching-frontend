@@ -8,6 +8,7 @@ pub mod call_chat;
 pub mod call_rtc;
 pub mod call_video;
 pub mod camera_capture;
+pub mod familiar_image;
 pub mod file_transfer;
 pub mod identity;
 pub mod media;
@@ -241,6 +242,7 @@ struct Slouching {
     invite: String,
     name: String,
     familiar: &'static str,
+    familiar_image_png: Option<Vec<u8>>,
     show_gallery: bool,
     settings_tab: u8,
     share_tab: u8,
@@ -440,6 +442,7 @@ impl Default for Slouching {
             invite: String::new(),
             name: String::new(),
             familiar: "Sapo Mago",
+            familiar_image_png: None,
             show_gallery: false,
             settings_tab: 1,
             share_tab: 0,
@@ -567,6 +570,8 @@ enum Message {
     InviteChanged(String),
     NameChanged(String),
     ChooseFamiliar(&'static str),
+    ChooseCustomFamiliar,
+    CustomFamiliarImageLoaded(Result<Option<Vec<u8>>, String>),
     ToggleGallery,
     SettingsTab(u8),
     RefreshAudioDevices,
@@ -1459,7 +1464,35 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         }
         Message::InviteChanged(value) => state.invite = value,
         Message::NameChanged(value) => state.name = value,
-        Message::ChooseFamiliar(value) => state.familiar = value,
+        Message::ChooseFamiliar(value) => {
+            state.familiar = value;
+            state.familiar_image_png = None;
+            state.profile_status = ProfileStatus::Empty;
+        }
+        Message::ChooseCustomFamiliar => {
+            return Task::perform(
+                async {
+                    let Some(file) = rfd::AsyncFileDialog::new()
+                        .add_filter("Imagem PNG", &["png"])
+                        .pick_file()
+                        .await
+                    else {
+                        return Ok(None);
+                    };
+                    familiar_image::load_png(file.path()).map(Some)
+                },
+                Message::CustomFamiliarImageLoaded,
+            );
+        }
+        Message::CustomFamiliarImageLoaded(Ok(Some(bytes))) => {
+            state.familiar_image_png = Some(bytes);
+            state.profile_status = ProfileStatus::Empty;
+        }
+        Message::CustomFamiliarImageLoaded(Ok(None)) => {}
+        Message::CustomFamiliarImageLoaded(Err(_)) => {
+            state.note =
+                Some("Imagem inválida. Escolha um PNG com até 8 MiB e 4096 × 4096 pixels.");
+        }
         Message::ToggleGallery => {
             stop_audio_monitor(state);
             state.show_gallery = !state.show_gallery;
@@ -1842,6 +1875,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             Ok(Some(profile)) => {
                 state.name = profile.display_name;
                 state.familiar = storage::familiar_label(&profile.familiar);
+                state.familiar_image_png = profile.familiar_image_png;
                 state.profile_status = ProfileStatus::Saved;
             }
             Ok(None) => state.profile_status = ProfileStatus::Empty,
@@ -1862,6 +1896,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             let profile = storage::LocalProfile {
                 display_name,
                 familiar: storage::familiar_id(state.familiar).to_owned(),
+                familiar_image_png: state.familiar_image_png.clone(),
             };
             state.profile_status = ProfileStatus::Saving;
             return Task::perform(save_profile_task(profile.clone()), move |result| {
@@ -1872,6 +1907,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             Ok(()) => {
                 state.name = profile.display_name;
                 state.familiar = storage::familiar_label(&profile.familiar);
+                state.familiar_image_png = profile.familiar_image_png;
                 state.profile_status = ProfileStatus::Saved;
                 state.note = Some("Perfil salvo no armazenamento local cifrado.");
             }
@@ -7580,6 +7616,21 @@ mod tests {
         assert_eq!(state.screen, Screen::Settings);
         assert_eq!(state.settings_tab, 2);
         assert!(!state.show_gallery);
+    }
+
+    #[test]
+    fn choosing_a_builtin_familiar_clears_custom_avatar_until_saved() {
+        let mut state = Slouching {
+            familiar_image_png: Some(b"old avatar".to_vec()),
+            profile_status: ProfileStatus::Saved,
+            ..Slouching::default()
+        };
+
+        let _ = update(&mut state, Message::ChooseFamiliar("Gnomo"));
+
+        assert_eq!(state.familiar, "Gnomo");
+        assert!(state.familiar_image_png.is_none());
+        assert!(matches!(state.profile_status, ProfileStatus::Empty));
     }
 
     #[test]

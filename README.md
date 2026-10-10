@@ -391,9 +391,12 @@ flow for a quarantined group.
 
 Familiar selection, invitation/draft fields, screen navigation, settings
 tabs, illustrative share-source selection, and interface texture work locally.
-The familiar screen saves the display name and familiar as a local profile in
-SQLCipher encrypted SQLite; the database key is stored in the operating system
-credential store. Saving fails closed when that store is unavailable. The
+The familiar screen saves the display name, supplied familiar, and optional
+custom PNG avatar in SQLCipher encrypted SQLite; the database key is stored
+in the operating system credential store. PNG import is explicit, limited to
+8 MiB and 4096 × 4096 pixels, resized within 256 × 256, and stored under a
+512 KiB bound. Selecting a supplied familiar removes the custom avatar.
+Saving fails closed when that store is unavailable. The
 screen can also explicitly create and retain an Ed25519 device signing key in
 the system credential store. The direct-text trust screen creates a signed
 10-minute QR invitation containing the public key and optional listener
@@ -452,7 +455,7 @@ the Elixir HTTP/WebSocket diagnostics and manual refresh. On Linux, this uses
 Secret Service, so a desktop password vault must
 be installed and available in the user session.
 
-![Actual refreshed 1280 × 800 native Iced familiar screen from this transport milestone; Secret Service is unavailable in this capture](docs/design/runtime/native-vhs/01-familiar.png)
+![Native Iced familiar screen; the current capture predates custom PNG avatar support](docs/design/runtime/native-vhs/01-familiar.png)
 
 ![Native Iced direct chat with explicit listener and VPN address guidance, relay settings, and copy controls for sample LAN and VPN socket addresses; addresses are illustrative and Secret Service is unavailable.](docs/design/runtime/native-vhs/06-chat.png)
 
@@ -554,6 +557,8 @@ The camera/window picker captures could not be refreshed in this headless
 environment: Iced/winit requires `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, or
 `DISPLAY`. Run the matching capture command in a graphical session to render
 the current screen.
+The familiar-screen capture also predates custom PNG avatar support; refreshing
+it was attempted here but requires a Wayland or X11 session.
 The updated `04-connecting` screen was also not captured here because this
 environment has no graphical display; capture it with the command above from
 the local frontend repository in a Wayland or X11 session.

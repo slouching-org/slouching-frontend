@@ -559,24 +559,33 @@ fn familiar(state: &Slouching, l: Layout) -> Element<'_, Message> {
             .style(move |_, s| button_style(s, false, state.familiar == name)),
         );
     }
+    let has_custom_image = state.familiar_image_png.is_some();
+    let custom_art: Element<'_, Message> = if let Some(png) = &state.familiar_image_png {
+        image(image::Handle::from_bytes(png.clone()))
+            .width(l.px(104.0))
+            .height(l.px(104.0))
+            .content_fit(ContentFit::Cover)
+            .into()
+    } else {
+        container(l.icon("plus", MUTED, 34.0))
+            .width(l.px(104.0))
+            .height(l.px(104.0))
+            .center(Fill)
+            .into()
+    };
     familiars = familiars.push(
         button(
             container(
-                column![
-                    container(l.icon("plus", MUTED, 34.0))
-                        .width(l.px(104.0))
-                        .height(l.px(104.0))
-                        .center(Fill),
-                    l.label("Sua imagem", 12.0, PAPER)
-                ]
-                .spacing(l.px(8.0))
-                .align_x(iced::Center),
+                column![custom_art, l.label("Sua imagem", 12.0, PAPER)]
+                    .spacing(l.px(8.0))
+                    .align_x(iced::Center),
             )
             .center_x(Fill),
         )
         .width(Fill)
         .padding(l.px(12.0))
-        .style(|_, s| button_style(s, false, false)),
+        .on_press(Message::ChooseCustomFamiliar)
+        .style(move |_, s| button_style(s, has_custom_image, false)),
     );
     let progress = row![rule(GOLD, 3.0), rule(GOLD, 3.0), rule(LINE, 3.0)].spacing(l.px(6.0));
     let (profile_title, profile_detail) = match &state.profile_status {
@@ -910,11 +919,25 @@ fn settings(state: &Slouching, l: Layout) -> Element<'_, Message> {
             .spacing(l.px(18.0))
             .into()
         }
-        0 => l.panel(
-            column![
+        0 => {
+            let avatar: Element<'_, Message> = if let Some(png) = &state.familiar_image_png {
+                image(image::Handle::from_bytes(png.clone()))
+                    .width(l.px(100.0))
+                    .height(l.px(100.0))
+                    .content_fit(ContentFit::Cover)
+                    .into()
+            } else {
+                let art = match state.familiar {
+                    "Gnomo" => "gnome",
+                    "Vidente do Orbe" => "orb-avatar",
+                    _ => "frog",
+                };
+                l.picture(art, 100.0, 100.0)
+            };
+            l.panel(column![
                 l.title("Perfil & familiar", 34.0),
                 row![
-                    l.picture("frog", 100.0, 100.0),
+                    avatar,
                     column![
                         l.label(
                             if state.name.is_empty() {
@@ -942,8 +965,8 @@ fn settings(state: &Slouching, l: Layout) -> Element<'_, Message> {
                     true
                 )
             ]
-            .spacing(l.px(24.0)),
-        ),
+            .spacing(l.px(24.0)))
+        }
         2 => l.panel(
             column![
                 l.title("Rede & P2P", 34.0),
