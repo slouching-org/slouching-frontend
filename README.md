@@ -34,7 +34,9 @@ connection.
 The native client has an internal file-transfer crypto foundation: random
 per-file keys, authenticated 48 KiB chunks, a 100 MiB size bound, ciphertext
 digests, bounded streaming encryption/decryption, and a filename-only offer
-format. Encrypted blobs can be stored persistently and fetched over Iroh QUIC;
+format. The app has a private per-user encrypted blob-store location and a
+streaming ciphertext import that checks exact length and digest before adding
+a persistent reference. Encrypted blobs can be fetched over Iroh QUIC;
 the provider handler requires explicit peer authorization. The SQLCipher
 profile now stores and reloads each group-bound offer, content key, sender key,
 and ciphertext digest. Storage checks the author against the active MLS

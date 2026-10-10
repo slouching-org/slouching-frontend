@@ -18,7 +18,7 @@ use std::{
     path::Path,
     sync::{Arc, RwLock},
 };
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug)]
 pub struct StoredEncryptedFile {
@@ -37,9 +37,25 @@ impl StoredEncryptedFile {
 #[derive(Clone, Debug)]
 pub struct EncryptedBlobStore {
     store: FsStore,
+    root: std::path::PathBuf,
+}
+
+struct TemporaryCiphertextFile(std::path::PathBuf);
+
+impl Drop for TemporaryCiphertextFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 impl EncryptedBlobStore {
+    /// Open the per-user encrypted blob database used by the desktop app.
+    pub async fn open_default() -> Result<Self, String> {
+        let project = directories::ProjectDirs::from("org", "slouching", "Slouching")
+            .ok_or_else(|| "could not resolve the Slouching data directory".to_owned())?;
+        Self::open(project.data_dir().join("encrypted-blobs")).await
+    }
+
     pub async fn open(root: impl AsRef<Path>) -> Result<Self, String> {
         let root = root.as_ref();
         std::fs::create_dir_all(root)
@@ -53,7 +69,10 @@ impl EncryptedBlobStore {
         let store = FsStore::load_with_opts(root.join("blobs.db"), options)
             .await
             .map_err(|error| format!("could not open encrypted blob store: {error}"))?;
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            root: root.to_path_buf(),
+        })
     }
 
     pub fn protocol(
@@ -138,6 +157,100 @@ impl EncryptedBlobStore {
         })
     }
 
+    /// Persist a received ciphertext stream only if its exact bounded length
+    /// and content digest match the authenticated MLS attachment offer.
+    pub async fn import_ciphertext_stream<R>(
+        &self,
+        mut reader: R,
+        offer: &FileOffer,
+        expected_hash: [u8; 32],
+    ) -> Result<(), String>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        offer.encode()?;
+        let ciphertext_bytes = offer
+            .total_bytes
+            .checked_add(u64::from(offer.chunk_count).saturating_mul(16))
+            .ok_or_else(|| "encrypted attachment size overflowed".to_owned())?;
+        let transfer_id = offer.transfer_id;
+        let temp_path = self.root.join(format!(
+            "received-{}-{}.tmp",
+            std::process::id(),
+            getrandom::u64()
+                .map_err(|error| format!("could not name attachment staging file: {error}"))?
+        ));
+        let temporary = TemporaryCiphertextFile(temp_path);
+        let mut output = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary.0)
+            .await
+            .map_err(|error| {
+                format!("could not create restricted attachment staging file: {error}")
+            })?;
+        restrict_file_permissions(&temporary.0)?;
+        let mut digest = blake3::Hasher::new();
+        let mut remaining = ciphertext_bytes;
+        while remaining > 0 {
+            let count = remaining.min(64 * 1024) as usize;
+            let mut buffer = vec![0; count];
+            reader
+                .read_exact(&mut buffer)
+                .await
+                .map_err(|error| format!("encrypted attachment stream ended early: {error}"))?;
+            digest.update(&buffer);
+            output
+                .write_all(&buffer)
+                .await
+                .map_err(|error| format!("could not stage encrypted attachment: {error}"))?;
+            remaining -= count as u64;
+        }
+        let mut extra = [0; 1];
+        if reader
+            .read(&mut extra)
+            .await
+            .map_err(|error| format!("could not finish encrypted attachment stream: {error}"))?
+            != 0
+        {
+            return Err("encrypted attachment stream exceeded its declared size".to_owned());
+        }
+        if digest.finalize().as_bytes() != &expected_hash {
+            return Err("encrypted attachment digest does not match its MLS offer".to_owned());
+        }
+        output
+            .flush()
+            .await
+            .map_err(|error| format!("could not finish attachment staging file: {error}"))?;
+        drop(output);
+        let staged = tokio::fs::File::open(&temporary.0)
+            .await
+            .map_err(|error| format!("could not read verified attachment staging file: {error}"))?;
+        let staged = Arc::new(tokio::sync::Mutex::new(staged));
+        let stream = async_stream::try_stream! {
+            let mut remaining = ciphertext_bytes;
+            while remaining > 0 {
+                let count = remaining.min(64 * 1024) as usize;
+                let mut buffer = vec![0; count];
+                staged.lock().await.read_exact(&mut buffer).await?;
+                remaining -= count as u64;
+                yield Bytes::from(buffer);
+            }
+        };
+        let tag_name = format!("slouching:file:{}", hex::encode(transfer_id));
+        let blob = self
+            .store
+            .add_stream(stream)
+            .await
+            .with_named_tag(tag_name.as_bytes())
+            .await
+            .map_err(|error| format!("could not persist received encrypted attachment: {error}"))?;
+        if blob.hash.as_bytes() != &expected_hash {
+            return Err("persisted encrypted attachment hash changed unexpectedly".to_owned());
+        }
+        Ok(())
+    }
+
     pub async fn remove(&self, transfer_id: &[u8; 16]) -> Result<(), String> {
         let tag_name = format!("slouching:file:{}", hex::encode(transfer_id));
         self.store
@@ -176,6 +289,11 @@ impl EncryptedBlobStore {
 
     pub fn inner(&self) -> &Store {
         &self.store
+    }
+
+    /// Open a bounded reader for already verified encrypted blob bytes.
+    pub fn ciphertext_reader(&self, hash: [u8; 32]) -> iroh_blobs::api::blobs::BlobReader {
+        self.store.reader(Hash::from_bytes(hash))
     }
 }
 
@@ -234,8 +352,20 @@ fn restrict_directory_permissions(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("could not restrict blob-store directory permissions: {error}"))
 }
 
+#[cfg(unix)]
+fn restrict_file_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("could not restrict attachment staging file permissions: {error}"))
+}
+
 #[cfg(not(unix))]
 fn restrict_directory_permissions(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_file_permissions(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -291,6 +421,103 @@ mod tests {
                 .unwrap()
         );
         store.shutdown().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn received_ciphertext_is_persisted_only_after_length_and_digest_verification() {
+        let root = test_root("blob-receive");
+        let source_path = root.join("source.bin");
+        tokio::fs::write(&source_path, vec![0x5a; 8193])
+            .await
+            .unwrap();
+        let provider = EncryptedBlobStore::open(root.join("provider"))
+            .await
+            .unwrap();
+        let received = EncryptedBlobStore::open(root.join("received"))
+            .await
+            .unwrap();
+        let artifact = provider.import_file(&source_path).await.unwrap();
+        let ciphertext = provider
+            .read_ciphertext_for_test(artifact.ciphertext_hash)
+            .await
+            .unwrap();
+        let ciphertext_path = root.join("ciphertext.bin");
+        tokio::fs::write(&ciphertext_path, &ciphertext)
+            .await
+            .unwrap();
+        received
+            .import_ciphertext_stream(
+                tokio::fs::File::open(&ciphertext_path).await.unwrap(),
+                &artifact.offer,
+                artifact.ciphertext_hash,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            received
+                .read_ciphertext_for_test(artifact.ciphertext_hash)
+                .await
+                .unwrap(),
+            ciphertext
+        );
+
+        let bad_hash = [0xa5; 32];
+        let rejected_id = [0xb6; 16];
+        let mut rejected_offer = FileOffer::decode(&artifact.offer.encode().unwrap()).unwrap();
+        rejected_offer.transfer_id = rejected_id;
+        assert!(
+            received
+                .import_ciphertext_stream(
+                    tokio::fs::File::open(&ciphertext_path).await.unwrap(),
+                    &rejected_offer,
+                    bad_hash,
+                )
+                .await
+                .is_err()
+        );
+        assert!(!received.has_reference_for_test(&rejected_id).await.unwrap());
+
+        let short_id = [0xc7; 16];
+        let mut short_offer = FileOffer::decode(&artifact.offer.encode().unwrap()).unwrap();
+        short_offer.transfer_id = short_id;
+        tokio::fs::write(&ciphertext_path, &ciphertext[..ciphertext.len() - 1])
+            .await
+            .unwrap();
+        assert!(
+            received
+                .import_ciphertext_stream(
+                    tokio::fs::File::open(&ciphertext_path).await.unwrap(),
+                    &short_offer,
+                    artifact.ciphertext_hash,
+                )
+                .await
+                .is_err()
+        );
+        assert!(!received.has_reference_for_test(&short_id).await.unwrap());
+
+        let long_id = [0xd8; 16];
+        let mut long_offer = FileOffer::decode(&artifact.offer.encode().unwrap()).unwrap();
+        long_offer.transfer_id = long_id;
+        let mut oversized_ciphertext = ciphertext.to_vec();
+        oversized_ciphertext.push(0);
+        tokio::fs::write(&ciphertext_path, oversized_ciphertext)
+            .await
+            .unwrap();
+        assert!(
+            received
+                .import_ciphertext_stream(
+                    tokio::fs::File::open(&ciphertext_path).await.unwrap(),
+                    &long_offer,
+                    artifact.ciphertext_hash,
+                )
+                .await
+                .is_err()
+        );
+        assert!(!received.has_reference_for_test(&long_id).await.unwrap());
+
+        provider.shutdown().await.unwrap();
+        received.shutdown().await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
