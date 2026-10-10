@@ -57,7 +57,7 @@ fn assets() -> &'static Assets {
                 "orb-avatar" => "../assets/avatars/ava-orb.jpg", "mushroom" => "../assets/avatars/ava-gnome2.jpg",
             },
             icons: vector! { "settings", "chat", "headphones", "users", "mic", "camera", "refresh",
-                "plus", "key", "close", "check", "screen", "phone", "shield", "file", "pause",
+                "plus", "key", "close", "check", "screen", "window", "phone", "shield", "file", "pause",
                 "play", "attachment", "arrow", "mic-off", "camera-off" },
         }
     })
@@ -1195,7 +1195,7 @@ fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
             state.call_rtc_session.is_some()
         ),
         video_control,
-        l.icon_button("screen", Message::Navigate(Screen::Share)),
+        l.icon_button("screen", Message::OpenScreenShare),
         button(l.label("Leave", 14.0, PAPER))
             .on_press(if state.call_rtc_session.is_some() {
                 Message::EndCall
@@ -1460,11 +1460,7 @@ fn connecting(l: Layout) -> Element<'static, Message> {
 fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
     let tabs = row![
         l.nav("Telas", Message::ShareTab(0), state.share_tab == 0),
-        l.nav(
-            "Janelas · em breve",
-            Message::ShareTab(1),
-            state.share_tab == 1
-        ),
+        l.nav("Janelas", Message::ShareTab(1), state.share_tab == 1),
         l.nav("Câmera", Message::ShareTab(2), state.share_tab == 2)
     ]
     .spacing(l.px(8.0));
@@ -1500,6 +1496,38 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
             .style(move |_, s| button_style(s, false, selected)),
         );
     }
+    let mut windows = column![].spacing(l.px(8.0));
+    for source in &state.window_sources {
+        let id = source.id;
+        let selected = state.selected_window == Some(id);
+        windows = windows.push(
+            button(
+                row![
+                    l.label(
+                        format!("{} · {} × {}", source.name, source.width, source.height),
+                        13.0,
+                        PAPER
+                    ),
+                    space().width(Fill),
+                    l.label(
+                        if selected {
+                            "SELECIONADA"
+                        } else {
+                            "Selecionar"
+                        },
+                        10.0,
+                        if selected { GOLD } else { MUTED }
+                    )
+                ]
+                .align_y(iced::Alignment::Center)
+                .spacing(l.px(10.0)),
+            )
+            .width(Fill)
+            .padding(l.px(12.0))
+            .on_press(Message::SelectWindow(id))
+            .style(move |_, status| button_style(status, false, selected)),
+        );
+    }
     let mut cameras = column![].spacing(l.px(8.0));
     for source in &state.camera_sources {
         let id = source.id.clone();
@@ -1528,10 +1556,10 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
             .style(move |_, s| button_style(s, false, selected)),
         );
     }
-    let preview_handle = if state.share_tab == 2 {
-        state.camera_preview.clone()
-    } else {
-        state.screen_preview.clone()
+    let preview_handle = match state.share_tab {
+        1 => state.window_preview.clone(),
+        2 => state.camera_preview.clone(),
+        _ => state.screen_preview.clone(),
     };
     let preview: Element<'_, Message> = if let Some(handle) = preview_handle {
         image(handle)
@@ -1541,7 +1569,11 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
             .into()
     } else {
         container(l.label(
-            "A prévia da tela aparecerá aqui após sua captura.",
+            match state.share_tab {
+                1 => "A prévia da janela aparecerá aqui após sua captura.",
+                2 => "A prévia da câmera aparecerá aqui após sua captura.",
+                _ => "A prévia da tela aparecerá aqui após sua captura.",
+            },
             12.0,
             MUTED,
         ))
@@ -1558,6 +1590,17 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
         } else {
             sources.into()
         }
+    } else if state.share_tab == 1 {
+        if state.window_sources.is_empty() {
+            l.label(
+                "Nenhuma janela capturável foi encontrada. Confira o ambiente gráfico e as permissões.",
+                12.0,
+                MUTED,
+            )
+            .into()
+        } else {
+            windows.into()
+        }
     } else if state.share_tab == 2 {
         if state.camera_sources.is_empty() {
             l.label(
@@ -1570,12 +1613,7 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
             cameras.into()
         }
     } else {
-        l.label(
-            "Seleção e captura de janelas ainda não estão implementadas.",
-            12.0,
-            MUTED,
-        )
-        .into()
+        l.label("Fonte não reconhecida.", 12.0, MUTED).into()
     };
     let share_action = if state.screen_sharing_active {
         Some(Message::StopScreenShare)
@@ -1584,6 +1622,11 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
         && state.selected_source.is_some()
     {
         Some(Message::StartScreenShare)
+    } else if state.call_rtc_session.is_some()
+        && state.share_tab == 1
+        && state.selected_window.is_some()
+    {
+        Some(Message::StartWindowShare)
     } else if state.call_rtc_session.is_some()
         && state.share_tab == 2
         && state.selected_camera.is_some()
@@ -1597,8 +1640,35 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
         "Parar compartilhamento"
     } else if state.share_tab == 2 {
         "Compartilhar câmera na chamada"
+    } else if state.share_tab == 1 {
+        "Compartilhar janela na chamada"
     } else {
         "Compartilhar tela na chamada"
+    };
+    let (refresh_label, refresh_message) = match state.share_tab {
+        1 => ("Atualizar janelas", Message::RefreshWindows),
+        2 => ("Atualizar câmeras", Message::RefreshCameras),
+        _ => ("Atualizar telas", Message::RefreshScreens),
+    };
+    let (preview_icon, preview_label, preview_message, preview_disabled) = match state.share_tab {
+        1 => (
+            "window",
+            "Capturar prévia local",
+            state.selected_window.map(Message::CaptureWindow),
+            state.selected_window.is_none(),
+        ),
+        2 => (
+            "camera",
+            "Capturar prévia local",
+            state.selected_camera.clone().map(Message::CaptureCamera),
+            state.selected_camera.is_none(),
+        ),
+        _ => (
+            "screen",
+            "Capturar prévia",
+            state.selected_source.map(Message::CaptureScreen),
+            state.selected_source.is_none(),
+        ),
     };
     let body = column![
         l.title("O que você quer mostrar à roda?", 36.0),
@@ -1623,37 +1693,12 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
                     }
                 ),
                 row![
+                    l.control("refresh", refresh_label, Some(refresh_message), false),
                     l.control(
-                        "refresh",
-                        if state.share_tab == 2 {
-                            "Atualizar câmeras"
-                        } else {
-                            "Atualizar telas"
-                        },
-                        Some(Message::RefreshScreens),
-                        false
-                    ),
-                    l.control(
-                        if state.share_tab == 2 {
-                            "camera"
-                        } else {
-                            "screen"
-                        },
-                        if state.share_tab == 2 {
-                            "Capturar prévia local"
-                        } else {
-                            "Capturar prévia"
-                        },
-                        if state.share_tab == 2 {
-                            state.selected_camera.clone().map(Message::CaptureCamera)
-                        } else {
-                            state.selected_source.map(Message::CaptureScreen)
-                        },
-                        if state.share_tab == 2 {
-                            state.selected_camera.is_none()
-                        } else {
-                            state.selected_source.is_none() || state.share_tab != 0
-                        }
+                        preview_icon,
+                        preview_label,
+                        preview_message,
+                        preview_disabled
                     )
                 ]
                 .spacing(l.px(10.0))
@@ -1664,6 +1709,8 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 l.label(
                     if state.share_tab == 2 {
                         "PRÉVIA DA CÂMERA"
+                    } else if state.share_tab == 1 {
+                        "PRÉVIA DA JANELA"
                     } else {
                         "PRÉVIA DA TELA"
                     },

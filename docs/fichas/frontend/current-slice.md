@@ -134,15 +134,19 @@ tests cover codec replay rejection, bounded fragmentation, protected frame
 delivery, remote decoding, and stop signaling. Physical-device capture,
 permissions, and VPN delivery still need validation. The camera tab enumerates
 native devices and supports an explicit local preview or in-call H.264/SFrame
-stream over the same video channel; only one source can be active. A two-frame
+stream over the same video channel; only one source can be active. The window
+tab enumerates visible windows and supports explicit local preview or in-call
+H.264/SFrame sharing through that channel. Linux window enumeration uses
+X11/Xorg; pure Wayland enumeration is not supported by the current capture
+library. A two-frame
 queue and 1920 × 1080 capture bound limit camera buffering. Device enumeration
 works on this host, but opening a camera and remote playback still need physical
 validation. The call's room chat sends
 SFrame-protected text over the reliable DataChannel. Its 4 KiB message limit
 and 100-entry UI cap are enforced, and the transcript stays in memory only; it
 is cleared when the call ends. Local loopback verifies messages in both
-directions. Window capture remains unavailable. Contact discovery,
-automatic pairing, and guaranteed offline delivery are also not implemented.
+directions. Contact discovery, automatic pairing, and guaranteed offline
+delivery are also not implemented.
 The older web UI under
 `prototypes/web/` is a design benchmark, not the product runtime.
 

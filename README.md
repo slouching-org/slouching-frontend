@@ -92,9 +92,20 @@ cargo run -- --list-cameras
 
 Capture currently targets Linux V4L2, Windows Media Foundation, and macOS
 AVFoundation. Frames are bounded to 1920 × 1080 at capture and scaled for the
-protected call-video limit. Window capture, system-audio capture, noise
-suppression, echo cancellation, push-to-talk, and an SFU remain unimplemented.
-Camera permission and cross-machine video still need runtime validation.
+protected call-video limit. System-audio capture, noise suppression, echo
+cancellation, push-to-talk, and an SFU remain unimplemented. Camera permission
+and cross-machine video still need runtime validation.
+
+The **Janelas** tab in **Escolher tela** lists visible, non-minimized windows.
+Select a window and use **Capturar prévia local** to check what the OS capture
+API returns. During a call, **Compartilhar janela na chamada** sends its H.264
+frames over the same bounded, SFrame-protected video channel. If a window is
+closed or its capture permission is revoked, the picker reports the failure;
+**Parar compartilhamento** stops the stream. Source names and dimensions come
+from the OS at enumeration time, and a refresh updates the list.
+On Linux, window enumeration uses the X11/Xorg backend; the current capture
+library does not enumerate windows in a pure Wayland session. The picker is
+available through XWayland when the app has a working X11 display connection.
 
 ## Direct peer messages
 
@@ -499,6 +510,7 @@ SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-capture
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-invite-imported
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 10-call --capture-call-negotiation
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 05-share --capture-share-camera
+SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 05-share --capture-share-window
 ```
 
 The capture command renders all twelve screens, saves screenshots through
@@ -526,11 +538,13 @@ after QR import; all values are fixtures.
 `--capture-call-negotiation` shows call controls with sample identity, peer, and
 group values; they do not represent a live MLS group or WebRTC session.
 `--capture-share-camera` shows the camera tab with real enumerated device names;
-it does not open a camera or display a live image.
-The protected-audio update could not refresh `10-call.png` in this headless
+it does not open a camera or display a live image. `--capture-share-window`
+shows windows enumerated from the current desktop session; it does not capture
+or transmit a window.
+The camera/window picker captures could not be refreshed in this headless
 environment: Iced/winit requires `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, or
-`DISPLAY`. Run the capture command in a graphical session to render the current
-screen.
+`DISPLAY`. Run the matching capture command in a graphical session to render
+the current screen.
 
 Assets and font license/provenance notes are in [assets/README.md](assets/README.md).
 

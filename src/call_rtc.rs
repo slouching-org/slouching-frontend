@@ -153,7 +153,7 @@ impl CallRtcSession {
         let (call_chat_messages, _) = tokio::sync::broadcast::channel(128);
         let (remote_screen_frame, _) = watch::channel(None);
         let (screen_share_status, _) =
-            watch::channel("Compartilhamento de tela parado.".to_owned());
+            watch::channel("Compartilhamento de vídeo parado.".to_owned());
         let (audio_status, _) = watch::channel("Áudio ainda não conectado.".to_owned());
         let handler = Arc::new(CallEvents {
             gathering_complete: gathering_tx,
@@ -453,11 +453,31 @@ impl CallRtcSession {
             .map_err(|error| format!("could not send protected call message: {error}"))
     }
 
-    pub fn is_screen_sharing(&self) -> bool {
+    pub fn is_video_sharing(&self) -> bool {
         self.screen_share_active.load(Ordering::Acquire)
     }
 
     pub async fn start_screen_sharing(self: &Arc<Self>, monitor_id: u32) -> Result<(), String> {
+        self.start_desktop_video_sharing(
+            crate::screen_capture::VideoSource::Monitor(monitor_id),
+            "tela",
+        )
+        .await
+    }
+
+    pub async fn start_window_sharing(self: &Arc<Self>, window_id: u32) -> Result<(), String> {
+        self.start_desktop_video_sharing(
+            crate::screen_capture::VideoSource::Window(window_id),
+            "janela",
+        )
+        .await
+    }
+
+    async fn start_desktop_video_sharing(
+        self: &Arc<Self>,
+        source: crate::screen_capture::VideoSource,
+        source_name: &'static str,
+    ) -> Result<(), String> {
         if self.screen_video_encoder.lock().await.is_none() {
             return Err("esta chamada não tem um codec de vídeo associado ao grupo MLS".to_owned());
         }
@@ -473,36 +493,41 @@ impl CallRtcSession {
             .map_err(|error| error.to_string())?
             != RTCDataChannelState::Open
         {
-            return Err("aguarde a conexão WebRTC antes de compartilhar a tela".to_owned());
+            return Err(format!(
+                "aguarde WebRTC antes de compartilhar {source_name}"
+            ));
         }
         if self.screen_share_active.swap(true, Ordering::AcqRel) {
-            return Err("a tela já está sendo compartilhada nesta chamada".to_owned());
+            return Err("já existe um compartilhamento de vídeo nesta chamada".to_owned());
         }
-        self.screen_share_status.send_replace(
-            "Capturando tela local a 5 quadros por segundo; vídeo protegido por SFrame.".to_owned(),
-        );
+        self.screen_share_status.send_replace(format!(
+            "Capturando {source_name} local a 5 quadros por segundo; vídeo protegido por SFrame."
+        ));
         let session = Arc::clone(self);
         let task = tokio::spawn(async move {
             let mut frame_id = 0_u32;
             let mut interval = tokio::time::interval(Duration::from_millis(200));
             loop {
                 interval.tick().await;
-                let captured =
-                    tokio::task::spawn_blocking(move || crate::screen_capture::capture(monitor_id))
-                        .await;
+                let captured = tokio::task::spawn_blocking(move || {
+                    crate::screen_capture::capture_video_source(source)
+                })
+                .await;
                 let captured = match captured {
                     Ok(Ok(frame)) => frame,
                     Ok(Err(error)) => {
                         session
                             .screen_share_status
-                            .send_replace(format!("Captura de tela falhou: {error}"));
-                        continue;
+                            .send_replace(format!("Captura de {source_name} falhou: {error}"));
+                        session.send_video_stop_signal().await;
+                        break;
                     }
                     Err(error) => {
                         session
                             .screen_share_status
                             .send_replace(format!("Tarefa de captura falhou: {error}"));
-                        continue;
+                        session.send_video_stop_signal().await;
+                        break;
                     }
                 };
                 let protected = {
@@ -522,12 +547,12 @@ impl CallRtcSession {
                     }
                 };
                 match session
-                    .send_protected_screen_frame(frame_id, &protected)
+                    .send_protected_video_frame(frame_id, &protected)
                     .await
                 {
                     Ok(()) => {
                         session.screen_share_status.send_replace(format!(
-                            "Tela compartilhada · quadro {frame_id} · H.264/SFrame."
+                            "{source_name} compartilhada · quadro {frame_id} · H.264/SFrame."
                         ));
                         frame_id = frame_id.wrapping_add(1);
                     }
@@ -621,7 +646,7 @@ impl CallRtcSession {
                     }
                 };
                 match session
-                    .send_protected_screen_frame(frame_id, &protected)
+                    .send_protected_video_frame(frame_id, &protected)
                     .await
                 {
                     Ok(()) => {
@@ -650,13 +675,20 @@ impl CallRtcSession {
         Ok(())
     }
 
-    pub async fn stop_screen_sharing(&self) {
+    pub async fn stop_video_sharing(&self) {
         self.camera_capture_stop.store(true, Ordering::Release);
         if let Ok(mut task) = self.screen_share_task.lock()
             && let Some(task) = task.take()
         {
             task.abort();
         }
+        self.send_video_stop_signal().await;
+        self.screen_share_active.store(false, Ordering::Release);
+        self.screen_share_status
+            .send_replace("Compartilhamento de vídeo parado.".to_owned());
+    }
+
+    async fn send_video_stop_signal(&self) {
         if let Some(channel) = self.screen_data_channel.lock().await.clone()
             && channel
                 .ready_state()
@@ -671,14 +703,11 @@ impl CallRtcSession {
             )
             .await;
         }
-        self.screen_share_active.store(false, Ordering::Release);
-        self.screen_share_status
-            .send_replace("Compartilhamento de tela parado.".to_owned());
     }
 
     /// Send one already SFrame-protected H.264 access unit over the bounded
-    /// screen-sharing data channel.
-    pub async fn send_protected_screen_frame(
+    /// bounded call-video data channel.
+    pub async fn send_protected_video_frame(
         &self,
         frame_id: u32,
         protected_frame: &[u8],
@@ -688,13 +717,13 @@ impl CallRtcSession {
             .lock()
             .await
             .clone()
-            .ok_or_else(|| "screen-sharing channel is not available on this call".to_owned())?;
+            .ok_or_else(|| "video channel is not available on this call".to_owned())?;
         let state = channel
             .ready_state()
             .await
-            .map_err(|error| format!("could not read screen-sharing channel state: {error}"))?;
+            .map_err(|error| format!("could not read video channel state: {error}"))?;
         if state != RTCDataChannelState::Open {
-            return Err(format!("screen-sharing channel is not open: {state:?}"));
+            return Err(format!("video channel is not open: {state:?}"));
         }
         let fragments = crate::video_transport::fragment_frame(frame_id, protected_frame)?;
         for fragment in fragments {
@@ -888,7 +917,7 @@ impl CallRtcSession {
     }
 
     pub async fn close(&self) -> Result<(), String> {
-        self.stop_screen_sharing().await;
+        self.stop_video_sharing().await;
         if let Ok(mut tasks) = self.audio_tasks.lock() {
             for task in tasks.drain(..) {
                 task.abort();
@@ -1146,7 +1175,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                match caller.send_protected_screen_frame(7, &frame).await {
+                match caller.send_protected_video_frame(7, &frame).await {
                     Ok(()) => break,
                     Err(error) if error.contains("not open") || error.contains("not available") => {
                         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1172,7 +1201,7 @@ mod tests {
         )));
         remote_video.changed().await.unwrap();
         assert!(remote_video.borrow().is_some());
-        caller.stop_screen_sharing().await;
+        caller.stop_video_sharing().await;
         tokio::time::timeout(Duration::from_secs(5), remote_video.changed())
             .await
             .expect("stop-sharing signal should reach the remote peer")
@@ -1210,7 +1239,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                match caller.send_protected_screen_frame(1, &protected).await {
+                match caller.send_protected_video_frame(1, &protected).await {
                     Ok(()) => break,
                     Err(error) if error.contains("not open") || error.contains("not available") => {
                         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1246,7 +1275,7 @@ mod tests {
             .unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                match callee.send_protected_screen_frame(2, &reverse_frame).await {
+                match callee.send_protected_video_frame(2, &reverse_frame).await {
                     Ok(()) => break,
                     Err(error) if error.contains("not open") || error.contains("not available") => {
                         tokio::time::sleep(Duration::from_millis(10)).await;
