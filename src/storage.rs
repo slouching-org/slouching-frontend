@@ -316,6 +316,27 @@ pub struct StoredMlsGroup {
     pub purpose: MlsGroupPurpose,
 }
 
+pub(crate) struct CallMediaMemberIndex {
+    pub device_public_key: [u8; 32],
+    pub index: u64,
+}
+
+pub(crate) struct CallMediaContext {
+    pub epoch: u64,
+    pub local_member_index: u64,
+    pub members: Vec<CallMediaMemberIndex>,
+    pub base_key: Zeroizing<Vec<u8>>,
+}
+
+impl CallMediaContext {
+    pub fn member_index(&self, device_public_key: &[u8; 32]) -> Option<u64> {
+        self.members
+            .iter()
+            .find(|member| &member.device_public_key == device_public_key)
+            .map(|member| member.index)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct StoredFileAttachment {
     pub group_id: [u8; 16],
@@ -3933,10 +3954,23 @@ pub fn export_call_media_base_key(group_id: &[u8]) -> Result<(u64, Zeroizing<Vec
     export_call_media_base_key_in(&mut connection, group_id)
 }
 
+pub(crate) fn load_call_media_context(group_id: &[u8]) -> Result<CallMediaContext, String> {
+    let mut connection = open_local_database()?;
+    load_call_media_context_in(&mut connection, group_id)
+}
+
 fn export_call_media_base_key_in(
     connection: &mut Connection,
     group_id: &[u8],
 ) -> Result<(u64, Zeroizing<Vec<u8>>), String> {
+    let context = load_call_media_context_in(connection, group_id)?;
+    Ok((context.epoch, context.base_key))
+}
+
+fn load_call_media_context_in(
+    connection: &mut Connection,
+    group_id: &[u8],
+) -> Result<CallMediaContext, String> {
     if group_id.len() != 16 {
         return Err("MLS group ID must contain 16 bytes".to_owned());
     }
@@ -3963,10 +3997,52 @@ fn export_call_media_base_key_in(
     {
         return Err("call MLS index does not match its authenticated state".to_owned());
     }
+    let mut members = Vec::new();
+    for member in group.members() {
+        let binding = MlsSigningKeyBinding::from_bytes(member.credential.serialized_content())
+            .ok_or_else(|| "MLS member has no device identity binding".to_owned())?;
+        if !binding.verifies_mls_credential(
+            &binding.device_public_key,
+            group.ciphersuite().signature_algorithm() as u16,
+            member.signature_key.as_slice(),
+        ) {
+            return Err("MLS member has an invalid device binding".to_owned());
+        }
+        if members.iter().any(|existing: &CallMediaMemberIndex| {
+            existing.device_public_key == binding.device_public_key
+        }) {
+            return Err("call MLS group contains duplicate device identities".to_owned());
+        }
+        let index = u64::from(member.index.u32());
+        if index > 255 {
+            return Err("call MLS group exceeds the SFrame member index limit".to_owned());
+        }
+        members.push(CallMediaMemberIndex {
+            device_public_key: binding.device_public_key,
+            index,
+        });
+    }
+    let own_index = u64::from(group.own_leaf_index().u32());
+    let own_binding = group
+        .own_leaf()
+        .and_then(|leaf| MlsSigningKeyBinding::from_bytes(leaf.credential().serialized_content()))
+        .ok_or_else(|| "local MLS member has no device identity binding".to_owned())?;
+    if members
+        .iter()
+        .find(|member| member.index == own_index)
+        .is_none_or(|member| member.device_public_key != own_binding.device_public_key)
+    {
+        return Err("local MLS member index does not match its device identity".to_owned());
+    }
     let key = group
         .export_secret(provider.crypto(), "SFrame 1.0 Base Key", b"", 16)
         .map_err(|error| format!("could not export call media base key: {error:?}"))?;
-    Ok((group.epoch().as_u64(), Zeroizing::new(key)))
+    Ok(CallMediaContext {
+        epoch: group.epoch().as_u64(),
+        local_member_index: own_index,
+        members,
+        base_key: Zeroizing::new(key),
+    })
 }
 
 /// Admit one device-bound KeyPackage to a local MLS group. The local creator
@@ -6397,11 +6473,47 @@ mod tests {
         )
         .expect("invitee should persist the call group purpose with its Welcome receipt");
         assert_eq!(joined.purpose, MlsGroupPurpose::Call);
-        let (_, sender_key) = export_call_media_base_key_in(&mut creator, &group.group_id)
-            .expect("creator should export the call media base key");
-        let (_, receiver_key) = export_call_media_base_key_in(&mut invitee, &group.group_id)
-            .expect("invitee should export the same call media base key");
-        assert_eq!(sender_key.as_slice(), receiver_key.as_slice());
+        let creator_context = load_call_media_context_in(&mut creator, &group.group_id)
+            .expect("creator should load its authenticated media context");
+        let invitee_context = load_call_media_context_in(&mut invitee, &group.group_id)
+            .expect("invitee should load its authenticated media context");
+        let creator_device = creator_identity.verifying_key().to_bytes();
+        let invitee_device = invitee_identity.verifying_key().to_bytes();
+        assert_eq!(creator_context.epoch, 1);
+        assert_eq!(invitee_context.epoch, 1);
+        assert_eq!(creator_context.local_member_index, 0);
+        assert_eq!(invitee_context.local_member_index, 1);
+        assert_eq!(creator_context.member_index(&creator_device), Some(0));
+        assert_eq!(creator_context.member_index(&invitee_device), Some(1));
+        assert_eq!(invitee_context.member_index(&creator_device), Some(0));
+        assert_eq!(invitee_context.member_index(&invitee_device), Some(1));
+        assert_eq!(creator_context.base_key, invitee_context.base_key);
+
+        let mut sender = crate::media::MediaFrameSender::new(
+            creator_context.epoch,
+            creator_context.local_member_index,
+            creator_context.base_key.as_slice(),
+        )
+        .expect("creator SFrame sender should use its MLS member index");
+        let creator_index_on_invitee = invitee_context
+            .member_index(&creator_device)
+            .expect("recipient should resolve the sender's current MLS member index");
+        let mut receiver = crate::media::MediaFrameReceiver::new(
+            invitee_context.epoch,
+            creator_index_on_invitee,
+            invitee_context.base_key.as_slice(),
+        )
+        .expect("invitee SFrame receiver should use sender's MLS member index");
+        let encoded_audio_frame = b"encoded opus frame";
+        let encrypted_frame = sender
+            .encrypt(encoded_audio_frame)
+            .expect("SFrame should encrypt the media frame");
+        assert_eq!(
+            receiver
+                .decrypt(&encrypted_frame)
+                .expect("the group member should decrypt the frame"),
+            encoded_audio_frame
+        );
         assert!(
             join_mls_group_from_welcome_with_purpose_in(
                 &mut invitee,

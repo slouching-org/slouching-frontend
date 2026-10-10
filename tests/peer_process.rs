@@ -5,6 +5,9 @@ mod file_transfer;
 #[path = "../src/identity.rs"]
 mod identity;
 #[allow(dead_code)]
+#[path = "../src/media.rs"]
+mod media;
+#[allow(dead_code)]
 #[path = "../src/peer.rs"]
 mod peer;
 #[allow(dead_code)]

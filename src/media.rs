@@ -1,9 +1,9 @@
 //! SFrame protection for encoded call-media frames.
 //!
-//! The caller must supply key material exported from the call's MLS group. Do
-//! not use conversation-group secrets or device identity keys here. Networking,
-//! capture, playback, and MLS call-group management are wired in later slices.
+//! The authenticated MLS group supplies the local sender index and each remote
+//! member index. Networking, capture, and playback remain outside this module.
 
+use crate::storage::load_call_media_context;
 use sframe::{
     CipherSuite,
     frame::validation::{ReplayAttackProtection, Tolerance},
@@ -43,7 +43,21 @@ pub struct MediaFrameSender {
 }
 
 impl MediaFrameSender {
-    pub fn new(epoch: u64, member_index: u64, mls_exported_key: &[u8]) -> Result<Self, String> {
+    /// Create a sender bound to this device's authenticated leaf in a call group.
+    pub fn from_call_group(group_id: &[u8]) -> Result<Self, String> {
+        let context = load_call_media_context(group_id)?;
+        Self::new(
+            context.epoch,
+            context.local_member_index,
+            context.base_key.as_slice(),
+        )
+    }
+
+    pub(crate) fn new(
+        epoch: u64,
+        member_index: u64,
+        mls_exported_key: &[u8],
+    ) -> Result<Self, String> {
         validate_exporter_key(mls_exported_key)?;
         Self::with_context_id(epoch, member_index, random_context_id()?, mls_exported_key)
     }
@@ -96,7 +110,23 @@ pub struct MediaFrameReceiver {
 }
 
 impl MediaFrameReceiver {
-    pub fn new(epoch: u64, member_index: u64, mls_exported_key: &[u8]) -> Result<Self, String> {
+    /// Create a receiver pinned to a current authenticated MLS group member.
+    pub fn for_call_group_member(
+        group_id: &[u8],
+        sender_device_public_key: &[u8; 32],
+    ) -> Result<Self, String> {
+        let context = load_call_media_context(group_id)?;
+        let member_index = context
+            .member_index(sender_device_public_key)
+            .ok_or_else(|| "SFrame sender is not a member of this call MLS group".to_owned())?;
+        Self::new(context.epoch, member_index, context.base_key.as_slice())
+    }
+
+    pub(crate) fn new(
+        epoch: u64,
+        member_index: u64,
+        mls_exported_key: &[u8],
+    ) -> Result<Self, String> {
         validate_exporter_key(mls_exported_key)?;
         Ok(Self {
             epoch,

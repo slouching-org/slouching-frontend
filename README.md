@@ -334,10 +334,13 @@ epoch-bound key IDs, a fresh random session context, bounded frames, and replay
 rejection. It requires key material supplied by a call MLS exporter, which is
 now available from a separately typed call MLS group. The call purpose is
 persisted in SQLCipher and carried by the authenticated Welcome; conversation
-groups cannot export media keys. This is a key-management foundation only: the
-call screen can create a dedicated group, copy its ID, and open the existing MLS
-invitation flow. It still does not start a call: no call uses SFrame, WebRTC, or
-audio capture. Device choices are not persisted or used by calls yet.
+groups cannot export media keys. The SFrame sender takes its local leaf index
+from the authenticated call group; a receiver resolves the sender device key
+to that group's current leaf index. A two-device Welcome test checks distinct
+member indexes and encrypts/decrypts a frame with the shared MLS exporter. This
+still does not start a call: no UI path sends SFrame frames, and WebRTC, live
+audio capture/playback, and video remain disconnected. Device choices are not
+persisted or used by calls yet.
 Camera and screen capture are also inactive. **Rede & P2P** in Settings retains
 the Elixir HTTP/WebSocket diagnostics and manual refresh. On Linux, this uses
 Secret Service, so a desktop password vault must
