@@ -346,9 +346,10 @@ test suite negotiates two local WebRTC peers, sends an Opus/SFrame frame over
 RTP, and verifies decoded samples reach the remote sink. This validates the
 local media path, not audio-device behavior between physical computers. Calls
 require both devices to be members of the same dedicated call MLS group, and
-each must select a microphone and output in Settings. Camera and screen
-capture, mute controls, noise suppression, echo cancellation, and push-to-talk
-are still inactive. **Rede & P2P** in Settings retains
+each must select a microphone and output in Settings. The call screen's
+microphone control silences outgoing frames locally. Camera and screen capture,
+noise suppression, echo cancellation, and push-to-talk are still inactive.
+**Rede & P2P** in Settings retains
 the Elixir HTTP/WebSocket diagnostics and manual refresh. On Linux, this uses
 Secret Service, so a desktop password vault must
 be installed and available in the user session.

@@ -300,6 +300,7 @@ struct Slouching {
     mls_commit_recipients: Vec<storage::MlsCommitRecipientStatus>,
     call_group_id: String,
     call_group_status: String,
+    call_mic_muted: bool,
     call_group_creating: bool,
     call_rtc_session: Option<std::sync::Arc<call_rtc::CallRtcSession>>,
     call_rtc_generation: u64,
@@ -485,6 +486,7 @@ impl Default for Slouching {
             mls_commit_recipients: Vec::new(),
             call_group_id: String::new(),
             call_group_status: "Crie um grupo MLS isolado para preparar uma chamada.".to_owned(),
+            call_mic_muted: false,
             call_group_creating: false,
             call_rtc_session: None,
             call_rtc_generation: 0,
@@ -652,6 +654,7 @@ enum Message {
     CallMlsGroupCreated(Result<storage::CreatedMlsGroup, String>),
     OpenCallMlsGroup,
     StartCall,
+    ToggleCallMic,
     EndCall,
     CallOfferCreated(Result<CallOfferReady, String>),
     CallSignalProcessed(
@@ -970,7 +973,21 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 Message::CallOfferCreated,
             );
         }
+        Message::ToggleCallMic => {
+            let Some(session) = state.call_rtc_session.as_ref() else {
+                state.call_group_status = "Conecte a chamada antes de alterar o microfone.".into();
+                return Task::none();
+            };
+            state.call_mic_muted = !state.call_mic_muted;
+            session.set_microphone_muted(state.call_mic_muted);
+            state.call_group_status = if state.call_mic_muted {
+                "Microfone silenciado; sua captura não é enviada ao peer.".into()
+            } else {
+                "Microfone ativo; áudio protegido enviado ao peer.".into()
+            };
+        }
         Message::EndCall => {
+            state.call_mic_muted = false;
             if let Some(session) = state.call_rtc_session.take() {
                 let commands = state.peer_session_commands.clone();
                 let group_id = hex_decode_bytes(&state.call_group_id)
@@ -1035,6 +1052,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 let request_id = state.peer_next_request_id;
                 state.peer_next_request_id = state.peer_next_request_id.saturating_add(1);
                 state.call_rtc_session = Some(ready.rtc.clone());
+                state.call_mic_muted = false;
                 state.call_rtc_generation = state.call_rtc_generation.saturating_add(1);
                 let generation = state.call_rtc_generation;
                 let rtc = ready.rtc.clone();
@@ -1090,6 +1108,9 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 }
                 if let Some(session) = session {
                     state.call_rtc_session = Some(session.clone());
+                    if signal.kind == peer::CallSignalKind::Offer {
+                        state.call_mic_muted = false;
+                    }
                     state.call_rtc_generation = generation;
                     state.call_group_status = match signal.kind {
                         peer::CallSignalKind::Offer => "Resposta WebRTC enviada pelo canal QUIC pinado; ICE/DTLS conectando com Opus/SFrame.".into(),
@@ -1173,10 +1194,8 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             if let Some(device_name) = device_name {
                 stop_audio_monitor(state);
                 state.audio_input_selected = Some(name);
-                state.audio_devices_status = format!(
-                    "Microfone selecionado: {} · seleção local ainda não usada em chamadas.",
-                    device_name
-                );
+                state.audio_devices_status =
+                    format!("Microfone selecionado para chamadas: {}.", device_name);
             }
         }
         Message::AudioOutputSelected(name) => {
@@ -1187,10 +1206,8 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 .map(|device| device.name.clone());
             if let Some(device_name) = device_name {
                 state.audio_output_selected = Some(name);
-                state.audio_devices_status = format!(
-                    "Saída selecionada: {} · seleção local ainda não usada em chamadas.",
-                    device_name
-                );
+                state.audio_devices_status =
+                    format!("Saída de chamadas selecionada: {}.", device_name);
             }
         }
         Message::StartAudioMonitor => {

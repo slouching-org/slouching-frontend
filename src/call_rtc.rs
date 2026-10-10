@@ -68,11 +68,15 @@ struct CallAudioState {
     track: Arc<TrackLocalStaticSample>,
     ssrc: u32,
     input_device_id: String,
+    microphone_muted: AtomicBool,
     sink: Arc<dyn crate::call_audio::AudioSink>,
 }
 
 impl CallAudioState {
     async fn send_audio_frame(&self, pcm: &[f32]) -> Result<(), String> {
+        if self.microphone_muted.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let protected = self
             .encoder
             .lock()
@@ -218,6 +222,7 @@ impl CallRtcSession {
             track,
             ssrc,
             input_device_id,
+            microphone_muted: AtomicBool::new(false),
             sink,
         }));
         session.start_audio_receiver();
@@ -313,6 +318,17 @@ impl CallRtcSession {
         self.audio_status.subscribe()
     }
 
+    pub fn set_microphone_muted(&self, muted: bool) {
+        if let Some(audio) = self.audio.as_ref() {
+            audio.microphone_muted.store(muted, Ordering::Release);
+            self.audio_status.send_replace(if muted {
+                "Microfone silenciado localmente.".to_owned()
+            } else {
+                "Microfone ativo · Opus/SFrame · enviando áudio protegido.".to_owned()
+            });
+        }
+    }
+
     /// Open the selected microphone once the peer connection is established.
     pub async fn start_microphone(&self) -> Result<(), String> {
         let Some(audio) = self.audio.as_ref().cloned() else {
@@ -384,7 +400,11 @@ impl CallRtcSession {
             tasks.push(capture_task);
         }
         self.audio_status
-            .send_replace("Microfone ativo · Opus/SFrame · enviando áudio protegido.".to_owned());
+            .send_replace(if audio.microphone_muted.load(Ordering::Acquire) {
+                "Microfone silenciado localmente; captura não enviada.".to_owned()
+            } else {
+                "Microfone ativo · Opus/SFrame · enviando áudio protegido.".to_owned()
+            });
         Ok(())
     }
 
@@ -584,6 +604,20 @@ mod tests {
                     * 0.2
             })
             .collect::<Vec<_>>();
+        caller.set_microphone_muted(true);
+        caller
+            .audio
+            .as_ref()
+            .unwrap()
+            .send_audio_frame(&frame)
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), callee_sink_rx.recv())
+                .await
+                .is_err()
+        );
+        caller.set_microphone_muted(false);
         caller
             .audio
             .as_ref()

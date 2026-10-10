@@ -1105,9 +1105,22 @@ fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
     ]
     .spacing(l.px(12.0));
     let controls = row![
-        l.icon_button(
-            "mic-off",
-            Message::PreviewAction("Captura de microfone ainda não implementada.")
+        l.control(
+            if state.call_mic_muted {
+                "mic-off"
+            } else {
+                "mic"
+            },
+            if state.call_mic_muted {
+                "Ativar microfone"
+            } else {
+                "Silenciar microfone"
+            },
+            state
+                .call_rtc_session
+                .is_some()
+                .then_some(Message::ToggleCallMic),
+            state.call_rtc_session.is_some()
         ),
         l.icon_button(
             "camera-off",
@@ -1115,7 +1128,11 @@ fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
         ),
         l.icon_button("screen", Message::Navigate(Screen::Share)),
         button(l.label("Leave", 14.0, PAPER))
-            .on_press(Message::Navigate(Screen::Home))
+            .on_press(if state.call_rtc_session.is_some() {
+                Message::EndCall
+            } else {
+                Message::Navigate(Screen::Home)
+            })
             .padding([l.px(14.0), l.px(30.0)])
             .style(|_, _| button::Style {
                 background: Some(RED.into()),
