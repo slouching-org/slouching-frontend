@@ -3292,10 +3292,10 @@ fn verification(state: &Slouching, l: Layout) -> Element<'_, Message> {
         (&state.identity_status, peer_id),
         (crate::IdentityStatus::Ready(local), Some(peer)) if peer.as_bytes() == local
     );
-    let safety_code = match (&state.identity_status, peer_id) {
-        (crate::IdentityStatus::Ready(local), Some(peer)) if peer.as_bytes() != local => {
-            Some(crate::verification_code::derive(local, peer.as_bytes()))
-        }
+    let safety_fingerprint = match (&state.identity_status, peer_id) {
+        (crate::IdentityStatus::Ready(local), Some(peer)) if peer.as_bytes() != local => Some(
+            crate::verification_fingerprint::derive(local, peer.as_bytes()),
+        ),
         _ => None,
     };
     let can_toggle = current_peer_key.as_deref().is_some_and(|key| {
@@ -3397,21 +3397,24 @@ fn verification(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 if state.peer_key_verified { GREEN } else { GOLD }
             ),
             l.label(
-                "CÓDIGO DE VERIFICAÇÃO · COMPARE NOS DOIS DISPOSITIVOS",
+                "FINGERPRINT DO PAR · 256 BITS · COMPARE NOS DOIS DISPOSITIVOS",
                 9.0,
                 GOLD
             ),
             l.label(
-                safety_code
+                safety_fingerprint
                     .as_deref()
-                    .unwrap_or("Informe sua chave e a chave do outro dispositivo."),
-                15.0,
+                    .map(crate::verification_fingerprint::display)
+                    .unwrap_or_else(
+                        || "Informe sua chave e a chave do outro dispositivo.".to_owned()
+                    ),
+                12.0,
                 PAPER
             ),
             l.control(
                 "key",
-                "Copiar código curto",
-                safety_code.clone().map(Message::CopyMlsValue),
+                "Copiar fingerprint completo",
+                safety_fingerprint.clone().map(Message::CopyMlsValue),
                 false
             ),
             l.control(
@@ -3435,7 +3438,7 @@ fn verification(state: &Slouching, l: Layout) -> Element<'_, Message> {
         column![
             l.label("COMO CONFERIR", 10.0, GOLD),
             l.label(
-                "Em uma conversa ao vivo, compare o mesmo código de 12 dígitos nos dois dispositivos ou confira a chave completa por um canal independente. Marque como conferida somente depois dessa comparação e de autenticar o contato.",
+                "Em uma conversa ao vivo, compare o fingerprint completo nos dois dispositivos ou confira a chave completa por um canal independente. Marque como conferida somente depois dessa comparação e de autenticar o contato.",
                 11.0,
                 PAPER
             ),

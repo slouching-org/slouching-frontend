@@ -237,8 +237,8 @@ key, but does not prove the person behind a transferred image. Import never
 marks trust automatically; press **Marcar como conferida** only after
 authenticating the QR source. That decision is local to this encrypted profile
 and exact key. It does not verify a display name, and a replacement key must be
-verified again. A symmetric 12-digit safety code derived from both device keys
-is available for live comparison; it does not implement SPAKE2 rendezvous or
+verified again. A symmetric full 256-bit BLAKE3 fingerprint derived from both device keys is
+available for live comparison; it does not implement SPAKE2 rendezvous or
 establish trust by itself. Camera scanning uses an explicit, temporary local
 capture and follows the same signature, expiry, self-invite, and trust checks
 as PNG import.
@@ -412,16 +412,16 @@ in the operating system credential store. PNG import is explicit, limited to
 512 KiB bound. Selecting a supplied familiar removes the custom avatar.
 Saving fails closed when that store is unavailable. The
 screen can also explicitly create and retain an Ed25519 device signing key in
-the system credential store. The connection screen can search for active Slouching listeners on the LAN via mDNS and fill
-a discovered route into direct chat. Discovery is an untrusted route hint: it
+the system credential store. The connection screen can search for active Slouching
+listeners on the LAN via mDNS and fill a discovered route into direct chat. Discovery is an untrusted route hint: it
 does not publish a device key or replace manual identity verification. mDNS
 discovery across VPNs is not supported. The direct-text trust screen creates a
 signed
 10-minute QR invitation containing the public key and optional listener
 addresses, then imports it from PNG and lets the user choose a route. The QR
 does not auto-verify human identity; a changed key has no inherited trust.
-The trust screen derives a symmetric 12-digit safety code from both device
-keys for live comparison. SPAKE2 rendezvous and contact discovery are not
+The trust screen derives a full 256-bit fingerprint from both device keys for
+manual comparison. SPAKE2 rendezvous and contact discovery are not
 implemented. OpenMLS credentials include a versioned binding signed by the durable device key. One-use
 KeyPackages and private MLS state are stored in SQLCipher. The direct-chat
 screen separately pins device public keys. Character scenes remain visual
@@ -483,9 +483,8 @@ be installed and available in the user session.
 
 ![Actual native Iced peer verification screen after importing a QR, with separate LAN and VPN address choices; all values are capture fixtures](docs/design/runtime/native-vhs/08-verify-invite-imported.png)
 
-These identity captures predate the camera-scan control and the 12-digit safety
-code. Refresh them with `--capture-peer-verification` in a graphical session;
-this TTY environment cannot create an Iced window.
+These identity captures predate the camera-scan control and the full 256-bit pair fingerprint. Refresh them with
+`--capture-peer-verification` in a graphical session; this TTY environment cannot create an Iced window.
 
 ![Native Iced call screen capture from before protected Opus RTP integration; a fresh capture needs a Wayland or X11 display](docs/design/runtime/native-vhs/10-call.png)
 
@@ -573,7 +572,7 @@ and playback, but not this illustrative capture.
 `--capture-lan-discovery` shows a sample mDNS result; it is a fixture, not a
 live listener.
 `--capture-peer-verification` supplies sample local and peer keys for the trust
-screen capture and its derived 12-digit safety code; they are fixtures, not
+screen capture and its derived 256-bit fingerprint; they are fixtures, not
 identities from the keyring. Refresh the identity screenshot from a graphical
 Wayland or X11 session; this checkout has no display server.
 `--capture-peer-invite` supplies a signed sample invitation and renders its QR

@@ -18,7 +18,7 @@ mod peer_invite;
 pub mod screen_capture;
 pub mod storage;
 mod ui;
-pub mod verification_code;
+pub mod verification_fingerprint;
 pub mod video_transport;
 #[cfg(target_os = "linux")]
 mod wayland_capture;
