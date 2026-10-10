@@ -1269,6 +1269,9 @@ fn create_mls_application_event_in(
     if expires_at_unix <= 0 {
         return Err("MLS application event expiry must be a positive Unix timestamp".to_owned());
     }
+    if expires_at_unix <= unix_time_now()? {
+        return Err("MLS application event expiry must be in the future".to_owned());
+    }
     let plaintext_text = std::str::from_utf8(plaintext)
         .map_err(|_| "MLS chat text must be valid UTF-8".to_owned())?;
     let author_device = device_identity.verifying_key().to_bytes();
@@ -1708,6 +1711,15 @@ fn process_inbound_mls_application_event_in(
     event: &EncryptedEvent,
     device_identity: &SigningKey,
 ) -> Result<ProcessedMlsApplicationEvent, String> {
+    process_inbound_mls_application_event_at(connection, event, device_identity, unix_time_now()?)
+}
+
+fn process_inbound_mls_application_event_at(
+    connection: &mut Connection,
+    event: &EncryptedEvent,
+    device_identity: &SigningKey,
+    now: i64,
+) -> Result<ProcessedMlsApplicationEvent, String> {
     use openmls::prelude::{
         MlsMessageIn, ProcessedMessageContent, tls_codec::Deserialize as TlsCodecDeserialize,
     };
@@ -1763,6 +1775,9 @@ fn process_inbound_mls_application_event_in(
                 );
             }
             return Ok(ProcessedMlsApplicationEvent::Duplicate);
+        }
+        if event.expires_at_unix <= now {
+            return Err("inbound MLS application event has expired".to_owned());
         }
 
         let incoming = MlsMessageIn::tls_deserialize_exact(&event.ciphertext)
@@ -2209,6 +2224,7 @@ pub fn list_outbound_events(
         return Err("outbound event batch size must be between 1 and 500".to_owned());
     }
     let connection = open_local_database()?;
+    expire_queued_mls_events_in(&connection, unix_time_now()?)?;
     let mut statement = connection
         .prepare(
             "SELECT e.rowid, e.event_id, e.author_device, e.group_id, e.epoch, e.checkpoint,
@@ -2274,10 +2290,26 @@ pub fn list_queued_mls_event_recipients(group_id: &[u8]) -> Result<Vec<[u8; 32]>
     list_queued_mls_event_recipients_in(&connection, group_id)
 }
 
+pub fn expire_queued_mls_events(group_id: &[u8]) -> Result<usize, String> {
+    if group_id.len() != 16 {
+        return Err("MLS group ID must be 16 bytes".to_owned());
+    }
+    let connection = open_local_database()?;
+    connection
+        .execute(
+            "UPDATE local_events SET delivery_state = 'expired'
+             WHERE group_id = ?1 AND direction = 'outbound'
+               AND delivery_state = 'queued' AND expires_at_unix <= ?2",
+            params![group_id, unix_time_now()?],
+        )
+        .map_err(|error| format!("could not expire queued MLS events: {error}"))
+}
+
 fn list_queued_mls_event_recipients_in(
     connection: &Connection,
     group_id: &[u8],
 ) -> Result<Vec<[u8; 32]>, String> {
+    expire_queued_mls_events_in(connection, unix_time_now()?)?;
     let mut statement = connection
         .prepare(
             "SELECT DISTINCT r.device_public_key
@@ -2318,6 +2350,7 @@ fn list_queued_mls_events_for_peer_in(
     peer_device: [u8; 32],
     limit: usize,
 ) -> Result<Vec<StoredOutboundEvent>, String> {
+    expire_queued_mls_events_in(connection, unix_time_now()?)?;
     let mut statement = connection
         .prepare(
             "SELECT e.rowid, e.event_id, e.author_device, e.group_id, e.epoch,
@@ -2383,6 +2416,7 @@ fn mark_mls_event_delivered_to_peer_in(
     event_id: [u8; 16],
     peer_device: [u8; 32],
 ) -> Result<(), String> {
+    expire_queued_mls_events_in(connection, unix_time_now()?)?;
     let transaction = connection
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| format!("could not begin MLS event delivery transaction: {error}"))?;
@@ -2390,6 +2424,19 @@ fn mark_mls_event_delivered_to_peer_in(
         .duration_since(UNIX_EPOCH)
         .map_err(|error| format!("system clock is invalid: {error}"))?
         .as_secs() as i64;
+    let event_state: Option<String> = transaction
+        .query_row(
+            "SELECT delivery_state FROM local_events
+             WHERE event_id = ?1 AND direction = 'outbound'",
+            [event_id.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("could not read MLS event state for ACK: {error}"))?;
+    let event_state = event_state.ok_or_else(|| "outbound MLS event was not found".to_owned())?;
+    if event_state == "expired" {
+        return Err("ACK arrived after the MLS event expired".to_owned());
+    }
     let changed = transaction
         .execute(
             "UPDATE local_mls_event_recipients SET delivery_state = 'delivered', delivered_at = ?1
@@ -2646,6 +2693,9 @@ fn store_encrypted_event(
             .map_err(|error| format!("could not finish local event transaction: {error}"))?;
         return Ok(StoreEventResult::AlreadyStored);
     }
+    if event.expires_at_unix <= unix_time_now()? {
+        return Err("encrypted event has expired".to_owned());
+    }
 
     transaction
         .execute(
@@ -2675,6 +2725,26 @@ fn store_encrypted_event(
         .commit()
         .map_err(|error| format!("could not commit local encrypted event: {error}"))?;
     Ok(StoreEventResult::Stored)
+}
+
+fn unix_time_now() -> Result<i64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock is invalid: {error}"))?
+        .as_secs()
+        .try_into()
+        .map_err(|_| "system clock exceeds supported Unix timestamp range".to_owned())
+}
+
+fn expire_queued_mls_events_in(connection: &Connection, now: i64) -> Result<usize, String> {
+    connection
+        .execute(
+            "UPDATE local_events SET delivery_state = 'expired'
+             WHERE direction = 'outbound' AND delivery_state = 'queued'
+               AND expires_at_unix <= ?1",
+            [now],
+        )
+        .map_err(|error| format!("could not expire queued MLS events: {error}"))
 }
 
 pub fn load_identity_public_key() -> Result<Option<[u8; 32]>, String> {
@@ -5746,6 +5816,16 @@ mod tests {
         .expect("second receiver should join from its Welcome");
 
         let payload = b"MLS application payload";
+        assert!(
+            create_mls_application_event_in(
+                &mut sender,
+                &group.group_id,
+                payload,
+                1,
+                &sender_identity,
+            )
+            .is_err()
+        );
         let prepared = create_mls_application_event_in(
             &mut sender,
             &group.group_id,
@@ -5842,6 +5922,46 @@ mod tests {
             .is_empty()
         );
 
+        let expiring = create_mls_application_event_in(
+            &mut sender,
+            &group.group_id,
+            b"expires before delivery",
+            2_000_000_000,
+            &sender_identity,
+        )
+        .expect("future event should queue before its deadline");
+        assert_eq!(
+            expire_queued_mls_events_in(&sender, 2_000_000_000)
+                .expect("expired outbox entries should be marked"),
+            1
+        );
+        let expired_state: String = sender
+            .query_row(
+                "SELECT delivery_state FROM local_events WHERE event_id = ?1",
+                [expiring.event.event_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("expired event state should persist");
+        assert_eq!(expired_state, "expired");
+        assert!(
+            mark_mls_event_delivered_to_peer_in(
+                &mut sender,
+                expiring.event.event_id,
+                receiver_identity.verifying_key().to_bytes(),
+            )
+            .is_err()
+        );
+        assert!(
+            list_queued_mls_events_for_peer_in(
+                &sender,
+                &group.group_id,
+                receiver_identity.verifying_key().to_bytes(),
+                100,
+            )
+            .expect("expired events should not be listed for delivery")
+            .is_empty()
+        );
+
         let mut forged = prepared.event.clone();
         forged.event_id = [0x91; 16];
         forged.author_device = [0x92; 32];
@@ -5857,6 +5977,24 @@ mod tests {
             )
             .expect("rejected message should not remain in the inbox");
         assert_eq!(rejected_rows, 0);
+
+        assert!(
+            process_inbound_mls_application_event_at(
+                &mut receiver,
+                &prepared.event,
+                &receiver_identity,
+                prepared.event.expires_at_unix,
+            )
+            .is_err()
+        );
+        let expired_rows: i64 = receiver
+            .query_row(
+                "SELECT COUNT(*) FROM local_events WHERE event_id = ?1",
+                [prepared.event.event_id.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("expired event should not be persisted");
+        assert_eq!(expired_rows, 0);
 
         assert_eq!(
             process_inbound_mls_application_event_in(

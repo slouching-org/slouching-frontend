@@ -110,7 +110,10 @@ device and leaves other recipients queued; the outbox event closes only after
 all snapshot members confirm. Direct send checks that the pinned peer belongs
 to the snapshot. The MLS screen can retry messages for the connected peer or
 distribute them to all peers with saved routes. A peer with pending Commits is
-skipped until its group epoch is current; unavailable peers remain queued.
+skipped until its group epoch is current; unavailable peers remain queued. New
+MLS chat events expire after 30 days. Expired events leave the retry queue,
+recipients reject new expired events before changing their MLS ratchet, and
+fan-out status reports the number that expired during the run.
 Membership Commits are also saved atomically with the
 group epoch in a separate local outbox; the latest pending Commit is restored
 from SQLCipher and can be sent from the MLS screen over an active direct

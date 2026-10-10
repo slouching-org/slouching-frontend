@@ -8,7 +8,7 @@ Its Elixir server/backend core and Rust/Iced client direction are retained.
 | --- | --- | --- |
 | Desktop UI | Rust 2024 + pinned Iced 0.14.0 | Native state in `src/main.rs`; eleven design-board views plus an MLS group setup screen |
 | Rendering | Iced/wgpu | Native views with images, SVG icons, and canvas texture; direct-LAN chat is functional, call/media screens remain previews |
-| Local client core | Rust identity, cryptography, storage, transport, media | SQLCipher profile and direct-chat history; OpenMLS group setup, transactional event journal, and MLS chat over a pinned Iroh/QUIC session with durable ACK/retry are implemented; discovery, relay, offline delivery, and media remain pending |
+| Local client core | Rust identity, cryptography, storage, transport, media | SQLCipher profile and direct-chat history; OpenMLS group setup, transactional event journal, and MLS chat over a pinned Iroh/QUIC session with durable per-device ACK, saved-route fan-out, and enforced 30-day expiry are implemented; discovery, relay, offline delivery, and media remain pending |
 | Server/backend | Elixir, separately versioned backend repo | Development status and protobuf handshake implemented |
 | State boundary | Versioned protocol | Asynchronous loopback HTTP status and binary protobuf WebSocket handshake v1 integrated; production boundary pending |
 | Browser UI | HTML/CSS/JavaScript | Historical visual prototype in `prototypes/web/`; not product runtime |

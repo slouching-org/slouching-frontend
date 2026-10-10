@@ -171,6 +171,7 @@ struct MlsCommitFanoutPeerOutcome {
 struct MlsEventFanoutReport {
     recipients: usize,
     events_acked: usize,
+    events_expired: usize,
     failures: Vec<String>,
 }
 
@@ -2104,16 +2105,17 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             match result {
                 Ok(report) if report.failures.is_empty() => {
                     state.mls_status = format!(
-                        "Fan-out MLS concluído: {} evento(s) confirmados por ACK em {} peer(s).",
-                        report.events_acked, report.recipients
+                        "Fan-out MLS: {} evento(s) confirmados por ACK em {} peer(s); {} expirado(s).",
+                        report.events_acked, report.recipients, report.events_expired
                     );
                 }
                 Ok(report) => {
                     state.mls_status = format!(
-                        "Fan-out MLS parcial: {} evento(s) confirmados em {} peer(s); {} pendentes. {}",
+                        "Fan-out MLS parcial: {} evento(s) confirmados em {} peer(s); {} pendentes, {} expirado(s). {}",
                         report.events_acked,
                         report.recipients,
                         report.failures.len(),
+                        report.events_expired,
                         report.failures.join(" · ")
                     );
                 }
@@ -3535,8 +3537,10 @@ async fn fanout_mls_commits_to_peer(
 
 async fn fanout_mls_events_task(group_id: Vec<u8>) -> Result<MlsEventFanoutReport, String> {
     let route_group_id = group_id.clone();
-    let (recipients, routes) = tokio::task::spawn_blocking(move || {
+    let (events_expired, recipients, routes) = tokio::task::spawn_blocking(move || {
+        let events_expired = storage::expire_queued_mls_events(&route_group_id)?;
         Ok::<_, String>((
+            events_expired,
             storage::list_queued_mls_event_recipients(&route_group_id)?,
             storage::list_peer_routes()?,
         ))
@@ -3550,6 +3554,7 @@ async fn fanout_mls_events_task(group_id: Vec<u8>) -> Result<MlsEventFanoutRepor
     let mut report = MlsEventFanoutReport {
         recipients: recipients.len(),
         events_acked: 0,
+        events_expired,
         failures: Vec::new(),
     };
     for peer_device in recipients {
