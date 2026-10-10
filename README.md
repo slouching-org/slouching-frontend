@@ -83,10 +83,13 @@ widgets, original characters and scenery, extracted outline SVG icons,
 Bricolage Grotesque and JetBrains Mono, translucent panels, scanlines, and
 vignette. The top-right **Telas** button opens the screen gallery.
 
-An additional **Grupo MLS** screen supports manual two-device group setup:
-create the group on one device, exchange the invitee KeyPackage over a trusted
-channel, then return the Welcome and ratchet tree to the joining device. After
-both devices join, open **Texto direto · LAN** and connect them using the usual
+An additional **Grupo MLS** screen supports two-device group setup. Create the
+group on one device and share its ID. The invitee can send its public KeyPackage
+over the active pinned session, or copy it through a trusted channel. The
+committer reviews and admits the package; the receiver checks that its device
+key matches the pinned peer before saving the Commit. The Welcome and ratchet
+tree still return through a trusted channel. After both devices join, open
+**Texto direto · LAN** and connect them using the usual
 pinned-key and LAN-address flow. In **Grupo MLS**, select the same group ID on
 both devices; MLS messages are encrypted and sent over that active direct
 Iroh/QUIC session. The receiver validates the MLS event and stores its
@@ -175,7 +178,7 @@ be installed and available in the user session.
 
 ![Actual native Iced group-call preview; media and sample messages are illustrative](docs/design/runtime/native-vhs/10-call.png)
 
-![Actual 1884 × 1000 native Iced MLS screen showing group setup and the visible proposal review summary, captured without a selected group](docs/design/runtime/native-vhs/11-mls.png)
+![Actual 1884 × 1000 native Iced MLS screen showing group setup and the visible control for sending a KeyPackage through the connected committer session](docs/design/runtime/native-vhs/11-mls.png)
 
 The MLS screen now detects authenticated committer equivocation. It verifies a
 conflicting historical Commit against a saved OpenMLS epoch snapshot, stores
@@ -192,7 +195,7 @@ These are a first implementation of the visual direction, with comparison
 at 1280 × 800 and a compact 960 × 640 window. Exact visual parity,
 accessibility, and live media integration remain to be completed.
 The current direct transport and MLS recovery frames are specified in the
-[v5 peer protocol](docs/fichas/transport/lan-peer-v5.md).
+[v6 peer protocol](docs/fichas/transport/lan-peer-v6.md).
 
 ## Reproduce native captures
 

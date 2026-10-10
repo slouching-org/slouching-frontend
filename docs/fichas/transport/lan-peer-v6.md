@@ -1,7 +1,4 @@
-# Direct peer transport v5
-
-> Historical contract. The active client uses v6; see
-> [lan-peer-v6.md](lan-peer-v6.md) for the current wire format.
+# Direct peer transport v6
 
 This client-only protocol carries direct pairwise text and opaque OpenMLS
 application events between two Rust clients on a reachable LAN. The Iced chat
@@ -21,14 +18,14 @@ Relay mode is disabled and callers supply direct socket addresses.
 
 ## Session framing
 
-ALPN: `org.slouching.peer/5`. One QUIC bidirectional stream stays open for a
+ALPN: `org.slouching.peer/6`. One QUIC bidirectional stream stays open for a
 session. Every frame has a 19-byte header followed by its payload:
 
 | Field | Size | Encoding |
 | --- | ---: | --- |
 | Marker | 4 bytes | ASCII `SLCH` |
-| Version | 2 bytes | Unsigned big-endian integer, `5` |
-| Kind | 1 byte | DATA=1, ACK=2, CLOSE=3, CLOSE_ACK=4, MLS_EVENT=5, MLS_COMMIT=6, REJECT=7, MLS_COMMIT_REQUEST=8, MLS_PROPOSAL=9 |
+| Version | 2 bytes | Unsigned big-endian integer, `6` |
+| Kind | 1 byte | DATA=1, ACK=2, CLOSE=3, CLOSE_ACK=4, MLS_EVENT=5, MLS_COMMIT=6, REJECT=7, MLS_COMMIT_REQUEST=8, MLS_PROPOSAL=9, MLS_KEY_PACKAGE=10 |
 | Sequence | 8 bytes | Unsigned big-endian; application frames advance monotonically, control requests use zero |
 | Payload length | 4 bytes | Unsigned big-endian byte count |
 
@@ -67,6 +64,17 @@ the receiver's event ID makes that retry idempotent. This path supports
 self-update proposals only; proposal approval and other proposal types remain
 unimplemented.
 
+MLS_KEY_PACKAGE carries a `SLKP` version 1 envelope: event ID (16 bytes),
+invitee device key (32), group ID (16), and public KeyPackage bytes. The event
+ID is the first 16 bytes of BLAKE3 over the package. Payloads are capped at
+64 KiB. The receiving UI requires the envelope's invitee key to equal the
+authenticated pinned peer and requires the same group to be selected. It
+holds the frame until the designated committer approves **Validar e admitir
+membro**. The ACK follows the transaction that saves the membership Commit
+and Welcome locally. The invitee then receives the Welcome and ratchet tree
+through the existing manual copy/paste fields; direct Welcome delivery and
+retry are not part of v6.
+
 ## Using the Iced app on a LAN
 
 Create an identity on each device and exchange the displayed public keys out
@@ -77,8 +85,11 @@ that address and connects. Either side can then send pairwise text in the
 **Texto direto · LAN** view.
 
 To use MLS, create a group on one device. Generate a KeyPackage on the other,
-exchange it over a separately trusted channel, admit it, then return the
-Welcome and ratchet tree to the joining client. Both devices open **Grupo MLS**
+select the same group ID, and connect directly to the designated committer.
+Click **Enviar KeyPackage ao committer conectado**. The committer reviews the
+incoming peer-bound package and admits it with **Validar e admitir membro**.
+After the package ACK, copy the generated Welcome and ratchet tree to the
+joining client through the existing separately trusted channel. Both devices open **Grupo MLS**
 and select the same group ID. Establish the pinned direct LAN session in
 **Texto direto · LAN**, then return to the group screen to send or retry
 messages. Messages are retained in each device's local SQLCipher database.
@@ -117,9 +128,9 @@ cannot fetch it. Requests are limited to 16 per session.
 
 `cargo test --test peer_process` launches separate operating system processes.
 It exchanges text, opaque MLS events, MLS Commit frames, predecessor requests,
-and proposals between separate processes; checks positive ACK, explicit
-rejection, and wrong-pin rejection; then disconnects with pending text, event,
-Commit, and proposal sends to verify delivery is reported unknown. Storage
+proposals, and KeyPackages between separate processes; checks positive ACK,
+explicit rejection, and wrong-pin rejection; then disconnects with pending text,
+event, Commit, and proposal sends to verify delivery is reported unknown. Storage
 coverage verifies that a recipient can recover a previously ACKed Commit after
 database reopen, while a device absent from its recipient snapshot receives no
 data. Codec tests cover the proposal envelope and bounds.
@@ -131,6 +142,6 @@ offline delivery, group event distribution service, automatic multi-member
 Commit fan-out, or cross-device history sync. MLS group setup and new-member
 Welcome exchange remain manual. Existing members can receive and atomically
 apply a Commit over the direct session; new members join through the matching
-Welcome/ratchet tree. The protocol v5 ALPN and frame version are not compatible
-with v4 or older peers. The older command-line
+Welcome/ratchet tree. The protocol v6 ALPN and frame version are not compatible
+with v5 or older peers. The older command-line
 helpers are diagnostic; the supported user-facing flow is in Iced.

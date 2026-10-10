@@ -1462,6 +1462,13 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 .then(|| Message::CopyMlsValue(state.mls_key_package.clone())),
             false
         ),
+        l.control(
+            "arrow",
+            "Enviar KeyPackage ao committer conectado",
+            (!state.mls_key_package.is_empty()).then_some(Message::SendMlsKeyPackage),
+            matches!(state.peer_listen_status, crate::PeerListenStatus::Connected)
+                && state.mls_quarantine_reason.is_none()
+        ),
         l.label("ATUALIZAÇÃO DA MINHA CHAVE MLS", 10.0, GOLD),
         l.control(
             "key",

@@ -10,9 +10,9 @@ use tokio::{
 };
 
 /// Direct-only protocol version used for persistent paired-device text sessions.
-pub const PEER_ALPN: &[u8] = b"org.slouching.peer/5";
+pub const PEER_ALPN: &[u8] = b"org.slouching.peer/6";
 const FRAME_MAGIC: &[u8; 4] = b"SLCH";
-const FRAME_VERSION: u16 = 5;
+const FRAME_VERSION: u16 = 6;
 const FRAME_DATA: u8 = 1;
 const FRAME_ACK: u8 = 2;
 const FRAME_CLOSE: u8 = 3;
@@ -22,16 +22,20 @@ const FRAME_MLS_COMMIT: u8 = 6;
 const FRAME_REJECT: u8 = 7;
 const FRAME_MLS_COMMIT_REQUEST: u8 = 8;
 const FRAME_MLS_PROPOSAL: u8 = 9;
+const FRAME_MLS_KEY_PACKAGE: u8 = 10;
 const MLS_EVENT_MAGIC: &[u8; 4] = b"SLME";
 const MLS_EVENT_VERSION: u16 = 1;
 const MLS_COMMIT_MAGIC: &[u8; 4] = b"SLMC";
 const MLS_COMMIT_VERSION: u16 = 1;
 const MLS_PROPOSAL_MAGIC: &[u8; 4] = b"SLMP";
 const MLS_PROPOSAL_VERSION: u16 = 1;
+const MLS_KEY_PACKAGE_MAGIC: &[u8; 4] = b"SLKP";
+const MLS_KEY_PACKAGE_VERSION: u16 = 1;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
 const MAX_MLS_EVENT_BYTES: usize = 64 * 1024;
 const MAX_MLS_COMMIT_BYTES: usize = 64 * 1024;
 const MAX_MLS_PROPOSAL_BYTES: usize = 64 * 1024;
+const MAX_MLS_KEY_PACKAGE_BYTES: usize = 64 * 1024;
 const MAX_CHECKPOINT_BYTES: usize = 16 * 1024;
 pub const MAX_PENDING_MESSAGES: usize = 16;
 const MAX_MLS_COMMIT_REQUESTS_PER_SESSION: u8 = 16;
@@ -75,6 +79,14 @@ pub struct MlsProposalEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlsKeyPackageEnvelope {
+    pub event_id: [u8; 16],
+    pub invitee_device: [u8; 32],
+    pub group_id: Vec<u8>,
+    pub key_package: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerAcceptError {
     Unauthorized(EndpointId),
     Failed(String),
@@ -97,6 +109,10 @@ pub enum PeerCommand {
     SendMlsProposal {
         request_id: u64,
         proposal: MlsProposalEnvelope,
+    },
+    SendMlsKeyPackage {
+        request_id: u64,
+        key_package: MlsKeyPackageEnvelope,
     },
     RequestMlsCommit {
         group_id: Vec<u8>,
@@ -139,6 +155,11 @@ pub enum PeerEvent {
         peer_id: EndpointId,
         proposal: MlsProposalEnvelope,
     },
+    MlsKeyPackageReceived {
+        sequence: u64,
+        peer_id: EndpointId,
+        key_package: MlsKeyPackageEnvelope,
+    },
     MlsCommitRequested {
         peer_id: EndpointId,
         group_id: Vec<u8>,
@@ -153,6 +174,9 @@ pub enum PeerEvent {
     MlsProposalAcknowledged {
         request_id: u64,
     },
+    MlsKeyPackageAcknowledged {
+        request_id: u64,
+    },
     MlsEventRejected {
         request_id: u64,
         reason: String,
@@ -162,6 +186,10 @@ pub enum PeerEvent {
         reason: String,
     },
     MlsProposalRejected {
+        request_id: u64,
+        reason: String,
+    },
+    MlsKeyPackageRejected {
         request_id: u64,
         reason: String,
     },
@@ -180,6 +208,9 @@ pub enum PeerEvent {
         request_id: u64,
     },
     MlsProposalDeliveryUnknown {
+        request_id: u64,
+    },
+    MlsKeyPackageDeliveryUnknown {
         request_id: u64,
     },
     #[allow(dead_code)]
@@ -201,6 +232,7 @@ enum PendingOutbound {
     MlsEvent { request_id: u64 },
     MlsCommit { request_id: u64 },
     MlsProposal { request_id: u64 },
+    MlsKeyPackage { request_id: u64 },
 }
 
 pub struct DirectPeerSession {
@@ -228,6 +260,10 @@ enum Frame {
     MlsProposal {
         sequence: u64,
         proposal: MlsProposalEnvelope,
+    },
+    MlsKeyPackage {
+        sequence: u64,
+        key_package: MlsKeyPackageEnvelope,
     },
     MlsCommitRequest {
         group_id: Vec<u8>,
@@ -320,18 +356,22 @@ impl DirectPeerListener {
                 | PeerEvent::MlsEventReceived { .. }
                 | PeerEvent::MlsCommitReceived { .. }
                 | PeerEvent::MlsProposalReceived { .. }
+                | PeerEvent::MlsKeyPackageReceived { .. }
                 | PeerEvent::MlsCommitRequested { .. }
                 | PeerEvent::MlsEventAcknowledged { .. }
                 | PeerEvent::MlsCommitAcknowledged { .. }
                 | PeerEvent::MlsProposalAcknowledged { .. }
+                | PeerEvent::MlsKeyPackageAcknowledged { .. }
                 | PeerEvent::MlsEventRejected { .. }
                 | PeerEvent::MlsCommitRejected { .. }
                 | PeerEvent::MlsProposalRejected { .. }
+                | PeerEvent::MlsKeyPackageRejected { .. }
                 | PeerEvent::Rejected { .. }
                 | PeerEvent::DeliveryUnknown { .. }
                 | PeerEvent::MlsEventDeliveryUnknown { .. }
                 | PeerEvent::MlsCommitDeliveryUnknown { .. }
-                | PeerEvent::MlsProposalDeliveryUnknown { .. } => {}
+                | PeerEvent::MlsProposalDeliveryUnknown { .. }
+                | PeerEvent::MlsKeyPackageDeliveryUnknown { .. } => {}
             }
         }
         received.ok_or_else(|| "peer session ended before receiving text".to_owned())
@@ -439,6 +479,27 @@ impl DirectPeerSession {
                                     proposal,
                                 };
                             }
+                            Ok(Frame::MlsKeyPackage { sequence, key_package }) => {
+                                if closing {
+                                    break 'session "peer sent application data while disconnecting".to_owned();
+                                }
+                                if sequence != next_in_sequence {
+                                    break 'session format!("peer data sequence {sequence} did not match expected {next_in_sequence}");
+                                }
+                                if pending_inbound.len() >= MAX_PENDING_MESSAGES {
+                                    break 'session "peer exceeded the inbound pending-message limit".to_owned();
+                                }
+                                let Some(next) = next_in_sequence.checked_add(1) else {
+                                    break 'session "inbound message sequence exhausted".to_owned();
+                                };
+                                next_in_sequence = next;
+                                pending_inbound.insert(sequence);
+                                yield PeerEvent::MlsKeyPackageReceived {
+                                    sequence,
+                                    peer_id: self.peer_id,
+                                    key_package,
+                                };
+                            }
                             Ok(Frame::MlsCommitRequest { group_id, predecessor_epoch }) => {
                                 received_commit_requests = received_commit_requests.saturating_add(1);
                                 if received_commit_requests > MAX_MLS_COMMIT_REQUESTS_PER_SESSION {
@@ -471,6 +532,9 @@ impl DirectPeerSession {
                                     PendingOutbound::MlsProposal { request_id } => {
                                         yield PeerEvent::MlsProposalAcknowledged { request_id };
                                     }
+                                    PendingOutbound::MlsKeyPackage { request_id } => {
+                                        yield PeerEvent::MlsKeyPackageAcknowledged { request_id };
+                                    }
                                 }
                             }
                             Ok(Frame::Reject { sequence, reason }) => {
@@ -482,6 +546,7 @@ impl DirectPeerSession {
                                     PendingOutbound::MlsEvent { request_id } => yield PeerEvent::MlsEventRejected { request_id, reason },
                                     PendingOutbound::MlsCommit { request_id } => yield PeerEvent::MlsCommitRejected { request_id, reason },
                                     PendingOutbound::MlsProposal { request_id } => yield PeerEvent::MlsProposalRejected { request_id, reason },
+                                    PendingOutbound::MlsKeyPackage { request_id } => yield PeerEvent::MlsKeyPackageRejected { request_id, reason },
                                 }
                             }
                             Ok(Frame::Close) => {
@@ -605,6 +670,31 @@ impl DirectPeerSession {
                                 }
                                 next_out_sequence = next;
                             }
+                            Some(PeerCommand::SendMlsKeyPackage { request_id, key_package }) => {
+                                let payload = match encode_mls_key_package(&key_package) {
+                                    Ok(payload) => payload,
+                                    Err(reason) => {
+                                        yield PeerEvent::MlsKeyPackageRejected { request_id, reason };
+                                        continue;
+                                    }
+                                };
+                                if pending_sends.len() >= MAX_PENDING_MESSAGES {
+                                    yield PeerEvent::MlsKeyPackageRejected {
+                                        request_id,
+                                        reason: format!("at most {MAX_PENDING_MESSAGES} messages may await acknowledgement"),
+                                    };
+                                    continue;
+                                }
+                                let sequence = next_out_sequence;
+                                let Some(next) = next_out_sequence.checked_add(1) else {
+                                    break 'session "outbound message sequence exhausted".to_owned();
+                                };
+                                pending_sends.insert(sequence, PendingOutbound::MlsKeyPackage { request_id });
+                                if let Err(error) = write_frame(&mut self.send, FRAME_MLS_KEY_PACKAGE, sequence, &payload).await {
+                                    break 'session format!("could not send MLS KeyPackage: {error}");
+                                }
+                                next_out_sequence = next;
+                            }
                             Some(PeerCommand::RequestMlsCommit { group_id, predecessor_epoch }) => {
                                 if group_id.len() != 16 || predecessor_epoch > i64::MAX as u64 {
                                     continue;
@@ -671,6 +761,9 @@ impl DirectPeerSession {
                     }
                     PendingOutbound::MlsProposal { request_id } => {
                         yield PeerEvent::MlsProposalDeliveryUnknown { request_id };
+                    }
+                    PendingOutbound::MlsKeyPackage { request_id } => {
+                        yield PeerEvent::MlsKeyPackageDeliveryUnknown { request_id };
                     }
                 }
             }
@@ -779,13 +872,16 @@ pub async fn send_once(
             | PeerEvent::MlsEventReceived { .. }
             | PeerEvent::MlsCommitReceived { .. }
             | PeerEvent::MlsProposalReceived { .. }
+            | PeerEvent::MlsKeyPackageReceived { .. }
             | PeerEvent::MlsCommitRequested { .. }
             | PeerEvent::MlsEventAcknowledged { .. }
             | PeerEvent::MlsCommitAcknowledged { .. }
             | PeerEvent::MlsProposalAcknowledged { .. }
+            | PeerEvent::MlsKeyPackageAcknowledged { .. }
             | PeerEvent::MlsEventRejected { .. }
             | PeerEvent::MlsCommitRejected { .. }
             | PeerEvent::MlsProposalRejected { .. }
+            | PeerEvent::MlsKeyPackageRejected { .. }
             | PeerEvent::Unauthorized { .. } => {}
             PeerEvent::MlsEventDeliveryUnknown { .. } => {
                 return Err("MLS event delivery could not be confirmed".to_owned());
@@ -795,6 +891,9 @@ pub async fn send_once(
             }
             PeerEvent::MlsProposalDeliveryUnknown { .. } => {
                 return Err("MLS proposal delivery could not be confirmed".to_owned());
+            }
+            PeerEvent::MlsKeyPackageDeliveryUnknown { .. } => {
+                return Err("MLS KeyPackage delivery could not be confirmed".to_owned());
             }
         }
     }
@@ -897,6 +996,22 @@ where
             Ok(Frame::MlsProposal {
                 sequence,
                 proposal: decode_mls_proposal(&bytes)?,
+            })
+        }
+        FRAME_MLS_KEY_PACKAGE => {
+            if length == 0 || length > MAX_MLS_KEY_PACKAGE_BYTES {
+                return Err(format!(
+                    "MLS KeyPackage length must be between 1 and {MAX_MLS_KEY_PACKAGE_BYTES}"
+                ));
+            }
+            let mut bytes = vec![0_u8; length];
+            reader
+                .read_exact(&mut bytes)
+                .await
+                .map_err(|error| format!("could not read MLS KeyPackage frame: {error}"))?;
+            Ok(Frame::MlsKeyPackage {
+                sequence,
+                key_package: decode_mls_key_package(&bytes)?,
             })
         }
         FRAME_MLS_COMMIT_REQUEST if length == 24 && sequence == 0 => {
@@ -1016,6 +1131,72 @@ fn decode_mls_proposal(bytes: &[u8]) -> Result<MlsProposalEnvelope, String> {
         group_id,
         epoch,
         proposal,
+    })
+}
+
+fn encode_mls_key_package(envelope: &MlsKeyPackageEnvelope) -> Result<Vec<u8>, String> {
+    if envelope.event_id.iter().all(|byte| *byte == 0)
+        || envelope.invitee_device.iter().all(|byte| *byte == 0)
+        || envelope.group_id.len() != 16
+        || envelope.key_package.is_empty()
+        || envelope.key_package.len() > MAX_MLS_KEY_PACKAGE_BYTES
+        || envelope.event_id.as_slice() != &blake3::hash(&envelope.key_package).as_bytes()[..16]
+    {
+        return Err("MLS KeyPackage has an invalid or oversized envelope".to_owned());
+    }
+    let mut output = Vec::with_capacity(76 + envelope.key_package.len());
+    output.extend_from_slice(MLS_KEY_PACKAGE_MAGIC);
+    output.extend_from_slice(&MLS_KEY_PACKAGE_VERSION.to_be_bytes());
+    output.extend_from_slice(&envelope.event_id);
+    output.extend_from_slice(&envelope.invitee_device);
+    output.extend_from_slice(&envelope.group_id);
+    output.extend_from_slice(&(envelope.key_package.len() as u32).to_be_bytes());
+    output.extend_from_slice(&envelope.key_package);
+    if output.len() > MAX_MLS_KEY_PACKAGE_BYTES {
+        return Err("serialized MLS KeyPackage exceeds the transport limit".to_owned());
+    }
+    Ok(output)
+}
+
+fn decode_mls_key_package(bytes: &[u8]) -> Result<MlsKeyPackageEnvelope, String> {
+    const FIXED: usize = 4 + 2 + 16 + 32 + 16 + 4;
+    if bytes.len() < FIXED
+        || bytes.len() > MAX_MLS_KEY_PACKAGE_BYTES
+        || &bytes[..4] != MLS_KEY_PACKAGE_MAGIC
+    {
+        return Err("invalid or oversized MLS KeyPackage envelope".to_owned());
+    }
+    let version = u16::from_be_bytes(bytes[4..6].try_into().unwrap());
+    if version != MLS_KEY_PACKAGE_VERSION {
+        return Err(format!(
+            "unsupported MLS KeyPackage envelope version: {version}"
+        ));
+    }
+    let mut cursor = 6;
+    let event_id: [u8; 16] = bytes[cursor..cursor + 16].try_into().unwrap();
+    cursor += 16;
+    let invitee_device: [u8; 32] = bytes[cursor..cursor + 32].try_into().unwrap();
+    cursor += 32;
+    let group_id = bytes[cursor..cursor + 16].to_vec();
+    cursor += 16;
+    let package_len = u32::from_be_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+    cursor += 4;
+    if event_id.iter().all(|byte| *byte == 0)
+        || invitee_device.iter().all(|byte| *byte == 0)
+        || package_len == 0
+        || cursor.checked_add(package_len) != Some(bytes.len())
+    {
+        return Err("MLS KeyPackage envelope metadata or lengths are invalid".to_owned());
+    }
+    let key_package = bytes[cursor..].to_vec();
+    if event_id.as_slice() != &blake3::hash(&key_package).as_bytes()[..16] {
+        return Err("MLS KeyPackage event ID does not match its bytes".to_owned());
+    }
+    Ok(MlsKeyPackageEnvelope {
+        event_id,
+        invitee_device,
+        group_id,
+        key_package,
     })
 }
 
@@ -1554,6 +1735,30 @@ mod tests {
         assert!(encode_mls_proposal(&invalid).is_err());
     }
 
+    #[test]
+    fn mls_key_package_envelope_round_trips_and_binds_event_id_to_bytes() {
+        let package_bytes = vec![0x75; 64];
+        let digest = blake3::hash(&package_bytes);
+        let mut event_id = [0; 16];
+        event_id.copy_from_slice(&digest.as_bytes()[..16]);
+        let envelope = MlsKeyPackageEnvelope {
+            event_id,
+            invitee_device: [0x72; 32],
+            group_id: [0x73; 16].to_vec(),
+            key_package: package_bytes,
+        };
+        let encoded = encode_mls_key_package(&envelope).expect("valid KeyPackage should serialize");
+        assert_eq!(decode_mls_key_package(&encoded).unwrap(), envelope);
+
+        let mut tampered = envelope.clone();
+        tampered.key_package[0] ^= 1;
+        assert!(encode_mls_key_package(&tampered).is_err());
+
+        let mut invalid = envelope;
+        invalid.group_id.pop();
+        assert!(encode_mls_key_package(&invalid).is_err());
+    }
+
     #[tokio::test]
     async fn strict_session_parser_round_trips_mls_proposal_frame() {
         let proposal_bytes = vec![0x84; 48];
@@ -1577,6 +1782,32 @@ mod tests {
             Frame::MlsProposal {
                 sequence: 4,
                 proposal,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_session_parser_round_trips_mls_key_package_frame() {
+        let package_bytes = vec![0x84; 48];
+        let digest = blake3::hash(&package_bytes);
+        let mut event_id = [0; 16];
+        event_id.copy_from_slice(&digest.as_bytes()[..16]);
+        let key_package = MlsKeyPackageEnvelope {
+            event_id,
+            invitee_device: [0x82; 32],
+            group_id: [0x83; 16].to_vec(),
+            key_package: package_bytes,
+        };
+        let payload = encode_mls_key_package(&key_package).unwrap();
+        let (mut writer, mut reader) = duplex(1024);
+        write_frame(&mut writer, FRAME_MLS_KEY_PACKAGE, 4, &payload)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_frame(&mut reader).await.unwrap(),
+            Frame::MlsKeyPackage {
+                sequence: 4,
+                key_package,
             }
         );
     }

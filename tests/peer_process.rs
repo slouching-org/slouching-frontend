@@ -190,6 +190,11 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 peer::PeerEvent::MlsProposalReceived {
                     sequence, proposal, ..
                 } if proposal.event_id[0] != 0xfe => Some((*sequence, None)),
+                peer::PeerEvent::MlsKeyPackageReceived {
+                    sequence,
+                    key_package,
+                    ..
+                } if key_package.event_id[0] != 0xfe => Some((*sequence, None)),
                 _ => None,
             };
             if let Some((sequence, rejection)) = inbound_action {
@@ -248,6 +253,13 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
         })
         .await
         .expect("session should accept an MLS proposal");
+    command_tx
+        .send(peer::PeerCommand::SendMlsKeyPackage {
+            request_id: 107,
+            key_package: mls_key_package_for(role, 107),
+        })
+        .await
+        .expect("session should accept an MLS KeyPackage");
     if role == "sender" {
         command_tx
             .send(peer::PeerCommand::RequestMlsCommit {
@@ -266,6 +278,8 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
     let mut commit_rejected = false;
     let mut proposal_acknowledged = false;
     let mut proposal_received = false;
+    let mut key_package_acknowledged = false;
+    let mut key_package_received = false;
     let mut commit_request_received = role != "listener";
     let mut recovered_commit_received = role == "listener";
     let mut recovered_commit_acknowledged = role == "sender";
@@ -278,6 +292,8 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
         || !commit_rejected
         || !proposal_acknowledged
         || !proposal_received
+        || !key_package_acknowledged
+        || !key_package_received
         || !commit_request_received
         || !recovered_commit_received
         || !recovered_commit_acknowledged
@@ -317,6 +333,11 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 assert_eq!(request_id, 105);
                 assert!(!proposal_acknowledged, "duplicate MLS proposal ACK");
                 proposal_acknowledged = true;
+            }
+            peer::PeerEvent::MlsKeyPackageAcknowledged { request_id } => {
+                assert_eq!(request_id, 107);
+                assert!(!key_package_acknowledged, "duplicate MLS KeyPackage ACK");
+                key_package_acknowledged = true;
             }
             peer::PeerEvent::Received { sequence, text } => {
                 let expected_role = if role == "listener" {
@@ -376,6 +397,29 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                     "duplicate proposal receive sequence"
                 );
                 proposal_received = true;
+            }
+            peer::PeerEvent::MlsKeyPackageReceived {
+                sequence,
+                key_package,
+                ..
+            } => {
+                let expected_role = if role == "listener" {
+                    "sender"
+                } else {
+                    "listener"
+                };
+                assert_eq!(key_package, mls_key_package_for(expected_role, 107));
+                assert!(
+                    received.insert(sequence),
+                    "duplicate KeyPackage receive sequence"
+                );
+                key_package_received = true;
+            }
+            peer::PeerEvent::MlsKeyPackageRejected { request_id, reason } => {
+                panic!("KeyPackage {request_id} was unexpectedly rejected: {reason}")
+            }
+            peer::PeerEvent::MlsKeyPackageDeliveryUnknown { request_id } => {
+                panic!("KeyPackage {request_id} unexpectedly became unknown before disconnect")
             }
             peer::PeerEvent::MlsProposalRejected { request_id, reason } => {
                 panic!("proposal {request_id} was unexpectedly rejected: {reason}")
@@ -496,7 +540,11 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 | peer::PeerEvent::MlsCommitRequested { .. }
                 | peer::PeerEvent::MlsProposalReceived { .. }
                 | peer::PeerEvent::MlsProposalAcknowledged { .. }
-                | peer::PeerEvent::MlsProposalRejected { .. } => {}
+                | peer::PeerEvent::MlsProposalRejected { .. }
+                | peer::PeerEvent::MlsKeyPackageReceived { .. }
+                | peer::PeerEvent::MlsKeyPackageAcknowledged { .. }
+                | peer::PeerEvent::MlsKeyPackageRejected { .. }
+                | peer::PeerEvent::MlsKeyPackageDeliveryUnknown { .. } => {}
                 peer::PeerEvent::Rejected { reason, .. } => {
                     panic!("unexpected rejection: {reason}")
                 }
@@ -521,7 +569,11 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 | peer::PeerEvent::Acknowledged { .. }
                 | peer::PeerEvent::MlsEventAcknowledged { .. }
                 | peer::PeerEvent::MlsCommitRequested { .. }
-                | peer::PeerEvent::MlsProposalAcknowledged { .. } => {}
+                | peer::PeerEvent::MlsProposalAcknowledged { .. }
+                | peer::PeerEvent::MlsKeyPackageReceived { .. }
+                | peer::PeerEvent::MlsKeyPackageAcknowledged { .. }
+                | peer::PeerEvent::MlsKeyPackageRejected { .. }
+                | peer::PeerEvent::MlsKeyPackageDeliveryUnknown { .. } => {}
                 peer::PeerEvent::MlsEventReceived { event, .. } if event.event_id[0] == 0xfe => {
                     got_unacknowledged = true;
                 }
@@ -624,6 +676,24 @@ fn mls_proposal_for(role: &str, id: u8) -> peer::MlsProposalEnvelope {
     }
 }
 
+fn mls_key_package_for(role: &str, id: u8) -> peer::MlsKeyPackageEnvelope {
+    let seed = if role == "sender" {
+        SENDER_SEED
+    } else {
+        LISTENER_SEED
+    };
+    let key_package = format!("public MLS KeyPackage bytes {role} {id}").into_bytes();
+    let digest = blake3::hash(&key_package);
+    let mut event_id = [0; 16];
+    event_id.copy_from_slice(&digest.as_bytes()[..16]);
+    peer::MlsKeyPackageEnvelope {
+        event_id,
+        invitee_device: SigningKey::from_bytes(&seed).verifying_key().to_bytes(),
+        group_id: [0x35; 16].to_vec(),
+        key_package,
+    }
+}
+
 async fn assert_no_application_session(session: peer::DirectPeerSession) {
     let (command_tx, command_rx) = mpsc::channel(4);
     let mut events = Box::pin(session.run(command_rx));
@@ -653,12 +723,15 @@ async fn assert_no_application_session(session: peer::DirectPeerSession) {
             | peer::PeerEvent::MlsCommitReceived { .. }
             | peer::PeerEvent::MlsCommitAcknowledged { .. }
             | peer::PeerEvent::MlsProposalReceived { .. }
-            | peer::PeerEvent::MlsProposalAcknowledged { .. } => {
+            | peer::PeerEvent::MlsProposalAcknowledged { .. }
+            | peer::PeerEvent::MlsKeyPackageReceived { .. }
+            | peer::PeerEvent::MlsKeyPackageAcknowledged { .. } => {
                 panic!("wrong pinned device exchanged an MLS event")
             }
             peer::PeerEvent::MlsEventRejected { .. }
             | peer::PeerEvent::MlsCommitRejected { .. }
-            | peer::PeerEvent::MlsProposalRejected { .. } => {
+            | peer::PeerEvent::MlsProposalRejected { .. }
+            | peer::PeerEvent::MlsKeyPackageRejected { .. } => {
                 panic!("wrong pinned device exchanged an MLS event")
             }
             peer::PeerEvent::Disconnected { .. } => break,
@@ -669,6 +742,7 @@ async fn assert_no_application_session(session: peer::DirectPeerSession) {
             peer::PeerEvent::MlsEventDeliveryUnknown { .. } => {}
             peer::PeerEvent::MlsCommitDeliveryUnknown { .. } => {}
             peer::PeerEvent::MlsProposalDeliveryUnknown { .. } => {}
+            peer::PeerEvent::MlsKeyPackageDeliveryUnknown { .. } => {}
             peer::PeerEvent::MlsCommitRequested { .. } => {}
         }
     }

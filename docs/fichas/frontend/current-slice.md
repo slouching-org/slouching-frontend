@@ -2,8 +2,10 @@
 
 **Status:** eleven design-board screens plus a native MLS group screen. Direct
 LAN chat uses pinned Ed25519 device identities and persistent Iroh/QUIC
-sessions. MLS group setup supports manual KeyPackage, Welcome, and ratchet-tree
-exchange over a trusted channel. For an already joined group, MLS application
+sessions. MLS group setup can send a device-bound KeyPackage over the active
+pinned session; the committer reviews and admits it after matching the package
+identity to the transport peer. Welcome and ratchet-tree exchange remain
+manual over a trusted channel. For an already joined group, MLS application
 messages are encrypted with OpenMLS and sent over the active direct session.
 The receiver validates the sender binding and event metadata, advances the
 ratchet, stores ciphertext and the local transcript in SQLCipher, then ACKs.
@@ -64,5 +66,5 @@ screen capture, contact discovery, verified pairing, multi-peer group fan-out,
 relay, and offline delivery are not implemented. The older web UI under
 `prototypes/web/` is a design benchmark, not the product runtime.
 
-See [direct peer transport v5](../transport/lan-peer-v5.md) for the direct session
+See [direct peer transport v6](../transport/lan-peer-v6.md) for the direct session
 contract and [the Iced design plan](iced-design.md) for visual references.

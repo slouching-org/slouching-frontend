@@ -151,6 +151,8 @@ impl Screen {
     }
 }
 
+type PendingPeerKeyPackage = (u64, [u8; 32], Vec<u8>, Vec<u8>);
+
 struct Slouching {
     backend: BackendConnection,
     transport: TransportState,
@@ -209,10 +211,12 @@ struct Slouching {
     mls_history_group: Option<Vec<u8>>,
     mls_pending_commits: Vec<storage::StoredMlsCommit>,
     mls_pending_proposals: Vec<storage::StoredMlsProposal>,
+    mls_pending_peer_key_package: Option<PendingPeerKeyPackage>,
     mls_commit_recipients: Vec<storage::MlsCommitRecipientStatus>,
     mls_pending_events: std::collections::HashMap<u64, [u8; 16]>,
     mls_sending_commits: std::collections::HashMap<u64, [u8; 16]>,
     mls_sending_proposals: std::collections::HashSet<u64>,
+    mls_sending_key_packages: std::collections::HashSet<u64>,
     mls_next_request_id: u64,
 }
 
@@ -344,10 +348,12 @@ impl Default for Slouching {
             mls_history_group: None,
             mls_pending_commits: Vec::new(),
             mls_pending_proposals: Vec::new(),
+            mls_pending_peer_key_package: None,
             mls_commit_recipients: Vec::new(),
             mls_pending_events: std::collections::HashMap::new(),
             mls_sending_commits: std::collections::HashMap::new(),
             mls_sending_proposals: std::collections::HashSet::new(),
+            mls_sending_key_packages: std::collections::HashSet::new(),
             mls_next_request_id: 1,
         }
     }
@@ -459,6 +465,8 @@ enum Message {
         Result<Vec<storage::MlsCommitRecipientStatus>, String>,
     ),
     MlsPendingProposalsLoaded(Vec<u8>, Result<Vec<storage::StoredMlsProposal>, String>),
+    SendMlsKeyPackage,
+    MlsKeyPackageCommandSent(u64, Result<(), String>),
     RetryQueuedMlsEvents,
     MlsOutboxLoaded(Vec<u8>, Result<Vec<storage::StoredOutboundEvent>, String>),
     SendMlsApplication,
@@ -935,6 +943,43 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                             },
                         );
                     }
+                    peer::PeerEvent::MlsKeyPackageReceived {
+                        sequence,
+                        peer_id,
+                        key_package,
+                    } => {
+                        let pinned_peer = *peer_id.as_bytes();
+                        let selected_group = hex_decode_bytes(&state.mls_group_id).ok();
+                        let rejection = if key_package.invitee_device != pinned_peer {
+                            Some("KeyPackage identity does not match the pinned peer")
+                        } else if selected_group.as_deref() != Some(key_package.group_id.as_slice())
+                        {
+                            Some("open the matching MLS group before receiving its KeyPackage")
+                        } else if state.mls_pending_peer_key_package.is_some() {
+                            Some("another peer KeyPackage is already awaiting review")
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = rejection {
+                            if let Some(commands) = state.peer_session_commands.as_ref() {
+                                let _ = commands.try_send(peer::PeerCommand::RejectInbound {
+                                    sequence,
+                                    reason: reason.to_owned(),
+                                });
+                            }
+                            state.mls_status = format!("KeyPackage rejeitado: {reason}.");
+                        } else {
+                            state.mls_invite_key_package =
+                                hex_encode_bytes(&key_package.key_package);
+                            state.mls_pending_peer_key_package = Some((
+                                sequence,
+                                pinned_peer,
+                                key_package.group_id,
+                                key_package.key_package,
+                            ));
+                            state.mls_status = "KeyPackage do peer fixado recebido. Revise o grupo e clique em Validar e admitir membro para persistir o Commit.".into();
+                        }
+                    }
                     peer::PeerEvent::MlsCommitRequested {
                         peer_id,
                         group_id,
@@ -1001,6 +1046,28 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         state.mls_sending_proposals.remove(&request_id);
                         state.mls_status = format!(
                             "Entrega da proposta MLS {request_id} desconhecida; reenvie os mesmos bytes para evitar proposta duplicada."
+                        );
+                    }
+                    peer::PeerEvent::MlsKeyPackageAcknowledged { request_id } => {
+                        if !state.mls_sending_key_packages.remove(&request_id) {
+                            state.mls_status =
+                                "ACK de KeyPackage desconhecido; sessão encerrada.".into();
+                            if let Some(commands) = state.peer_session_commands.as_ref() {
+                                let _ = commands.try_send(peer::PeerCommand::Disconnect);
+                            }
+                            return Task::none();
+                        }
+                        state.mls_status = "O committer autenticou e admitiu o KeyPackage; compartilhe Welcome e ratchet tree para concluir a entrada neste peer.".into();
+                    }
+                    peer::PeerEvent::MlsKeyPackageRejected { request_id, reason } => {
+                        state.mls_sending_key_packages.remove(&request_id);
+                        state.mls_status =
+                            format!("KeyPackage {request_id} rejeitado pelo committer: {reason}");
+                    }
+                    peer::PeerEvent::MlsKeyPackageDeliveryUnknown { request_id } => {
+                        state.mls_sending_key_packages.remove(&request_id);
+                        state.mls_status = format!(
+                            "Entrega do KeyPackage {request_id} desconhecida; envie novamente pelo mesmo peer."
                         );
                     }
                     peer::PeerEvent::MlsCommitRejected { request_id, reason } => {
@@ -1254,6 +1321,74 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             }
             Err(error) => state.mls_status = format!("Falha ao preparar pacote: {error}"),
         },
+        Message::SendMlsKeyPackage => {
+            let Some(commands) = state.peer_session_commands.clone() else {
+                state.mls_status =
+                    "Conecte-se diretamente ao committer antes de enviar o KeyPackage.".into();
+                return Task::none();
+            };
+            let group_id = match hex_decode_bytes(&state.mls_group_id) {
+                Ok(group_id) if group_id.len() == 16 => group_id,
+                _ => {
+                    state.mls_status = "Informe o ID do grupo MLS para este convite.".into();
+                    return Task::none();
+                }
+            };
+            let key_package = match hex_decode_bytes(&state.mls_key_package) {
+                Ok(bytes) if !bytes.is_empty() => bytes,
+                Ok(_) => {
+                    state.mls_status = "Gere um KeyPackage antes de enviá-lo.".into();
+                    return Task::none();
+                }
+                Err(error) => {
+                    state.mls_status = format!("KeyPackage inválido: {error}");
+                    return Task::none();
+                }
+            };
+            let invitee_device = match state.identity_status {
+                IdentityStatus::Ready(public_key) => public_key,
+                _ => {
+                    state.mls_status = "Carregue a identidade do dispositivo primeiro.".into();
+                    return Task::none();
+                }
+            };
+            let digest = blake3::hash(&key_package);
+            let mut event_id = [0; 16];
+            event_id.copy_from_slice(&digest.as_bytes()[..16]);
+            let envelope = peer::MlsKeyPackageEnvelope {
+                event_id,
+                invitee_device,
+                group_id,
+                key_package,
+            };
+            let request_id = state.mls_next_request_id;
+            state.mls_next_request_id = state.mls_next_request_id.saturating_add(1);
+            state.mls_sending_key_packages.insert(request_id);
+            state.mls_status = "Enviando KeyPackage público pela sessão fixada…".into();
+            return Task::perform(
+                async move {
+                    commands
+                        .send(peer::PeerCommand::SendMlsKeyPackage {
+                            request_id,
+                            key_package: envelope,
+                        })
+                        .await
+                        .map_err(|error| error.to_string())
+                },
+                move |result| Message::MlsKeyPackageCommandSent(request_id, result),
+            );
+        }
+        Message::MlsKeyPackageCommandSent(request_id, result) => match result {
+            Ok(()) => {
+                state.mls_status = format!(
+                    "KeyPackage {request_id} enviado; aguardando o committer validar e admitir o membro."
+                );
+            }
+            Err(error) => {
+                state.mls_sending_key_packages.remove(&request_id);
+                state.mls_status = format!("Falha ao enviar KeyPackage {request_id}: {error}");
+            }
+        },
         Message::AdmitMlsMember => {
             if state.mls_quarantine_reason.is_some() {
                 state.mls_status =
@@ -1275,26 +1410,78 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 }
             };
             state.mls_status = "Validando pacote e criando Commit/Welcome…".into();
+            if let Some((_, peer_device, expected_group, expected_package)) =
+                state.mls_pending_peer_key_package.as_ref()
+            {
+                if &group_id != expected_group || &package != expected_package {
+                    state.mls_status = "O KeyPackage recebido foi alterado; recarregue-o do peer antes de admitir.".into();
+                    return Task::none();
+                }
+                let peer_device = *peer_device;
+                return Task::perform(
+                    admit_mls_member_from_peer_task(group_id, package, peer_device),
+                    Message::MlsMemberAdded,
+                );
+            }
             return Task::perform(
                 admit_mls_member_task(group_id, package),
                 Message::MlsMemberAdded,
             );
         }
-        Message::MlsMemberAdded(result) => match result {
-            Ok(admission) => {
-                state.mls_commit = hex_encode_bytes(&admission.commit);
-                state.mls_welcome = hex_encode_bytes(&admission.welcome);
-                state.mls_ratchet_tree = hex_encode_bytes(&admission.ratchet_tree);
-                state.mls_status = format!(
-                    "Commit {} salvo no outbox local; envie também aos membros MLS existentes. Envie Welcome e ratchet tree ao convidado (epoch {}).",
-                    hex_encode_bytes(&admission.commit_event_id[..4]),
-                    admission.epoch
-                );
-                let history = load_mls_history(state, admission.group_id);
-                return Task::batch([history, load_mls_groups()]);
+        Message::MlsMemberAdded(result) => {
+            match result {
+                Ok(admission) => {
+                    let mut key_package_ack_error = None;
+                    if let Some((sequence, peer_device, _, _)) =
+                        state.mls_pending_peer_key_package.take()
+                    {
+                        if admission.invited_device != peer_device {
+                            if let Some(commands) = state.peer_session_commands.as_ref() {
+                                let _ = commands.try_send(peer::PeerCommand::RejectInbound {
+                                    sequence,
+                                    reason: "KeyPackage member does not match pinned peer".into(),
+                                });
+                            }
+                            state.mls_status = "KeyPackage rejeitado: identidade do membro diverge do peer fixado.".into();
+                            return Task::none();
+                        }
+                        if let Some(commands) = state.peer_session_commands.as_ref()
+                            && let Err(error) =
+                                commands.try_send(peer::PeerCommand::AcceptInbound { sequence })
+                        {
+                            key_package_ack_error = Some(error.to_string());
+                        }
+                    }
+                    state.mls_commit = hex_encode_bytes(&admission.commit);
+                    state.mls_welcome = hex_encode_bytes(&admission.welcome);
+                    state.mls_ratchet_tree = hex_encode_bytes(&admission.ratchet_tree);
+                    state.mls_status = if let Some(error) = key_package_ack_error {
+                        format!(
+                            "Convite salvo localmente, mas não foi possível confirmar o KeyPackage ao peer: {error}. Compartilhe Welcome e ratchet tree por canal confiável."
+                        )
+                    } else {
+                        format!(
+                            "Commit {} salvo no outbox local; envie também aos membros MLS existentes. Envie Welcome e ratchet tree ao convidado (epoch {}).",
+                            hex_encode_bytes(&admission.commit_event_id[..4]),
+                            admission.epoch
+                        )
+                    };
+                    let history = load_mls_history(state, admission.group_id);
+                    return Task::batch([history, load_mls_groups()]);
+                }
+                Err(error) => {
+                    if let Some((sequence, _, _, _)) = state.mls_pending_peer_key_package.take()
+                        && let Some(commands) = state.peer_session_commands.as_ref()
+                    {
+                        let _ = commands.try_send(peer::PeerCommand::RejectInbound {
+                            sequence,
+                            reason: error.clone(),
+                        });
+                    }
+                    state.mls_status = format!("Falha ao admitir membro: {error}");
+                }
             }
-            Err(error) => state.mls_status = format!("Falha ao admitir membro: {error}"),
-        },
+        }
         Message::JoinMlsGroup => {
             let welcome = match hex_decode_bytes(&state.mls_welcome) {
                 Ok(value) => value,
@@ -2455,6 +2642,18 @@ async fn admit_mls_member_task(
         .map_err(|error| format!("MLS member admission task failed: {error}"))?
 }
 
+async fn admit_mls_member_from_peer_task(
+    group_id: Vec<u8>,
+    package: Vec<u8>,
+    pinned_peer_device: [u8; 32],
+) -> Result<storage::AddedMlsMember, String> {
+    tokio::task::spawn_blocking(move || {
+        storage::add_mls_group_member_from_peer(&group_id, &package, pinned_peer_device)
+    })
+    .await
+    .map_err(|error| format!("pinned MLS member admission task failed: {error}"))?
+}
+
 async fn create_mls_update_proposal_task(
     group_id: Vec<u8>,
 ) -> Result<storage::PreparedMlsUpdateProposal, String> {
@@ -2854,6 +3053,7 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
         peer::PeerEvent::MlsEventReceived { .. } => {}
         peer::PeerEvent::MlsCommitReceived { .. } => {}
         peer::PeerEvent::MlsProposalReceived { .. } => {}
+        peer::PeerEvent::MlsKeyPackageReceived { .. } => {}
         peer::PeerEvent::MlsCommitRequested { .. } => {}
         peer::PeerEvent::MlsEventAcknowledged { request_id } => {
             state.peer_send_status = PeerSendStatus::Failed(format!(
@@ -2874,7 +3074,10 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
         | peer::PeerEvent::MlsCommitDeliveryUnknown { .. }
         | peer::PeerEvent::MlsProposalAcknowledged { .. }
         | peer::PeerEvent::MlsProposalRejected { .. }
-        | peer::PeerEvent::MlsProposalDeliveryUnknown { .. } => {}
+        | peer::PeerEvent::MlsProposalDeliveryUnknown { .. }
+        | peer::PeerEvent::MlsKeyPackageAcknowledged { .. }
+        | peer::PeerEvent::MlsKeyPackageRejected { .. }
+        | peer::PeerEvent::MlsKeyPackageDeliveryUnknown { .. } => {}
         peer::PeerEvent::Unauthorized { .. } => {
             state.peer_listen_status = PeerListenStatus::Unauthorized(
                 "peer não corresponde à chave pública fixada".to_owned(),
