@@ -116,6 +116,12 @@ two-member call MLS group, and each participant starts the call from the
 cannot verify MLS membership independently. A smoke test covers two software
 clients and protected audio forwarded by a local helper; physical audio
 devices and different networks have not been tested.
+For a remote helper, expose its signaling as WSS and set
+`SLOUCHING_SFU_PUBLIC_IP` plus `SLOUCHING_SFU_UDP_PORT_RANGE` on the Elixir
+service when its public address is behind one-to-one NAT. Open and forward
+that UDP range to the helper. SFU media has no TURN/TCP fallback, so both
+client networks must permit outbound UDP. The clients can join the SFU without
+an active direct P2P connection once they share the call MLS group.
 From the project root, `./scripts/smoke-gateway-auth-e2e.sh` starts an isolated
 SQLite-backed Elixir helper and verifies device authentication, Ping/Pong,
 signed roster admission, SDP negotiation, ICE/DTLS, and protected audio
