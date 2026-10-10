@@ -278,7 +278,7 @@ pub fn encrypt_file_stream<R: Read, W: Write>(
     let mut digest = blake3::Hasher::new();
     for index in 0..count {
         let length = expected_plaintext_chunk_len(total_bytes, index)?;
-        let mut plaintext = vec![0; length];
+        let mut plaintext = Zeroizing::new(vec![0; length]);
         reader
             .read_exact(&mut plaintext)
             .map_err(|error| format!("file source ended before its declared size: {error}"))?;
@@ -287,7 +287,6 @@ pub fn encrypt_file_stream<R: Read, W: Write>(
         writer
             .write_all(&ciphertext)
             .map_err(|error| format!("could not write encrypted file chunk: {error}"))?;
-        plaintext.zeroize();
     }
     let mut extra = [0; 1];
     if reader
@@ -320,13 +319,17 @@ pub fn decrypt_file_stream<R: Read, W: Write>(
             .read_exact(&mut ciphertext)
             .map_err(|error| format!("encrypted file stream is truncated: {error}"))?;
         digest.update(&ciphertext);
-        let mut plaintext =
-            decrypt_chunk(transfer_id, content_key, total_bytes, index, &ciphertext)?;
+        let plaintext = Zeroizing::new(decrypt_chunk(
+            transfer_id,
+            content_key,
+            total_bytes,
+            index,
+            &ciphertext,
+        )?);
         writer
             .write_all(&plaintext)
             .map_err(|error| format!("could not write decrypted file chunk: {error}"))?;
         ciphertext.zeroize();
-        plaintext.zeroize();
     }
     let mut extra = [0; 1];
     if reader
