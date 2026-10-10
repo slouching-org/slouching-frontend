@@ -1,9 +1,51 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 const DOMAIN: &[u8] = b"slouching/device-identity/mls-signing-key-binding";
+const CONTACT_PAIRING_IDENTITY_DOMAIN: &[u8] = b"slouching/contact-pairing/device-identity/v1\0";
 const SERIALIZED_BINDING_MAGIC: &[u8; 4] = b"SLMB";
 const MAX_SERIALIZED_MLS_KEY_BYTES: usize = 16 * 1024;
 pub const BINDING_VERSION: u16 = 1;
+
+/// Public device key signed for one fresh, confirmed contact-pairing transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactIdentityProof {
+    pub device_key: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+impl ContactIdentityProof {
+    pub fn sign(identity: &SigningKey, transcript_hash: &[u8; 32]) -> Self {
+        let device_key = identity.verifying_key().to_bytes();
+        let signature = identity.sign(&contact_pairing_identity_payload(
+            &device_key,
+            transcript_hash,
+        ));
+        Self {
+            device_key,
+            signature: signature.to_bytes(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn verify(&self, transcript_hash: &[u8; 32]) -> bool {
+        let Ok(key) = VerifyingKey::from_bytes(&self.device_key) else {
+            return false;
+        };
+        key.verify_strict(
+            &contact_pairing_identity_payload(&self.device_key, transcript_hash),
+            &Signature::from_bytes(&self.signature),
+        )
+        .is_ok()
+    }
+}
+
+fn contact_pairing_identity_payload(device_key: &[u8; 32], transcript_hash: &[u8; 32]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(CONTACT_PAIRING_IDENTITY_DOMAIN.len() + 64);
+    payload.extend_from_slice(CONTACT_PAIRING_IDENTITY_DOMAIN);
+    payload.extend_from_slice(transcript_hash);
+    payload.extend_from_slice(device_key);
+    payload
+}
 
 /// Proof that a device identity authorized one MLS signing key and scheme.
 #[derive(Debug, Clone, PartialEq, Eq)]

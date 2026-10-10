@@ -74,6 +74,29 @@ not establish a peer session. The UI shows connection and protocol errors
 separately. **Refresh backend** repeats both
 the HTTP diagnostic and WebSocket handshake.
 
+## Pair contacts with a one time code (experimental)
+
+The identity screen includes the optional Elixir SPAKE2 rendezvous flow. Run
+the sibling backend with its pairing helper enabled and reachable over HTTPS
+from both devices. For a local-only test, `http://127.0.0.1:3707` is accepted;
+plain HTTP on a non-loopback host is rejected.
+
+On the inviter device, create an invite, share the session ID and the generated
+one-time code with the contact through separate trusted channels, then start as
+host. On the invitee device, enter both values and start as guest. Both devices
+must have a device identity loaded from Secret Service and finish within the
+helper's 120-second lifetime. The helper relays SPAKE2 messages, confirmation
+tags, and an encrypted signed device identity; it does not receive the code or
+the signing key. A successful pairing fills in the peer device key. It does not
+automatically mark that person trusted: compare the displayed fingerprint with
+the person and choose **Marcar como conferida** only after confirming identity.
+Cancel deletes the temporary helper session.
+
+This is an experimental contact-pairing path. It does not make peers reachable
+across NAT, establish messaging by itself, or replace transport/network setup.
+The helper contract and limits are in
+[`docs/fichas/identity/pairing-rendezvous-v1.md`](../../docs/fichas/identity/pairing-rendezvous-v1.md).
+
 ## Camera video in a call
 
 The **Câmera** tab in **Escolher tela** enumerates native camera devices. Use
@@ -548,6 +571,7 @@ SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-capture
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 11-mls --capture-mls-attachment
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 02-settings --settings-tab 1
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-verification
+SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-contact-pairing
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 04-connecting --capture-lan-discovery
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-invite
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-invite-imported
@@ -584,6 +608,12 @@ live listener.
 screen capture and its derived 256-bit fingerprint; they are fixtures, not
 identities from the keyring. Refresh the identity screenshot from a graphical
 Wayland or X11 session; this checkout has no display server.
+`--capture-contact-pairing` shows the experimental code-pairing controls with
+sample session and code values; they are fixtures and cannot connect to a peer.
+Refreshing this capture was attempted after adding the controls, but this
+checkout has no Wayland or X11 display (`neither WAYLAND_DISPLAY nor
+WAYLAND_SOCKET nor DISPLAY is set`). Run the command above in a graphical
+session to produce the actual Iced screenshot.
 `--capture-peer-invite` supplies a signed sample invitation and renders its QR
 in the identity screen; its keys and address are fixtures.
 `--capture-peer-invite-imported` shows the selectable LAN and VPN addresses

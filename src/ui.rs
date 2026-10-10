@@ -3456,20 +3456,108 @@ fn verification(state: &Slouching, l: Layout) -> Element<'_, Message> {
         ]
         .spacing(l.px(12.0)),
     );
-    let body = column![
+    let pairing = l.panel(
         column![
-            l.title("Conferir identidade do peer", 32.0),
+            l.label("PAREAMENTO POR CÓDIGO · HELPER HTTPS", 10.0, GOLD),
             l.label(
-                "VERIFICAÇÃO MANUAL · CHAVE DO DISPOSITIVO · ARMAZENAMENTO LOCAL",
+                "O código secreto protege a troca. Compartilhe o ID da sessão e o código por canais separados.",
                 10.0,
-                VIOLET
+                MUTED
+            ),
+            l.input_maybe(
+                "http://127.0.0.1:3707",
+                &state.pairing_helper_url,
+                (!state.pairing_working)
+                    .then_some(Message::PairingHelperUrlChanged as fn(String) -> Message)
+            ),
+            row![
+                l.input_maybe(
+                    "ID da sessão",
+                    &state.pairing_session_id,
+                    (!state.pairing_working)
+                        .then_some(Message::PairingSessionIdChanged as fn(String) -> Message)
+                ),
+                l.control(
+                    "key",
+                    "Copiar ID",
+                    (!state.pairing_session_id.is_empty())
+                        .then(|| Message::CopyMlsValue(state.pairing_session_id.clone())),
+                    false
+                ),
+                l.input_maybe(
+                    "Código de pareamento",
+                    &state.pairing_code,
+                    (!state.pairing_working)
+                        .then_some(Message::PairingCodeChanged as fn(String) -> Message)
+                ),
+                l.control(
+                    "key",
+                    "Copiar código",
+                    (!state.pairing_code.is_empty())
+                        .then(|| Message::CopyMlsValue(state.pairing_code.clone())),
+                    false
+                )
+            ]
+            .spacing(l.px(6.0)),
+            row![
+                l.control(
+                    "key",
+                    "Criar convite (anfitrião)",
+                    (!state.pairing_working).then_some(Message::CreatePairingSession),
+                    false
+                ),
+                l.control(
+                    "check",
+                    "Iniciar como anfitrião",
+                    (!state.pairing_working
+                        && !state.pairing_session_id.is_empty()
+                        && !state.pairing_code.is_empty())
+                        .then_some(Message::StartContactPairing(crate::pairing_client::PairingRole::Inviter)),
+                    false
+                ),
+                l.control(
+                    "check",
+                    "Entrar como convidado",
+                    (!state.pairing_working
+                        && !state.pairing_session_id.is_empty()
+                        && !state.pairing_code.is_empty())
+                        .then_some(Message::StartContactPairing(crate::pairing_client::PairingRole::Invitee)),
+                    false
+                ),
+                l.control(
+                    "close",
+                    "Cancelar",
+                    state.pairing_working.then_some(Message::CancelContactPairing),
+                    false
+                )
+            ]
+            .spacing(l.px(6.0)),
+            l.label(
+                state.pairing_status.clone(),
+                10.0,
+                if state.pairing_working { GOLD } else { GREEN }
             )
         ]
         .spacing(l.px(8.0)),
-        row![own, peer].spacing(l.px(16.0)),
-        instructions
-    ]
-    .spacing(l.px(16.0));
+    );
+    let body = scrollable(
+        column![
+            column![
+                l.title("Conferir identidade do peer", 32.0),
+                l.label(
+                    "VERIFICAÇÃO MANUAL · CHAVE DO DISPOSITIVO · ARMAZENAMENTO LOCAL",
+                    10.0,
+                    VIOLET
+                )
+            ]
+            .spacing(l.px(8.0)),
+            pairing,
+            row![own, peer].spacing(l.px(16.0)),
+            instructions
+        ]
+        .spacing(l.px(16.0)),
+    )
+    .height(Fill);
     l.place(l.panel(body), 24.0, 80.0, 1232.0, 676.0)
 }
 

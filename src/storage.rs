@@ -3902,6 +3902,19 @@ pub fn sign_mls_identity_binding(
     )
 }
 
+/// Signs this fresh contact-pairing transcript with the existing device identity.
+pub fn sign_contact_identity_proof(
+    transcript_hash: &[u8; 32],
+) -> Result<([u8; 32], [u8; 64]), String> {
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let signing_key = signing_key_from_secret(secret)?;
+    let proof = crate::identity::ContactIdentityProof::sign(&signing_key, transcript_hash);
+    Ok((proof.device_key, proof.signature))
+}
+
 /// Creates or loads this device's MLS signing key for the caller-selected suite,
 /// persists it in the encrypted local database, and signs its public key with
 /// the existing long-term device identity.

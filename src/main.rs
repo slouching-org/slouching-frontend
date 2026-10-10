@@ -13,6 +13,7 @@ pub mod file_transfer;
 pub mod identity;
 pub mod lan_discovery;
 pub mod media;
+pub mod pairing_client;
 pub mod pairing_spake2;
 mod peer;
 mod peer_invite;
@@ -276,6 +277,12 @@ struct Slouching {
     peer_verification_loaded_for: Option<String>,
     peer_key_verified: bool,
     peer_verification_status: String,
+    pairing_helper_url: String,
+    pairing_session_id: String,
+    pairing_code: String,
+    pairing_status: String,
+    pairing_working: bool,
+    pairing_generation: u64,
     active_peer_device: Option<[u8; 32]>,
     helper_listener_active: bool,
     peer_listener_port: Option<u16>,
@@ -485,6 +492,12 @@ impl Default for Slouching {
             peer_key_verified: false,
             peer_verification_status: "Compare a chave completa por um canal independente."
                 .to_owned(),
+            pairing_helper_url: "http://127.0.0.1:3707".to_owned(),
+            pairing_session_id: String::new(),
+            pairing_code: String::new(),
+            pairing_status: "Pareamento por código ainda não iniciado.".to_owned(),
+            pairing_working: false,
+            pairing_generation: 0,
             active_peer_device: None,
             helper_listener_active: false,
             peer_listener_port: None,
@@ -642,6 +655,15 @@ enum Message {
     IdentityLoaded(Result<Option<[u8; 32]>, String>),
     CreateIdentity,
     IdentityCreated(Result<[u8; 32], String>),
+    PairingHelperUrlChanged(String),
+    PairingSessionIdChanged(String),
+    PairingCodeChanged(String),
+    CreatePairingSession,
+    PairingSessionCreated(Result<(String, String), String>),
+    StartContactPairing(pairing_client::PairingRole),
+    ContactPairingCompleted(u64, Result<[u8; 32], String>),
+    CancelContactPairing,
+    ContactPairingCanceled(u64, Result<(), String>),
     DelegatedMlsStorageLoaded(Result<storage::DelegatedMlsStorageStatus, String>),
     SetDelegatedMlsStorage(bool),
     DelegatedMlsStorageSaved(bool, Result<storage::DelegatedMlsStorageStatus, String>),
@@ -2034,6 +2056,103 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 state.identity_status = IdentityStatus::Failed;
             }
         },
+        Message::PairingHelperUrlChanged(value) => state.pairing_helper_url = value,
+        Message::PairingSessionIdChanged(value) => state.pairing_session_id = value,
+        Message::PairingCodeChanged(value) => state.pairing_code = value,
+        Message::CreatePairingSession => {
+            if state.pairing_working {
+                return Task::none();
+            }
+            let code = match pairing_spake2::PairingCode::generate() {
+                Ok(code) => code,
+                Err(error) => {
+                    state.pairing_status = format!("Não foi possível gerar o código: {error}");
+                    return Task::none();
+                }
+            };
+            let code = code.expose().to_owned();
+            state.pairing_status = "Criando convite temporário…".to_owned();
+            let helper = state.pairing_helper_url.clone();
+            return Task::perform(
+                async move {
+                    pairing_client::create_session(&helper)
+                        .await
+                        .map(|session| (session, code))
+                },
+                Message::PairingSessionCreated,
+            );
+        }
+        Message::PairingSessionCreated(result) => match result {
+            Ok((session, code)) => {
+                state.pairing_session_id = session;
+                state.pairing_code = code;
+                state.pairing_status = "Convite pronto. Compartilhe ID e código por canais separados; inicie como anfitrião.".to_owned();
+            }
+            Err(error) => state.pairing_status = format!("Falha ao criar convite: {error}"),
+        },
+        Message::StartContactPairing(role) => {
+            let IdentityStatus::Ready(local_key) = state.identity_status else {
+                state.pairing_status =
+                    "Carregue ou crie a identidade do dispositivo primeiro.".to_owned();
+                return Task::none();
+            };
+            if state.pairing_working {
+                return Task::none();
+            }
+            state.pairing_generation = state.pairing_generation.saturating_add(1);
+            let generation = state.pairing_generation;
+            state.pairing_working = true;
+            state.pairing_status = "Pareando… mantenha esta tela aberta.".to_owned();
+            let helper = state.pairing_helper_url.clone();
+            let session = state.pairing_session_id.clone();
+            let code = state.pairing_code.clone();
+            return Task::perform(
+                async move {
+                    pairing_client::run_pairing(&helper, &session, &code, role, local_key).await
+                },
+                move |result| Message::ContactPairingCompleted(generation, result),
+            );
+        }
+        Message::ContactPairingCompleted(generation, result) => {
+            if generation != state.pairing_generation {
+                return Task::none();
+            }
+            state.pairing_working = false;
+            match result {
+                Ok(public_key) => {
+                    state.pairing_status = "Identidade autenticada pelo código. Compare o fingerprint com a pessoa antes de marcar como conferida.".to_owned();
+                    return update(
+                        state,
+                        Message::PeerPublicKeyChanged(hex_encode_key(&public_key)),
+                    );
+                }
+                Err(error) => state.pairing_status = format!("Pareamento falhou: {error}"),
+            }
+        }
+        Message::CancelContactPairing => {
+            state.pairing_generation = state.pairing_generation.saturating_add(1);
+            state.pairing_working = false;
+            let helper = state.pairing_helper_url.clone();
+            let session = state.pairing_session_id.clone();
+            let generation = state.pairing_generation;
+            state.pairing_status = "Cancelando convite…".to_owned();
+            return Task::perform(
+                async move { pairing_client::delete_session(&helper, &session).await },
+                move |result| Message::ContactPairingCanceled(generation, result),
+            );
+        }
+        Message::ContactPairingCanceled(generation, result) => {
+            if generation == state.pairing_generation {
+                state.pairing_status = match result {
+                    Ok(()) => "Convite cancelado.".to_owned(),
+                    Err(error) => format!(
+                        "Pareamento interrompido; não foi possível cancelar no helper: {error}"
+                    ),
+                };
+                state.pairing_session_id.clear();
+                state.pairing_code.clear();
+            }
+        }
         Message::CopyDeviceKey => {
             if let IdentityStatus::Ready(public_key) = state.identity_status {
                 state.identity_key_copied = true;
@@ -5436,6 +5555,7 @@ fn boot() -> (Slouching, Task<Message>) {
     let capture_share_camera = args.iter().any(|arg| arg == "--capture-share-camera");
     let capture_share_window = args.iter().any(|arg| arg == "--capture-share-window");
     let capture_peer_verification = args.iter().any(|arg| arg == "--capture-peer-verification");
+    let capture_contact_pairing = args.iter().any(|arg| arg == "--capture-contact-pairing");
     let capture_lan_discovery = args.iter().any(|arg| arg == "--capture-lan-discovery");
     if let Some(pos) = args.iter().position(|s| s == "--screen")
         && let Some(name) = args.get(pos + 1)
@@ -5591,6 +5711,15 @@ fn boot() -> (Slouching, Task<Message>) {
         state.peer_verification_status =
             "Chave conferida e marcada como verificada neste dispositivo.".to_owned();
     }
+    if capture_contact_pairing {
+        state.screen = Screen::Verify;
+        state.identity_status = IdentityStatus::Ready([0x11; 32]);
+        state.pairing_session_id =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned();
+        state.pairing_code = "0123-4567-89AB-CDEF-GHJK".to_owned();
+        state.pairing_status =
+            "Convite de demonstração · valores fictícios; não use para conectar.".to_owned();
+    }
     if capture_lan_discovery {
         state.screen = Screen::Connecting;
         state.identity_status = IdentityStatus::Ready([0x11; 32]);
@@ -5665,7 +5794,7 @@ fn boot() -> (Slouching, Task<Message>) {
         Task::batch([
             Task::perform(fetch_backend_status(), Message::BackendFetched),
             Task::perform(load_profile_task(), Message::ProfileLoaded),
-            if capture_peer_verification {
+            if capture_peer_verification || capture_contact_pairing {
                 Task::none()
             } else {
                 Task::perform(load_identity_task(), Message::IdentityLoaded)

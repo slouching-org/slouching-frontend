@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 iced = { version = "=0.14.0", default-features = false, features = ["wgpu", "x11", "wayland", "image", "svg", "canvas", "tokio"] }
-reqwest = { version = "=0.12.28", default-features = false, features = ["json"] }
+reqwest = { version = "=0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "=0.1.92"
@@ -16,6 +16,7 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi
 tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["connect"] }
 bytes = "=1.12.1"
 hex = "=0.4.3"
+base64 = "=0.22.1"
 
 image_codec = { package = "image", version = "=0.25.10", default-features = false, features = ["png"] }
 directories = "=6.0.0"
