@@ -125,14 +125,16 @@ mute and close the prior media session. The microphone control mutes outgoing
 frames locally.
 
 The **Escolher tela** view uses XCap to enumerate real monitors and capture a
-single still image only after an explicit user action. Blocking enumeration and
-capture run outside Iced's UI thread. This is a local preview only: continuous
-capture, WebRTC transport, and rendering remote video are not implemented, so
-it does not share the image with a peer. An H.264/SFrame frame codec now has a
-local encode-protect-authenticate-decode test, including replay rejection, but
-is not connected to the capture view or call transport. Window and camera
-capture remain unavailable. Contact discovery, automatic pairing, and
-guaranteed offline delivery are also not implemented. The older web UI under
+still image after an explicit user action. During an active call, the user can
+share the selected monitor: capture runs outside Iced's UI thread, H.264 frames
+are protected with the call group's SFrame key, and bounded fragments travel on
+a WebRTC DataChannel. The receiving peer authenticates and decodes complete
+frames before rendering them; a stop signal clears the remote image. Local
+tests cover codec replay rejection, bounded fragmentation, protected frame
+delivery, remote decoding, and stop signaling. Physical-device capture,
+permissions, and VPN delivery still need validation. Window and camera capture
+remain unavailable. Contact discovery, automatic pairing, and guaranteed
+offline delivery are also not implemented. The older web UI under
 `prototypes/web/` is a design benchmark, not the product runtime.
 
 See [direct peer transport v10](../transport/lan-peer-v10.md) for the direct session

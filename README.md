@@ -150,8 +150,8 @@ rejection, and verifies a pending send is reported as unknown on disconnect.
 
 ## Direct voice call with another device
 
-Voice calls are ready for the first physical-device trial, but have only been
-verified with two local WebRTC peers so far. Both devices need an active,
+Voice and screen sharing are ready for the first physical-device trial, but
+have only been verified with two local WebRTC peers so far. Both devices need an active,
 manually pinned direct peer session and membership in the **same dedicated call
 MLS group**.
 
@@ -166,14 +166,21 @@ MLS group**.
    refuse. The app opens the microphone only after acceptance and WebRTC
    connects. **Silenciar microfone** stops outgoing voice frames; **Leave** ends
    the call.
+4. To share a monitor during the call, open **Escolher tela**, select a screen,
+   and click **Compartilhar tela na chamada**. The remote call stage displays
+   authenticated frames after H.264 decoding. Click **Parar compartilhamento**
+   to stop capture and clear the remote image. Window and camera sharing are
+   not implemented.
 
 Voice uses direct WebRTC host candidates over UDP. The manually selected UDP
 port in **Texto direto** carries QUIC signaling; WebRTC also chooses its own
 UDP port dynamically. Allow the app's UDP traffic through both device firewalls
 and the VPN, and make sure the VPN routes between the peers. No STUN/TURN or
 NAT traversal is configured, so this will fail if the VPN or firewall blocks
-the advertised route. Video, calls over a deployed relay, and calls between
-physical devices have not yet been validated.
+the advertised route. Physical-device calls and screen capture, including over
+VPN, have not yet been validated. The local H.264/SFrame/DataChannel test
+covers encode, protection, fragmentation, remote authentication, decoding, and
+stop signaling; it does not replace a two-machine test.
 
 Before trusting a peer's identity, open **Conferir identidade do peer** from
 the shield button, exchange the complete 64-character device keys through a
@@ -377,11 +384,15 @@ local media path, not audio-device behavior between physical computers. Calls
 require both devices to be members of the same dedicated call MLS group, and
 each must select a microphone and output in Settings. The call screen's
 microphone control silences outgoing frames locally. The screen chooser
-enumerates monitors and captures a still preview on demand without sending it to
-a peer. A local H.264/SFrame frame codec passes an encode/protect/authenticate/decode
-test with replay rejection, but it is not connected to capture or WebRTC.
-Continuous screen capture, video transport/rendering, camera capture, noise
-suppression, echo cancellation, and push-to-talk are still inactive.
+enumerates real monitors, captures a still preview on demand, and can share the
+selected monitor during an active call. The capture loop encodes bounded H.264
+frames, protects them with the call-group SFrame key, and sends bounded
+fragments over a WebRTC DataChannel; the receiver authenticates, decodes, and
+renders complete frames. Local tests cover codec replay rejection, bounded
+fragmentation, a protected H.264 frame over loopback, remote decode, and stop
+signaling. Physical-device capture, permissions, and VPN delivery remain
+unverified. Window and camera capture, noise suppression, echo cancellation,
+and push-to-talk remain inactive.
 **Rede & P2P** in Settings retains
 the Elixir HTTP/WebSocket diagnostics and manual refresh. On Linux, this uses
 Secret Service, so a desktop password vault must
@@ -431,7 +442,9 @@ The eleven design-board views and additional MLS screen are captured in [native-
 These are a first implementation of the visual direction, with comparison
 at 1280 × 800 and a compact 960 × 640 window. Exact visual parity and
 accessibility remain to be completed; the local Opus/SFrame RTP media path is
-implemented, while physical-device calls still need validation.
+implemented, while physical-device calls and screen sharing still need
+validation. The latest `05-share` and `10-call` screenshots could not be
+captured in this environment because no Wayland or X11 display is available.
 The current direct transport, delegated-copy frames, call-group Welcome purpose,
 and bounded call-signaling frames are specified in the [v10 peer protocol](docs/fichas/transport/lan-peer-v10.md). Version 9 remains as the prior compatibility contract.
 
