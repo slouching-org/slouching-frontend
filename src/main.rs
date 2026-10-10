@@ -2977,7 +2977,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 || !matches!(state.peer_listen_status, PeerListenStatus::Connected)
             {
                 state.mls_status =
-                    "Conecte ao dispositivo do grupo na tela Texto direto · LAN antes de enviar."
+                    "Conecte ao dispositivo do grupo na tela Texto direto · LAN/VPN antes de enviar."
                         .to_owned();
                 return Task::none();
             }

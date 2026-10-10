@@ -1,7 +1,7 @@
 # Direct peer transport v8
 
 This client-only protocol carries direct pairwise text and opaque OpenMLS
-application events between two Rust clients on a reachable LAN. The Iced chat
+application events between two Rust clients over a manually addressed UDP route. The Iced chat
 screen exposes pin, listen, connect, send, disconnect, and session transcript
 controls. The MLS screen uses the same active peer session after both devices
 have joined the same group. Elixir HTTP/WebSocket diagnostics are independent
@@ -153,7 +153,7 @@ After the committer reports that it stored the proposal, it can create and
 deliver the resulting Commit through the existing member flow.
 
 Allow the selected UDP port through each device's firewall. Wildcard addresses
-such as `0.0.0.0` cannot be shared. If no LAN address is announced, inspect the
+such as `0.0.0.0` cannot be shared. If no direct address is announced, inspect the
 machine's network interfaces.
 
 An MLS_COMMIT_REQUEST is a control frame with sequence zero and a fixed 24-byte
