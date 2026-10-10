@@ -1,6 +1,9 @@
 //! Native widgets composed from the supplied design board. All call/chat
 //! content is explicitly a visual preview until product capabilities exist.
-use crate::{BackendConnection, Message, Screen, Slouching, TransportState, storage};
+use crate::{
+    BackendConnection, Message, Screen, Slouching, TransportState,
+    file_transfer::FileAttachmentOffer, storage,
+};
 use iced::widget::{
     self, button, canvas, column, container, image, row, scrollable, space, stack, svg, text,
     text_input,
@@ -1582,20 +1585,53 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 .iter()
                 .map(|message| {
                     let outgoing = message.direction == storage::DirectMessageDirection::Sent;
-                    let bubble = column![
-                        l.label(message.text.clone(), 13.0, PAPER),
-                        l.label(
-                            if outgoing {
-                                "Enviada · sessão atual"
-                            } else {
-                                "Recebida · sessão atual"
-                            },
-                            10.0,
-                            MUTED
-                        )
-                    ]
-                    .spacing(l.px(4.0));
-                    container(bubble)
+                    let content: Element<'_, Message> =
+                        match FileAttachmentOffer::decode_mls_text(&message.text) {
+                            Ok(Some(attachment)) => {
+                                let transfer_id = attachment.offer.transfer_id;
+                                let filename = attachment.offer.filename.clone();
+                                let details =
+                                    format!("{} · {}", filename, attachment.offer.total_bytes);
+                                let save = button(l.label("Salvar arquivo", 11.0, NIGHT))
+                                    .on_press(Message::SaveMlsAttachment(
+                                        transfer_id,
+                                        filename.clone(),
+                                    ))
+                                    .padding([l.px(6.0), l.px(10.0)])
+                                    .style(|_, status| button_style(status, true, false));
+                                column![
+                                    l.label("ANEXO CIFRADO", 10.0, GOLD),
+                                    l.label(details, 12.0, PAPER),
+                                    save,
+                                    l.label(
+                                        if outgoing {
+                                            "Enviado · MLS"
+                                        } else {
+                                            "Recebido · MLS"
+                                        },
+                                        10.0,
+                                        MUTED
+                                    )
+                                ]
+                                .spacing(l.px(5.0))
+                                .into()
+                            }
+                            _ => column![
+                                l.label(message.text.clone(), 13.0, PAPER),
+                                l.label(
+                                    if outgoing {
+                                        "Enviada · sessão atual"
+                                    } else {
+                                        "Recebida · sessão atual"
+                                    },
+                                    10.0,
+                                    MUTED
+                                )
+                            ]
+                            .spacing(l.px(4.0))
+                            .into(),
+                        };
+                    container(content)
                         .padding(l.px(10.0))
                         .width(Length::Shrink)
                         .style(move |_| container::Style {
@@ -1621,6 +1657,13 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
         .on_press_maybe(can_send.then_some(Message::SendMlsApplication))
         .padding([l.px(13.0), l.px(20.0)])
         .style(|_, status| button_style(status, true, false));
+    let can_attach = matches!(state.peer_listen_status, crate::PeerListenStatus::Connected)
+        && state.mls_history_group.is_some()
+        && state.mls_quarantine_reason.is_none();
+    let attach = button(l.label("Anexar arquivo", 12.0, PAPER))
+        .on_press_maybe(can_attach.then_some(Message::PickMlsAttachment))
+        .padding([l.px(10.0), l.px(14.0)])
+        .style(|_, status| button_style(status, false, false));
     let retry = button(l.label("Reenviar pendentes", 12.0, PAPER))
         .on_press_maybe(
             (matches!(state.peer_listen_status, crate::PeerListenStatus::Connected)
@@ -1630,6 +1673,18 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
         )
         .padding([l.px(12.0), l.px(16.0)])
         .style(|_, status| button_style(status, false, false));
+    let retry_attachment = button(l.label(
+        format!("Reenviar anexo ({})", state.mls_attachment_transfers.len()),
+        12.0,
+        PAPER,
+    ))
+    .on_press_maybe(
+        (!state.mls_attachment_transfers.is_empty()
+            && matches!(state.peer_listen_status, crate::PeerListenStatus::Connected))
+        .then_some(Message::RetryMlsAttachmentBlob),
+    )
+    .padding([l.px(12.0), l.px(16.0)])
+    .style(|_, status| button_style(status, false, false));
     let quarantine_banner: Element<'_, Message> =
         if let Some(reason) = state.mls_quarantine_reason.as_ref() {
             container(
@@ -1773,8 +1828,10 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
         container(history).height(l.px(78.0)).width(Fill),
         row![
             container(l.input("Mensagem MLS · até 16 KiB", &state.mls_message_draft, Message::MlsMessageDraftChanged)).width(Fill),
+            attach,
             send,
-            retry
+            retry,
+            retry_attachment
         ].spacing(l.px(10.0)),
         l.label(
             "Convites e árvores ainda são trocados manualmente por canal confiável. Mensagens MLS seguem pela sessão autenticada ativa e só recebem ACK depois da validação e persistência no outro dispositivo.",

@@ -1,5 +1,15 @@
+#[path = "../src/blob_store.rs"]
+mod blob_store;
+#[path = "../src/file_transfer.rs"]
+mod file_transfer;
+#[path = "../src/identity.rs"]
+mod identity;
+#[allow(dead_code)]
 #[path = "../src/peer.rs"]
 mod peer;
+#[allow(dead_code)]
+#[path = "../src/storage.rs"]
+mod storage;
 
 use ed25519_dalek::SigningKey;
 use futures_util::StreamExt;
@@ -362,7 +372,9 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
             | peer::PeerEvent::DelegatedMlsCopyRejected { .. }
             | peer::PeerEvent::DelegatedMlsCopyDeliveryUnknown { .. }
             | peer::PeerEvent::DelegatedMlsCopyReceived { .. }
-            | peer::PeerEvent::DelegatedMlsCopiesRequested { .. } => {}
+            | peer::PeerEvent::DelegatedMlsCopiesRequested { .. }
+            | peer::PeerEvent::AttachmentBlobSent { .. }
+            | peer::PeerEvent::AttachmentBlobReceived { .. } => {}
             peer::PeerEvent::Received { sequence, text } => {
                 let expected_role = if role == "listener" {
                     "sender"
@@ -610,7 +622,9 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 | peer::PeerEvent::DelegatedMlsCopyRejected { .. }
                 | peer::PeerEvent::DelegatedMlsCopyDeliveryUnknown { .. }
                 | peer::PeerEvent::DelegatedMlsCopyReceived { .. }
-                | peer::PeerEvent::DelegatedMlsCopiesRequested { .. } => {}
+                | peer::PeerEvent::DelegatedMlsCopiesRequested { .. }
+                | peer::PeerEvent::AttachmentBlobSent { .. }
+                | peer::PeerEvent::AttachmentBlobReceived { .. } => {}
                 peer::PeerEvent::Rejected { reason, .. } => {
                     panic!("unexpected rejection: {reason}")
                 }
@@ -648,7 +662,9 @@ async fn run_session_script(session: peer::DirectPeerSession, role: &str) {
                 | peer::PeerEvent::DelegatedMlsCopyRejected { .. }
                 | peer::PeerEvent::DelegatedMlsCopyDeliveryUnknown { .. }
                 | peer::PeerEvent::DelegatedMlsCopyReceived { .. }
-                | peer::PeerEvent::DelegatedMlsCopiesRequested { .. } => {}
+                | peer::PeerEvent::DelegatedMlsCopiesRequested { .. }
+                | peer::PeerEvent::AttachmentBlobSent { .. }
+                | peer::PeerEvent::AttachmentBlobReceived { .. } => {}
                 peer::PeerEvent::MlsEventReceived { event, .. } if event.event_id[0] == 0xfe => {
                     got_unacknowledged = true;
                 }
@@ -846,7 +862,9 @@ async fn assert_no_application_session(session: peer::DirectPeerSession) {
             peer::PeerEvent::Connected { .. }
             | peer::PeerEvent::Rejected { .. }
             | peer::PeerEvent::Unauthorized { .. }
-            | peer::PeerEvent::DeliveryUnknown { .. } => {}
+            | peer::PeerEvent::DeliveryUnknown { .. }
+            | peer::PeerEvent::AttachmentBlobSent { .. }
+            | peer::PeerEvent::AttachmentBlobReceived { .. } => {}
             peer::PeerEvent::MlsEventDeliveryUnknown { .. } => {}
             peer::PeerEvent::MlsCommitDeliveryUnknown { .. } => {}
             peer::PeerEvent::MlsProposalDeliveryUnknown { .. } => {}

@@ -1,3 +1,4 @@
+use crate::{blob_store::EncryptedBlobStore, file_transfer::FileOffer};
 use futures_util::{Stream, StreamExt};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey,
@@ -26,6 +27,9 @@ const FRAME_MLS_KEY_PACKAGE: u8 = 10;
 const FRAME_MLS_WELCOME: u8 = 11;
 const FRAME_MLS_DELEGATED_COPY: u8 = 12;
 const FRAME_MLS_COPY_FETCH: u8 = 13;
+const ATTACHMENT_STREAM_MAGIC: &[u8; 4] = b"SLAB";
+const ATTACHMENT_STREAM_VERSION: u16 = 1;
+const ATTACHMENT_STREAM_HEADER_BYTES: usize = 4 + 2 + 16 + 16 + 32 + 8;
 const MLS_EVENT_MAGIC: &[u8; 4] = b"SLME";
 const MLS_EVENT_VERSION: u16 = 1;
 const MLS_COMMIT_MAGIC: &[u8; 4] = b"SLMC";
@@ -155,6 +159,12 @@ pub enum PeerCommand {
         request_id: u64,
         welcome: MlsWelcomeEnvelope,
     },
+    SendAttachmentBlob {
+        request_id: u64,
+        group_id: [u8; 16],
+        transfer_id: [u8; 16],
+        ciphertext_hash: [u8; 32],
+    },
     #[allow(dead_code)]
     SendDelegatedMlsCopy {
         request_id: u64,
@@ -184,6 +194,15 @@ pub enum PeerCommand {
 pub enum PeerEvent {
     Connected {
         peer_id: EndpointId,
+    },
+    AttachmentBlobSent {
+        request_id: u64,
+        result: Result<(), String>,
+    },
+    AttachmentBlobReceived {
+        group_id: [u8; 16],
+        transfer_id: [u8; 16],
+        result: Result<(), String>,
     },
     Received {
         sequence: u64,
@@ -331,6 +350,183 @@ pub struct DirectPeerSession {
     peer_id: EndpointId,
 }
 
+/// Send one ciphertext blob over a separate unidirectional stream on an
+/// already authenticated peer connection. The offer must come from the
+/// sender's authenticated SQLCipher MLS manifest.
+pub async fn send_attachment_blob(
+    connection: &Connection,
+    store: &EncryptedBlobStore,
+    group_id: [u8; 16],
+    offer: &FileOffer,
+    ciphertext_hash: [u8; 32],
+) -> Result<(), String> {
+    offer.encode()?;
+    let ciphertext_bytes = offer
+        .total_bytes
+        .checked_add(u64::from(offer.chunk_count).saturating_mul(16))
+        .ok_or_else(|| "encrypted attachment size overflowed".to_owned())?;
+    let mut stream = connection
+        .open_uni()
+        .await
+        .map_err(|error| format!("could not open attachment QUIC stream: {error}"))?;
+    stream
+        .write_all(ATTACHMENT_STREAM_MAGIC)
+        .await
+        .map_err(|error| format!("could not write attachment stream marker: {error}"))?;
+    stream
+        .write_all(&ATTACHMENT_STREAM_VERSION.to_be_bytes())
+        .await
+        .map_err(|error| format!("could not write attachment stream version: {error}"))?;
+    stream
+        .write_all(&group_id)
+        .await
+        .map_err(|error| format!("could not write attachment group ID: {error}"))?;
+    stream
+        .write_all(&offer.transfer_id)
+        .await
+        .map_err(|error| format!("could not write attachment transfer ID: {error}"))?;
+    stream
+        .write_all(&ciphertext_hash)
+        .await
+        .map_err(|error| format!("could not write attachment ciphertext hash: {error}"))?;
+    stream
+        .write_all(&ciphertext_bytes.to_be_bytes())
+        .await
+        .map_err(|error| format!("could not write attachment ciphertext size: {error}"))?;
+    let mut reader = store
+        .ciphertext_reader(ciphertext_hash)
+        .take(ciphertext_bytes);
+    let transferred = tokio::io::copy(&mut reader, &mut stream)
+        .await
+        .map_err(|error| format!("could not stream encrypted attachment: {error}"))?;
+    if transferred != ciphertext_bytes {
+        return Err("stored encrypted attachment is shorter than its MLS offer".to_owned());
+    }
+    stream
+        .finish()
+        .map_err(|error| format!("could not finish attachment QUIC stream: {error}"))
+}
+
+/// Receive and persist one ciphertext blob. `offer` and `ciphertext_hash`
+/// must have been loaded from the local SQLCipher manifest after MLS
+/// authentication; the stream header must match them exactly.
+#[cfg(test)]
+pub async fn receive_attachment_blob(
+    connection: &Connection,
+    store: &EncryptedBlobStore,
+    expected_group_id: [u8; 16],
+    offer: &FileOffer,
+    expected_hash: [u8; 32],
+) -> Result<(), String> {
+    offer.encode()?;
+    let mut stream = connection
+        .accept_uni()
+        .await
+        .map_err(|error| format!("could not accept attachment QUIC stream: {error}"))?;
+    let header = read_attachment_blob_header(&mut stream).await?;
+    let expected_ciphertext_bytes = offer
+        .total_bytes
+        .checked_add(u64::from(offer.chunk_count).saturating_mul(16))
+        .ok_or_else(|| "encrypted attachment size overflowed".to_owned())?;
+    if header.group_id != expected_group_id
+        || header.transfer_id != offer.transfer_id
+        || header.ciphertext_hash != expected_hash
+        || header.ciphertext_bytes != expected_ciphertext_bytes
+    {
+        return Err("attachment stream does not match its authenticated MLS offer".to_owned());
+    }
+    store
+        .import_ciphertext_stream(stream, offer, expected_hash)
+        .await
+}
+
+/// Receive a stream only when the local MLS manifest exists and the connected
+/// device is a verified member of that exact group.
+async fn receive_authorized_attachment_stream<R>(
+    mut stream: R,
+    peer_id: EndpointId,
+) -> Result<([u8; 16], [u8; 16]), String>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let header = read_attachment_blob_header(&mut stream).await?;
+    let offer = load_authorized_attachment(
+        header.group_id,
+        header.transfer_id,
+        header.ciphertext_hash,
+        peer_id,
+    )
+    .await?;
+    let expected_ciphertext_bytes = offer
+        .total_bytes
+        .checked_add(u64::from(offer.chunk_count).saturating_mul(16))
+        .ok_or_else(|| "encrypted attachment size overflowed".to_owned())?;
+    if header.ciphertext_bytes != expected_ciphertext_bytes {
+        return Err("attachment stream size does not match its MLS offer".to_owned());
+    }
+    let store = EncryptedBlobStore::open_default().await?;
+    store
+        .import_ciphertext_stream(stream, &offer, header.ciphertext_hash)
+        .await?;
+    store.shutdown().await?;
+    Ok((header.group_id, header.transfer_id))
+}
+
+async fn load_authorized_attachment(
+    group_id: [u8; 16],
+    transfer_id: [u8; 16],
+    ciphertext_hash: [u8; 32],
+    peer_id: EndpointId,
+) -> Result<FileOffer, String> {
+    tokio::task::spawn_blocking(move || {
+        let member_devices = crate::storage::list_mls_group_member_devices(group_id)?;
+        if !member_devices.contains(peer_id.as_bytes()) {
+            return Err("connected device is not a member of the attachment MLS group".to_owned());
+        }
+        crate::storage::list_file_attachments(group_id)?
+            .into_iter()
+            .find(|attachment| {
+                attachment.offer.transfer_id == transfer_id
+                    && attachment.ciphertext_hash == ciphertext_hash
+            })
+            .map(|attachment| attachment.offer)
+            .ok_or_else(|| "attachment is not present in the authenticated MLS manifest".to_owned())
+    })
+    .await
+    .map_err(|error| format!("attachment authorization task failed: {error}"))?
+}
+
+struct AttachmentBlobHeader {
+    group_id: [u8; 16],
+    transfer_id: [u8; 16],
+    ciphertext_hash: [u8; 32],
+    ciphertext_bytes: u64,
+}
+
+async fn read_attachment_blob_header<R>(reader: &mut R) -> Result<AttachmentBlobHeader, String>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0; ATTACHMENT_STREAM_HEADER_BYTES];
+    reader
+        .read_exact(&mut header)
+        .await
+        .map_err(|error| format!("attachment stream header is incomplete: {error}"))?;
+    if &header[..4] != ATTACHMENT_STREAM_MAGIC {
+        return Err("attachment stream has an invalid marker".to_owned());
+    }
+    let version = u16::from_be_bytes(header[4..6].try_into().unwrap());
+    if version != ATTACHMENT_STREAM_VERSION {
+        return Err(format!("unsupported attachment stream version: {version}"));
+    }
+    Ok(AttachmentBlobHeader {
+        group_id: header[6..22].try_into().unwrap(),
+        transfer_id: header[22..38].try_into().unwrap(),
+        ciphertext_hash: header[38..70].try_into().unwrap(),
+        ciphertext_bytes: u64::from_be_bytes(header[70..78].try_into().unwrap()),
+    })
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Frame {
     Data {
@@ -454,6 +650,8 @@ impl DirectPeerListener {
                     return Err("incoming peer did not match the pinned identity".to_owned());
                 }
                 PeerEvent::Connected { .. }
+                | PeerEvent::AttachmentBlobSent { .. }
+                | PeerEvent::AttachmentBlobReceived { .. }
                 | PeerEvent::Acknowledged { .. }
                 | PeerEvent::MlsEventReceived { .. }
                 | PeerEvent::MlsCommitReceived { .. }
@@ -522,6 +720,34 @@ impl DirectPeerSession {
                     let frame = read_frame(&mut receive).await;
                     let finished = frame.is_err();
                     if frame_sender.send(frame).await.is_err() || finished {
+                        break;
+                    }
+                }
+            });
+            let (side_event_sender, mut side_event_receiver) = mpsc::channel(8);
+            let attachment_connection = self.connection.clone();
+            let attachment_peer = self.peer_id;
+            let attachment_events = side_event_sender.clone();
+            let _attachment_reader = tokio::spawn(async move {
+                loop {
+                    let stream = match attachment_connection.accept_uni().await {
+                        Ok(stream) => stream,
+                        Err(_) => break,
+                    };
+                    let result = receive_authorized_attachment_stream(stream, attachment_peer).await;
+                    let event = match result {
+                        Ok((group_id, transfer_id)) => PeerEvent::AttachmentBlobReceived {
+                            group_id,
+                            transfer_id,
+                            result: Ok(()),
+                        },
+                        Err(error) => PeerEvent::AttachmentBlobReceived {
+                            group_id: [0; 16],
+                            transfer_id: [0; 16],
+                            result: Err(error),
+                        },
+                    };
+                    if attachment_events.send(event).await.is_err() {
                         break;
                     }
                 }
@@ -741,8 +967,28 @@ impl DirectPeerSession {
                             None => break 'session "peer session reader stopped".to_owned(),
                         }
                     }
+                    event = side_event_receiver.recv() => {
+                        if let Some(event) = event {
+                            yield event;
+                        }
+                    }
                     command = commands.recv(), if !closing => {
                         match command {
+                            Some(PeerCommand::SendAttachmentBlob { request_id, group_id, transfer_id, ciphertext_hash }) => {
+                                let connection = self.connection.clone();
+                                let peer_id = self.peer_id;
+                                let event_sender = side_event_sender.clone();
+                                tokio::spawn(async move {
+                                    let result = async {
+                                        let offer = load_authorized_attachment(group_id, transfer_id, ciphertext_hash, peer_id).await?;
+                                        let store = EncryptedBlobStore::open_default().await?;
+                                        let sent = send_attachment_blob(&connection, &store, group_id, &offer, ciphertext_hash).await;
+                                        let shutdown = store.shutdown().await;
+                                        sent.and(shutdown)
+                                    }.await;
+                                    let _ = event_sender.send(PeerEvent::AttachmentBlobSent { request_id, result }).await;
+                                });
+                            }
                             Some(PeerCommand::Send { request_id, text }) => {
                                 if text.is_empty() || text.len() > MAX_TEXT_BYTES {
                                     yield PeerEvent::Rejected {
@@ -1153,6 +1399,8 @@ pub async fn send_once(
                 return Err("delivery could not be confirmed before disconnect".to_owned());
             }
             PeerEvent::Connected { .. }
+            | PeerEvent::AttachmentBlobSent { .. }
+            | PeerEvent::AttachmentBlobReceived { .. }
             | PeerEvent::Acknowledged { .. }
             | PeerEvent::MlsEventReceived { .. }
             | PeerEvent::MlsCommitReceived { .. }
@@ -1991,6 +2239,83 @@ mod tests {
 
     #[derive(Debug)]
     struct RelayTestToken(String);
+
+    #[tokio::test]
+    async fn direct_peer_transfers_ciphertext_blob_over_a_separate_quic_stream() {
+        let root = std::env::temp_dir().join(format!(
+            "slouching-quic-attachment-{}-{}",
+            std::process::id(),
+            getrandom::u32().unwrap()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source_path = root.join("map.bin");
+        let source = vec![0x37; crate::file_transfer::FILE_CHUNK_PLAINTEXT_BYTES + 39];
+        tokio::fs::write(&source_path, &source).await.unwrap();
+        let sender_store = EncryptedBlobStore::open(root.join("sender-store"))
+            .await
+            .unwrap();
+        let receiver_store = EncryptedBlobStore::open(root.join("receiver-store"))
+            .await
+            .unwrap();
+        let stored = sender_store.import_file(&source_path).await.unwrap();
+        let receiver_offer = FileOffer::decode(&stored.offer.encode().unwrap()).unwrap();
+        let expected_hash = stored.ciphertext_hash;
+        let group_id = [0x91; 16];
+
+        let sender_key = SecretKey::from_bytes(&[0x92; 32]);
+        let receiver_key = SecretKey::from_bytes(&[0x93; 32]);
+        let listener = bind_listener(
+            receiver_key,
+            "127.0.0.1:0".parse().unwrap(),
+            sender_key.public(),
+        )
+        .await
+        .unwrap();
+        let address = listener.direct_addresses()[0];
+        let receiver_id = listener.id();
+        let output_path = root.join("saved-map.bin");
+        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+        let receive_task = tokio::spawn(async move {
+            let session = listener.accept_session().await.unwrap();
+            let _ = ready_sender.send(());
+            receive_attachment_blob(
+                &session.connection,
+                &receiver_store,
+                group_id,
+                &receiver_offer,
+                expected_hash,
+            )
+            .await
+            .unwrap();
+            receiver_store
+                .save_decrypted_file(receiver_offer, expected_hash, &output_path)
+                .await
+                .unwrap();
+            assert_eq!(tokio::fs::read(output_path).await.unwrap(), source);
+            receiver_store.shutdown().await.unwrap();
+        });
+
+        let mut sender = connect_peer(sender_key, receiver_id, address)
+            .await
+            .unwrap();
+        write_frame(&mut sender.send, FRAME_MLS_COPY_FETCH, 0, &[])
+            .await
+            .unwrap();
+        ready_receiver.await.unwrap();
+        send_attachment_blob(
+            &sender.connection,
+            &sender_store,
+            group_id,
+            &stored.offer,
+            expected_hash,
+        )
+        .await
+        .unwrap();
+        receive_task.await.unwrap();
+        sender.endpoint.close().await;
+        sender_store.shutdown().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     impl AccessControl for RelayTestToken {
         async fn on_connect(&self, request: &ClientRequest) -> Access {

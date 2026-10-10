@@ -40,30 +40,31 @@ a persistent reference. A stored blob can be decrypted chunk by chunk to a
 user-selected path; publication waits for AEAD and ciphertext-digest checks and
 never replaces an existing file. On Unix, plaintext staging files use mode
 0600. Encrypted blobs can be fetched over Iroh QUIC;
-the provider handler requires explicit peer authorization. The SQLCipher
-profile now stores and reloads each group-bound offer, content key, sender key,
-and ciphertext digest. Storage checks the author against the active MLS
-membership and verified device bindings, rejects quarantined groups and
+the provider handler requires explicit peer authorization. A separate
+unidirectional QUIC stream helper transfers ciphertext against an expected
+group-bound offer, with a two-endpoint test that saves the received file. The
+The SQLCipher profile stores and reloads each group-bound offer, content key,
+sender key, and ciphertext digest. Storage checks the author against active
+MLS membership and verified device bindings, rejects quarantined groups and
 conflicting transfer IDs, and rechecks the group epoch before inserting. A
-200 MiB per-profile attachment quota is enforced before storing an
-offer, and the schema migration backfills sizes from existing offers. The
-MLS receiver recognizes the bounded attachment envelope only after OpenMLS
-authenticates and decrypts the application event. It commits the manifest in
-the same SQLCipher transaction as the ratchet, event, and transcript, before
-the peer ACK is allowed; exact redelivery is deduplicated. Received offers are
-now persisted correctly. The sender likewise commits its local manifest with
-the outbound ratchet and retryable outbox event. The app does not yet fetch or
-render the referenced blobs.
-receive core stages plaintext in a temporary file and publishes it
-only after digest validation, without replacing an existing destination. Local
-two-endpoint tests cover authorized retrieval and rejection of an unauthorized
-peer. A bounded, versioned attachment-offer text codec is ready for carrying
-the blob hash and key-bearing offer inside an MLS application event. The app
-does not yet wire blob serving to MLS membership authorization, coordinate
-offer persistence with blob lifecycle, or expose a send/accept/save flow in the
-UI. The current composer does not create file offers. The pinned iroh-blobs
-0.103.1 release is marked by its
-maintainers as not production quality, so this remains experimental.
+200 MiB per-profile attachment quota is enforced before storing an offer; the
+schema migration backfills sizes from existing offers. OpenMLS authenticates
+and decrypts the bounded attachment envelope before its manifest is committed
+with the ratchet, event, and transcript; ACK follows that transaction. Exact
+redelivery is deduplicated, and outbound offers are committed with the sender's
+ratchet and retryable outbox event.
+
+The MLS composer imports and encrypts a selected file, sends its offer as an
+MLS application event, then starts a separate QUIC ciphertext stream after the
+receiver ACKs that event. The receiver checks the connected device's MLS group
+membership and exact stored offer before importing the bounded ciphertext
+stream. History renders attachment cards; **Salvar arquivo** decrypts to a
+user-selected path and publishes only after digest validation. A failed
+outbound stream can be retried from the MLS screen while the app remains open.
+Two-endpoint tests cover stream transfer and save, but the full
+database-authorized desktop flow and cross-machine file transfer still need
+runtime validation. The pinned iroh-blobs 0.103.1 release is marked by its
+maintainers as not production quality, so this path remains experimental.
 
 The app also opens `ws://127.0.0.1:3707/ws` asynchronously, sends a binary
 protobuf `ClientHello` v1, and validates one binary `ServerHello` or
@@ -323,6 +324,8 @@ be installed and available in the user session.
 
 ![Actual 934 × 1000 native Iced MLS screen showing pending, approved, and rejected self-update proposal review controls; proposal rows are capture fixtures](docs/design/runtime/native-vhs/11-mls.png)
 
+![Actual native Iced MLS screen with an encrypted attachment card and save action; attachment and connected state are capture fixtures](docs/design/runtime/native-vhs/12-mls-attachments.png)
+
 ![Actual native Iced Network and P2P settings with delegated MLS copy consent and helper-listener guidance; Secret Service is unavailable in this capture, so the local policy cannot load](docs/design/runtime/native-vhs/02-settings.png)
 
 The Network and P2P settings expose persisted opt-in for delegated encrypted
@@ -361,6 +364,7 @@ SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-capture
 SLOUCHING_WINDOW_SIZE=960x640 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 01-familiar
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 06-chat --capture-peer-addresses
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 11-mls --capture-mls-review
+SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 11-mls --capture-mls-attachment
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-verification
 ```
 
@@ -375,6 +379,8 @@ addresses for the direct-chat capture; they are fixtures, not live interfaces.
 default is a compact 1100 × 720 window.
 `--capture-mls-review` adds sample pending, approved, and rejected proposals to
 illustrate the review controls; they are fixtures, not live MLS state.
+`--capture-mls-attachment` adds a sample attachment card and connected state;
+they are fixtures, not a transferred file or live peer session.
 `--capture-peer-verification` supplies sample local and peer keys for the trust
 screen capture; they are fixtures, not identities from the keyring.
 

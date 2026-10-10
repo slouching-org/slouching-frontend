@@ -156,6 +156,19 @@ impl Screen {
 type PendingPeerKeyPackage = (u64, [u8; 32], Vec<u8>, Vec<u8>);
 type PendingPeerWelcome = (u64, [u8; 32], [u8; 16], Vec<u8>, Vec<u8>, Vec<u8>);
 
+#[derive(Debug, Clone, Copy)]
+struct PendingMlsAttachmentBlob {
+    group_id: [u8; 16],
+    transfer_id: [u8; 16],
+    ciphertext_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingMlsAttachmentTransfer {
+    event_id: [u8; 16],
+    attachment: PendingMlsAttachmentBlob,
+}
+
 #[derive(Debug, Clone)]
 struct MlsCommitFanoutReport {
     recipients: usize,
@@ -259,6 +272,8 @@ struct Slouching {
     mls_fanout_running: bool,
     mls_event_fanout_running: bool,
     mls_pending_events: std::collections::HashMap<u64, ([u8; 16], [u8; 32])>,
+    mls_pending_attachment_blobs: std::collections::HashMap<[u8; 16], PendingMlsAttachmentBlob>,
+    mls_attachment_transfers: std::collections::HashMap<u64, PendingMlsAttachmentTransfer>,
     delegated_copy_sends: std::collections::HashMap<u64, [u8; 16]>,
     mls_sending_commits: std::collections::HashMap<u64, [u8; 16]>,
     mls_sending_proposals: std::collections::HashSet<u64>,
@@ -419,6 +434,8 @@ impl Default for Slouching {
             mls_fanout_running: false,
             mls_event_fanout_running: false,
             mls_pending_events: std::collections::HashMap::new(),
+            mls_pending_attachment_blobs: std::collections::HashMap::new(),
+            mls_attachment_transfers: std::collections::HashMap::new(),
             delegated_copy_sends: std::collections::HashMap::new(),
             mls_sending_commits: std::collections::HashMap::new(),
             mls_sending_proposals: std::collections::HashSet::new(),
@@ -581,6 +598,22 @@ enum Message {
     ),
     SendMlsApplication,
     MlsApplicationCreated(Result<storage::PreparedMlsApplicationEvent, String>),
+    PickMlsAttachment,
+    RetryMlsAttachmentBlob,
+    MlsAttachmentPicked(Option<std::path::PathBuf>),
+    MlsAttachmentCreated(
+        Result<(storage::PreparedMlsApplicationEvent, [u8; 16], [u8; 32]), String>,
+    ),
+    MlsAttachmentRecipientReady(
+        storage::PreparedMlsApplicationEvent,
+        [u8; 32],
+        [u8; 16],
+        [u8; 32],
+        Result<Vec<storage::StoredOutboundEvent>, String>,
+    ),
+    SaveMlsAttachment([u8; 16], String),
+    MlsAttachmentSavePath([u8; 16], Vec<u8>, Option<std::path::PathBuf>),
+    MlsAttachmentSaved(Result<std::path::PathBuf, String>),
     MlsApplicationRecipientReady(
         storage::PreparedMlsApplicationEvent,
         [u8; 32],
@@ -3111,7 +3144,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         }
         Message::MlsCommitProcessed(Ok(result)) => {
             state.mls_received_commit.clear();
-            state.mls_status = match result {
+            state.mls_status = match &result {
                 storage::ProcessedMlsCommit::Applied { epoch } => {
                     format!("Commit autenticado e aplicado; grupo agora está no epoch {epoch}.")
                 }
@@ -3311,6 +3344,206 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 Message::MlsApplicationCreated,
             );
         }
+        Message::PickMlsAttachment => {
+            if state.peer_session_commands.is_none()
+                || !matches!(state.peer_listen_status, PeerListenStatus::Connected)
+                || state.mls_quarantine_reason.is_some()
+            {
+                state.mls_status = "Conecte um membro MLS e abra um grupo antes de anexar.".into();
+                return Task::none();
+            }
+            return Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .pick_file()
+                        .await
+                        .map(|file| file.path().to_path_buf())
+                },
+                Message::MlsAttachmentPicked,
+            );
+        }
+        Message::MlsAttachmentPicked(Some(path)) => {
+            let group_id = match state
+                .mls_history_group
+                .as_deref()
+                .and_then(|group_id| <[u8; 16]>::try_from(group_id).ok())
+            {
+                Some(group_id) => group_id,
+                None => {
+                    state.mls_status = "Selecione um grupo MLS ativo antes de anexar.".into();
+                    return Task::none();
+                }
+            };
+            state.mls_status = "Cifrando arquivo e preparando oferta MLS…".into();
+            return Task::perform(
+                create_mls_attachment_task(group_id, path),
+                Message::MlsAttachmentCreated,
+            );
+        }
+        Message::MlsAttachmentPicked(None) => {}
+        Message::RetryMlsAttachmentBlob => {
+            let Some((&request_id, transfer)) = state.mls_attachment_transfers.iter().next() else {
+                return Task::none();
+            };
+            let Some(commands) = state.peer_session_commands.clone() else {
+                state.mls_status = "Reconecte o peer antes de reenviar o anexo.".into();
+                return Task::none();
+            };
+            match commands.try_send(peer::PeerCommand::SendAttachmentBlob {
+                request_id,
+                group_id: transfer.attachment.group_id,
+                transfer_id: transfer.attachment.transfer_id,
+                ciphertext_hash: transfer.attachment.ciphertext_hash,
+            }) {
+                Ok(()) => {
+                    state.mls_status = format!(
+                        "Reenviando anexo {}…",
+                        hex_encode_bytes(&transfer.event_id[..4])
+                    );
+                }
+                Err(error) => {
+                    state.mls_status = format!("Não foi possível iniciar o reenvio: {error}");
+                }
+            }
+        }
+        Message::MlsAttachmentCreated(result) => match result {
+            Ok((prepared, transfer_id, ciphertext_hash)) => {
+                let peer_device = match parse_peer_id(&state.peer_public_key) {
+                    Ok(peer) => *peer.as_bytes(),
+                    Err(error) => {
+                        state.mls_status =
+                            format!("Anexo cifrado e salvo no outbox; peer pin inválido: {error}");
+                        return load_mls_history(state, prepared.event.group_id);
+                    }
+                };
+                let group_id = prepared.event.group_id.clone();
+                return Task::perform(
+                    load_mls_events_for_peer_task(group_id, peer_device),
+                    move |result| {
+                        Message::MlsAttachmentRecipientReady(
+                            prepared,
+                            peer_device,
+                            transfer_id,
+                            ciphertext_hash,
+                            result,
+                        )
+                    },
+                );
+            }
+            Err(error) => state.mls_status = format!("Falha ao preparar anexo: {error}"),
+        },
+        Message::MlsAttachmentRecipientReady(
+            prepared,
+            peer_device,
+            transfer_id,
+            ciphertext_hash,
+            result,
+        ) => {
+            if parse_peer_id(&state.peer_public_key)
+                .ok()
+                .is_none_or(|peer| *peer.as_bytes() != peer_device)
+            {
+                return Task::none();
+            }
+            let is_recipient = match result {
+                Ok(events) => events
+                    .iter()
+                    .any(|stored| stored.event.event_id == prepared.event.event_id),
+                Err(error) => {
+                    state.mls_status =
+                        format!("Anexo salvo; não foi possível validar o peer: {error}");
+                    return load_mls_history(state, prepared.event.group_id);
+                }
+            };
+            if !is_recipient {
+                state.mls_status =
+                    "O peer pinado não está no snapshot de membros deste grupo; anexo não enviado."
+                        .into();
+                return Task::none();
+            }
+            let Some(commands) = state.peer_session_commands.clone() else {
+                state.mls_status = "Anexo cifrado no outbox; reconecte o membro e reenvie.".into();
+                return load_mls_history(state, prepared.event.group_id);
+            };
+            let request_id = state.mls_next_request_id;
+            state.mls_next_request_id = state.mls_next_request_id.saturating_add(1);
+            state
+                .mls_pending_events
+                .insert(request_id, (prepared.event.event_id, peer_device));
+            let group_id: [u8; 16] = match prepared.event.group_id.as_slice().try_into() {
+                Ok(group_id) => group_id,
+                Err(_) => {
+                    state.mls_status = "ID do grupo MLS inválido para o anexo.".into();
+                    return Task::none();
+                }
+            };
+            state.mls_pending_attachment_blobs.insert(
+                prepared.event.event_id,
+                PendingMlsAttachmentBlob {
+                    group_id,
+                    transfer_id,
+                    ciphertext_hash,
+                },
+            );
+            let event = peer::MlsEventEnvelope {
+                event_id: prepared.event.event_id,
+                author_device: prepared.event.author_device,
+                group_id: prepared.event.group_id.clone(),
+                epoch: prepared.event.epoch,
+                checkpoint: prepared.event.checkpoint,
+                expires_at_unix: prepared.event.expires_at_unix,
+                ciphertext: prepared.event.ciphertext,
+            };
+            let history_group_id = event.group_id.clone();
+            state.mls_status =
+                "Oferta MLS enviada; aguardando ACK antes de transferir o ciphertext…".into();
+            return Task::batch([
+                Task::perform(
+                    async move {
+                        commands
+                            .send(peer::PeerCommand::SendMlsEvent { request_id, event })
+                            .await
+                            .map_err(|error| error.to_string())
+                    },
+                    move |result| Message::MlsPeerCommandSent(request_id, result),
+                ),
+                Task::perform(
+                    load_mls_history_task(history_group_id.clone()),
+                    move |result| Message::MlsHistoryLoaded(history_group_id, result),
+                ),
+            ]);
+        }
+        Message::SaveMlsAttachment(transfer_id, filename) => {
+            let Some(group_id) = state.mls_history_group.clone() else {
+                state.mls_status = "Abra o grupo MLS do anexo antes de salvar.".into();
+                return Task::none();
+            };
+            state.mls_status = "Escolha onde salvar o anexo…".into();
+            return Task::perform(
+                async move {
+                    rfd::AsyncFileDialog::new()
+                        .set_file_name(&filename)
+                        .save_file()
+                        .await
+                        .map(|file| file.path().to_path_buf())
+                },
+                move |path| Message::MlsAttachmentSavePath(transfer_id, group_id, path),
+            );
+        }
+        Message::MlsAttachmentSavePath(transfer_id, group_id, Some(path)) => {
+            state.mls_status = "Verificando e salvando o arquivo…".into();
+            return Task::perform(
+                save_mls_attachment_task(group_id, transfer_id, path),
+                Message::MlsAttachmentSaved,
+            );
+        }
+        Message::MlsAttachmentSavePath(_, _, None) => {}
+        Message::MlsAttachmentSaved(Ok(path)) => {
+            state.mls_status = format!("Arquivo salvo em {}", path.display());
+        }
+        Message::MlsAttachmentSaved(Err(error)) => {
+            state.mls_status = format!("Não foi possível salvar o anexo: {error}");
+        }
         Message::MlsApplicationCreated(result) => match result {
             Ok(prepared) => {
                 let peer_device = match parse_peer_id(&state.peer_public_key) {
@@ -3436,6 +3669,43 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         "Peer confirmou que reteve o evento MLS {}.",
                         hex_encode_bytes(&event_id[..4])
                     );
+                    if let Some(attachment) = state.mls_pending_attachment_blobs.remove(&event_id) {
+                        state.mls_attachment_transfers.insert(
+                            request_id,
+                            PendingMlsAttachmentTransfer {
+                                event_id,
+                                attachment,
+                            },
+                        );
+                        if let Some(commands) = state.peer_session_commands.clone() {
+                            match commands.try_send(peer::PeerCommand::SendAttachmentBlob {
+                                request_id,
+                                group_id: attachment.group_id,
+                                transfer_id: attachment.transfer_id,
+                                ciphertext_hash: attachment.ciphertext_hash,
+                            }) {
+                                Ok(()) => {
+                                    state.mls_status =
+                                        "ACK MLS recebido; enviando ciphertext do anexo…".into();
+                                }
+                                Err(error) => {
+                                    state
+                                        .mls_pending_attachment_blobs
+                                        .insert(event_id, attachment);
+                                    state.mls_attachment_transfers.remove(&request_id);
+                                    state.mls_status = format!(
+                                        "Evento MLS entregue, mas o stream do anexo não iniciou: {error}"
+                                    );
+                                }
+                            }
+                        } else {
+                            state
+                                .mls_pending_attachment_blobs
+                                .insert(event_id, attachment);
+                            state.mls_status =
+                                "Evento MLS entregue; reconecte para transferir o anexo.".into();
+                        }
+                    }
                 }
                 Err(error) => {
                     state.mls_status =
@@ -3672,6 +3942,32 @@ fn boot() -> (Slouching, Task<Message>) {
                 rejected: true,
             },
         ];
+    }
+    if args.iter().any(|arg| arg == "--capture-mls-attachment") {
+        state.screen = Screen::Mls;
+        state.mls_group_id = "5f8d4d2a7c314e6a9b0f123456789abc".to_owned();
+        state.mls_history_group = hex_decode_bytes(&state.mls_group_id).ok();
+        state.peer_listen_status = PeerListenStatus::Connected;
+        state.mls_status = "Ciphertext do anexo recebido e verificado.".to_owned();
+        let attachment = file_transfer::FileAttachmentOffer {
+            offer: file_transfer::FileOffer {
+                transfer_id: [0x3a; 16],
+                content_key: [0x7b; 32],
+                total_bytes: 2_621_440,
+                chunk_count: file_transfer::chunk_count(2_621_440)
+                    .expect("capture attachment size should be valid"),
+                filename: "mapa-da-expedicao.pdf".to_owned(),
+            },
+            ciphertext_hash: [0x5c; 32],
+        }
+        .encode_mls_text()
+        .expect("capture attachment should encode");
+        state.mls_history = vec![storage::StoredMlsMessage {
+            sequence: 1,
+            event_id: [0x6d; 16],
+            direction: storage::DirectMessageDirection::Received,
+            text: attachment,
+        }];
     }
     if capture_peer_verification {
         let peer_key = [0x22; 32];
@@ -4922,6 +5218,67 @@ async fn create_mls_application_task(
     .map_err(|error| format!("MLS application encryption task failed: {error}"))?
 }
 
+async fn create_mls_attachment_task(
+    group_id: [u8; 16],
+    path: std::path::PathBuf,
+) -> Result<(storage::PreparedMlsApplicationEvent, [u8; 16], [u8; 32]), String> {
+    let store = blob_store::EncryptedBlobStore::open_default().await?;
+    let stored = store.import_file(path).await?;
+    let transfer_id = stored.offer.transfer_id;
+    let ciphertext_hash = stored.ciphertext_hash;
+    let text = file_transfer::FileAttachmentOffer {
+        offer: stored.offer,
+        ciphertext_hash,
+    }
+    .encode_mls_text();
+    let text = match text {
+        Ok(text) => text,
+        Err(error) => {
+            let _ = store.remove(&transfer_id).await;
+            let _ = store.shutdown().await;
+            return Err(error);
+        }
+    };
+    let prepared = match create_mls_application_task(group_id.to_vec(), text).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = store.remove(&transfer_id).await;
+            let _ = store.shutdown().await;
+            return Err(error);
+        }
+    };
+    let _ = store.shutdown().await;
+    Ok((prepared, transfer_id, ciphertext_hash))
+}
+
+async fn save_mls_attachment_task(
+    group_id: Vec<u8>,
+    transfer_id: [u8; 16],
+    destination: std::path::PathBuf,
+) -> Result<std::path::PathBuf, String> {
+    let group_id: [u8; 16] = group_id
+        .as_slice()
+        .try_into()
+        .map_err(|_| "MLS attachment group ID must contain 16 bytes".to_owned())?;
+    let attachment = tokio::task::spawn_blocking(move || {
+        storage::list_file_attachments(group_id)?
+            .into_iter()
+            .find(|attachment| attachment.offer.transfer_id == transfer_id)
+            .ok_or_else(|| "attachment manifest is not available in this profile".to_owned())
+    })
+    .await
+    .map_err(|error| format!("attachment lookup task failed: {error}"))??;
+    let store = blob_store::EncryptedBlobStore::open_default().await?;
+    let result = store
+        .save_decrypted_file(attachment.offer, attachment.ciphertext_hash, destination)
+        .await;
+    let shutdown = store.shutdown().await;
+    match (result, shutdown) {
+        (Ok(path), Ok(())) => Ok(path),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
+
 async fn process_inbound_mls_application_task(
     event: storage::EncryptedEvent,
 ) -> Result<storage::ProcessedMlsApplicationEvent, String> {
@@ -5092,6 +5449,33 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
             state.peer_listen_status = PeerListenStatus::Connected;
             if matches!(state.peer_send_status, PeerSendStatus::Connecting) {
                 state.peer_send_status = PeerSendStatus::Idle;
+            }
+        }
+        peer::PeerEvent::AttachmentBlobSent { request_id, result } => {
+            if result.is_ok() {
+                state.mls_attachment_transfers.remove(&request_id);
+            }
+            state.mls_status = match result {
+                Ok(()) => format!("Ciphertext do anexo {request_id} enviado pelo stream QUIC."),
+                Err(error) => format!(
+                    "Falha ao enviar ciphertext do anexo: {error}. O envio continua disponível para nova tentativa."
+                ),
+            };
+        }
+        peer::PeerEvent::AttachmentBlobReceived {
+            group_id,
+            transfer_id,
+            result,
+        } => {
+            state.mls_status = match &result {
+                Ok(()) => format!(
+                    "Ciphertext do anexo {} recebido e verificado.",
+                    hex_encode_bytes(&transfer_id[..4])
+                ),
+                Err(error) => format!("Anexo MLS recusado: {error}"),
+            };
+            if result.is_ok() {
+                state.mls_history_group = Some(group_id.to_vec());
             }
         }
         peer::PeerEvent::Received { sequence, text } => {
@@ -5429,6 +5813,44 @@ fn hex_encode_key(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_attachment_stream_remains_retryable_until_success() {
+        let mut state = Slouching::default();
+        let attachment = PendingMlsAttachmentBlob {
+            group_id: [0x11; 16],
+            transfer_id: [0x22; 16],
+            ciphertext_hash: [0x33; 32],
+        };
+        state.mls_attachment_transfers.insert(
+            7,
+            PendingMlsAttachmentTransfer {
+                event_id: [0x44; 16],
+                attachment,
+            },
+        );
+
+        apply_peer_event(
+            &mut state,
+            peer::PeerEvent::AttachmentBlobSent {
+                request_id: 7,
+                result: Err("test failure".to_owned()),
+            },
+        );
+
+        assert!(state.mls_attachment_transfers.contains_key(&7));
+        assert!(state.mls_status.contains("nova tentativa"));
+
+        apply_peer_event(
+            &mut state,
+            peer::PeerEvent::AttachmentBlobSent {
+                request_id: 7,
+                result: Ok(()),
+            },
+        );
+
+        assert!(!state.mls_attachment_transfers.contains_key(&7));
+    }
 
     #[test]
     fn participant_relay_requires_tls_and_a_shared_token() {
