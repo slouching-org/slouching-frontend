@@ -421,8 +421,11 @@ signed
 addresses, then imports it from PNG and lets the user choose a route. The QR
 does not auto-verify human identity; a changed key has no inherited trust.
 The trust screen derives a full 256-bit fingerprint from both device keys for
-manual comparison. SPAKE2 rendezvous and contact discovery are not
-implemented. OpenMLS credentials include a versioned binding signed by the durable device key. One-use
+manual comparison. The client has an experimental SPAKE2 crypto foundation
+with 100-bit pairing codes and transcript-bound key confirmation, but no UI,
+rendezvous, server-side attempt limits, or signed identity exchange. It does
+not mark contacts trusted; see the [prototype boundary](https://github.com/slouching-org/slouching/blob/main/docs/fichas/identity/spake2-prototype.md).
+Contact pairing and discovery are not implemented. OpenMLS credentials include a versioned binding signed by the durable device key. One-use
 KeyPackages and private MLS state are stored in SQLCipher. The direct-chat
 screen separately pins device public keys. Character scenes remain visual
 previews. **Áudio & vídeo** enumerates real audio inputs and outputs, and lets
@@ -484,7 +487,10 @@ be installed and available in the user session.
 ![Actual native Iced peer verification screen after importing a QR, with separate LAN and VPN address choices; all values are capture fixtures](docs/design/runtime/native-vhs/08-verify-invite-imported.png)
 
 These identity captures predate the camera-scan control and the full 256-bit pair fingerprint. Refresh them with
-`--capture-peer-verification` in a graphical session; this TTY environment cannot create an Iced window.
+`--capture-peer-verification` in a graphical session. A fresh identity capture
+was attempted on 2026-10-10 after the SPAKE2 foundation change, but this TTY
+has no `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, or `DISPLAY`, so Iced could not
+create a window. The SPAKE2 change is crypto-only and adds no visible control.
 
 ![Native Iced call screen capture from before protected Opus RTP integration; a fresh capture needs a Wayland or X11 display](docs/design/runtime/native-vhs/10-call.png)
 

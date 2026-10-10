@@ -13,6 +13,7 @@ pub mod file_transfer;
 pub mod identity;
 pub mod lan_discovery;
 pub mod media;
+pub mod pairing_spake2;
 mod peer;
 mod peer_invite;
 pub mod screen_capture;
