@@ -5,6 +5,7 @@ pub mod audio;
 pub mod blob_store;
 pub mod call_audio;
 pub mod call_rtc;
+pub mod call_video;
 pub mod file_transfer;
 pub mod identity;
 pub mod media;

@@ -36,6 +36,7 @@ zeroize = "=1.9.1"
 cpal = "=0.18.2"
 sframe = "=2.0.0"
 opus = "=0.4.0"
+openh264 = "=0.9.8"
 media = { package = "rtc-media", version = "=0.21.0" }
 rtc = "=0.21.0"
 webrtc = { version = "=0.21.0", default-features = false, features = ["crypto-ring", "runtime-tokio"] }

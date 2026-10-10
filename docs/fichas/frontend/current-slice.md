@@ -127,8 +127,10 @@ frames locally.
 The **Escolher tela** view uses XCap to enumerate real monitors and capture a
 single still image only after an explicit user action. Blocking enumeration and
 capture run outside Iced's UI thread. This is a local preview only: continuous
-capture, H.264 encoding, video RTP/SFrame, and rendering remote video are not
-implemented, so it does not share the image with a peer. Window and camera
+capture, WebRTC transport, and rendering remote video are not implemented, so
+it does not share the image with a peer. An H.264/SFrame frame codec now has a
+local encode-protect-authenticate-decode test, including replay rejection, but
+is not connected to the capture view or call transport. Window and camera
 capture remain unavailable. Contact discovery, automatic pairing, and
 guaranteed offline delivery are also not implemented. The older web UI under
 `prototypes/web/` is a design benchmark, not the product runtime.
