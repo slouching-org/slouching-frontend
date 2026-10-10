@@ -87,6 +87,34 @@ pub async fn run_pairing(
     role: PairingRole,
     local_device_key: [u8; 32],
 ) -> Result<[u8; 32], String> {
+    run_pairing_with_signer(
+        helper_url,
+        session_id,
+        code_text,
+        role,
+        local_device_key,
+        |transcript_hash| {
+            let (device_key, signature) = storage::sign_contact_identity_proof(&transcript_hash)?;
+            Ok(ContactIdentityProof {
+                device_key,
+                signature,
+            })
+        },
+    )
+    .await
+}
+
+async fn run_pairing_with_signer<F>(
+    helper_url: &str,
+    session_id: &str,
+    code_text: &str,
+    role: PairingRole,
+    local_device_key: [u8; 32],
+    signer: F,
+) -> Result<[u8; 32], String>
+where
+    F: FnOnce([u8; 32]) -> Result<ContactIdentityProof, String> + Send + 'static,
+{
     let base = helper_base(helper_url)?;
     validate_session_id(session_id)?;
     let code = PairingCode::parse(code_text)?;
@@ -122,17 +150,12 @@ pub async fn run_pairing(
     let confirmed = pending.confirm(&remote_confirmation)?;
 
     let transcript_hash = confirmed.transcript_hash();
-    let (proof_key, proof_signature) =
-        tokio::task::spawn_blocking(move || storage::sign_contact_identity_proof(&transcript_hash))
-            .await
-            .map_err(|error| format!("device identity signing task failed: {error}"))??;
-    if proof_key != local_device_key {
+    let proof = tokio::task::spawn_blocking(move || signer(transcript_hash))
+        .await
+        .map_err(|error| format!("device identity signing task failed: {error}"))??;
+    if proof.device_key != local_device_key {
         return Err("saved device identity changed during pairing".to_owned());
     }
-    let proof = ContactIdentityProof {
-        device_key: proof_key,
-        signature: proof_signature,
-    };
     let encrypted_identity = confirmed.seal_identity_proof(&proof)?;
     post_message(
         &client,
@@ -296,4 +319,84 @@ async fn response_error(response: reqwest::Response, context: &str) -> String {
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .and_then(|json| json.get("message")?.as_str().map(str::to_owned));
     message.unwrap_or_else(|| format!("{context} (HTTP {status})"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PairingRole, create_session, run_pairing_with_signer};
+    use crate::{identity::ContactIdentityProof, pairing_spake2::PairingCode};
+    use ed25519_dalek::SigningKey;
+
+    const TEST_CODE: &str = "0123-4567-89AB-CDEF-GHJK";
+
+    fn helper_url() -> String {
+        std::env::var("SLOUCHING_PAIRING_TEST_URL")
+            .expect("run scripts/smoke-pairing-e2e.sh to provide a live local helper")
+    }
+
+    fn test_signer(seed: u8) -> (SigningKey, [u8; 32]) {
+        let key = SigningKey::from_bytes(&[seed; 32]);
+        let public = key.verifying_key().to_bytes();
+        (key, public)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the live local Elixir helper; run scripts/smoke-pairing-e2e.sh"]
+    async fn two_clients_pair_through_the_live_elixir_helper() {
+        let helper = helper_url();
+        let session = create_session(&helper).await.unwrap();
+        let code = PairingCode::parse(TEST_CODE).unwrap();
+        let code_a = code.expose().to_owned();
+        let code_b = code.expose().to_owned();
+        let (key_a, public_a) = test_signer(0x31);
+        let (key_b, public_b) = test_signer(0x62);
+
+        let inviter = run_pairing_with_signer(
+            &helper,
+            &session,
+            &code_a,
+            PairingRole::Inviter,
+            public_a,
+            move |transcript| Ok(ContactIdentityProof::sign(&key_a, &transcript)),
+        );
+        let invitee = run_pairing_with_signer(
+            &helper,
+            &session,
+            &code_b,
+            PairingRole::Invitee,
+            public_b,
+            move |transcript| Ok(ContactIdentityProof::sign(&key_b, &transcript)),
+        );
+        let (seen_by_a, seen_by_b) = tokio::join!(inviter, invitee);
+        assert_eq!(seen_by_a.unwrap(), public_b);
+        assert_eq!(seen_by_b.unwrap(), public_a);
+
+        let wrong_code_session = create_session(&helper).await.unwrap();
+        let code_a = PairingCode::parse(TEST_CODE).unwrap().expose().to_owned();
+        let code_b = PairingCode::parse("1123-4567-89AB-CDEF-GHJK")
+            .unwrap()
+            .expose()
+            .to_owned();
+        let (key_a, public_a) = test_signer(0x47);
+        let (key_b, public_b) = test_signer(0x58);
+        let inviter = run_pairing_with_signer(
+            &helper,
+            &wrong_code_session,
+            &code_a,
+            PairingRole::Inviter,
+            public_a,
+            move |transcript| Ok(ContactIdentityProof::sign(&key_a, &transcript)),
+        );
+        let invitee = run_pairing_with_signer(
+            &helper,
+            &wrong_code_session,
+            &code_b,
+            PairingRole::Invitee,
+            public_b,
+            move |transcript| Ok(ContactIdentityProof::sign(&key_b, &transcript)),
+        );
+        let (inviter, invitee) = tokio::join!(inviter, invitee);
+        assert!(inviter.is_err());
+        assert!(invitee.is_err());
+    }
 }

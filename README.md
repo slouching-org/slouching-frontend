@@ -92,6 +92,11 @@ automatically mark that person trusted: compare the displayed fingerprint with
 the person and choose **Marcar como conferida** only after confirming identity.
 Cancel deletes the temporary helper session.
 
+From the project root, run `./scripts/smoke-pairing-e2e.sh` to start a local
+Elixir helper and exercise inviter and invitee clients with test device
+keys. It also verifies that different codes fail. This test covers the client
+protocol against the live helper, not the rendered GUI or two physical devices.
+
 This is an experimental contact-pairing path. It does not make peers reachable
 across NAT, establish messaging by itself, or replace transport/network setup.
 The helper contract and limits are in
@@ -261,8 +266,9 @@ marks trust automatically; press **Marcar como conferida** only after
 authenticating the QR source. That decision is local to this encrypted profile
 and exact key. It does not verify a display name, and a replacement key must be
 verified again. A symmetric full 256-bit BLAKE3 fingerprint derived from both device keys is
-available for live comparison. The optional Elixir helper now provides an
-experimental SPAKE2 rendezvous API, but the Iced client does not call it yet.
+available for live comparison. The identity screen also supports experimental
+SPAKE2 code pairing through the Elixir helper. It exchanges transcript-bound
+signed device proofs but does not mark the contact trusted automatically.
 Neither fingerprint nor helper establishes trust by itself. Camera scanning uses an explicit, temporary local
 capture and follows the same signature, expiry, self-invite, and trust checks
 as PNG import.
@@ -445,13 +451,13 @@ signed
 addresses, then imports it from PNG and lets the user choose a route. The QR
 does not auto-verify human identity; a changed key has no inherited trust.
 The trust screen derives a full 256-bit fingerprint from both device keys for
-manual comparison. The client has an experimental SPAKE2 crypto foundation
-with 100-bit pairing codes and transcript-bound key confirmation. The Elixir
-helper provides bounded, expiring rendezvous sessions, but there is no Iced
-flow or signed identity exchange yet. It does not mark contacts trusted; see
-the [client boundary](https://github.com/slouching-org/slouching/blob/main/docs/fichas/identity/spake2-prototype.md)
+manual comparison. The experimental Iced SPAKE2 flow uses a fresh 100-bit code,
+transcript-bound key confirmation, and encrypted signed device proofs relayed
+by the Elixir helper. A live-helper two-client test covers successful exchange
+and mismatched-code rejection. The flow does not establish human identity or
+mark contacts trusted; see the [client boundary](https://github.com/slouching-org/slouching/blob/main/docs/fichas/identity/spake2-prototype.md)
 and [rendezvous contract](https://github.com/slouching-org/slouching/blob/main/docs/fichas/identity/pairing-rendezvous-v1.md).
-Contact pairing and discovery are not implemented. OpenMLS credentials include a versioned binding signed by the durable device key. One-use
+Contact discovery remains open. OpenMLS credentials include a versioned binding signed by the durable device key. One-use
 KeyPackages and private MLS state are stored in SQLCipher. The direct-chat
 screen separately pins device public keys. Character scenes remain visual
 previews. **Áudio & vídeo** enumerates real audio inputs and outputs, and lets
@@ -512,11 +518,10 @@ be installed and available in the user session.
 
 ![Actual native Iced peer verification screen after importing a QR, with separate LAN and VPN address choices; all values are capture fixtures](docs/design/runtime/native-vhs/08-verify-invite-imported.png)
 
-These identity captures predate the camera-scan control and the full 256-bit pair fingerprint. Refresh them with
-`--capture-peer-verification` in a graphical session. A fresh identity capture
-was attempted on 2026-10-10 after the SPAKE2 foundation change, but this TTY
-has no `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, or `DISPLAY`, so Iced could not
-create a window. The SPAKE2 change is crypto-only and adds no visible control.
+These identity captures predate the camera-scan control, full 256-bit pair
+fingerprint, and code-pairing controls. Refresh them with the matching capture
+fixtures in a graphical session. A post-pairing-control capture attempt and
+the missing display environment are recorded in the capture instructions below.
 
 ![Native Iced call screen capture from before protected Opus RTP integration; a fresh capture needs a Wayland or X11 display](docs/design/runtime/native-vhs/10-call.png)
 

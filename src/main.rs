@@ -2120,13 +2120,19 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.pairing_working = false;
             match result {
                 Ok(public_key) => {
-                    state.pairing_status = "Identidade autenticada pelo código. Compare o fingerprint com a pessoa antes de marcar como conferida.".to_owned();
+                    state.pairing_status = "O dispositivo provou posse da chave com o código. A sessão expira em até 2 minutos; compare a pessoa antes de marcar como conferida.".to_owned();
+                    state.pairing_session_id.clear();
+                    state.pairing_code.clear();
                     return update(
                         state,
                         Message::PeerPublicKeyChanged(hex_encode_key(&public_key)),
                     );
                 }
-                Err(error) => state.pairing_status = format!("Pareamento falhou: {error}"),
+                Err(error) => {
+                    state.pairing_status = format!(
+                        "Pareamento falhou: {error}. Cancele esta sessão e crie outro convite para tentar novamente."
+                    )
+                }
             }
         }
         Message::CancelContactPairing => {
@@ -2136,6 +2142,8 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             let session = state.pairing_session_id.clone();
             let generation = state.pairing_generation;
             state.pairing_status = "Cancelando convite…".to_owned();
+            state.pairing_session_id.clear();
+            state.pairing_code.clear();
             return Task::perform(
                 async move { pairing_client::delete_session(&helper, &session).await },
                 move |result| Message::ContactPairingCanceled(generation, result),
@@ -2149,8 +2157,6 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         "Pareamento interrompido; não foi possível cancelar no helper: {error}"
                     ),
                 };
-                state.pairing_session_id.clear();
-                state.pairing_code.clear();
             }
         }
         Message::CopyDeviceKey => {

@@ -3527,7 +3527,8 @@ fn verification(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 l.control(
                     "close",
                     "Cancelar",
-                    state.pairing_working.then_some(Message::CancelContactPairing),
+                    (state.pairing_working || !state.pairing_session_id.is_empty())
+                        .then_some(Message::CancelContactPairing),
                     false
                 )
             ]
