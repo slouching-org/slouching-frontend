@@ -120,8 +120,10 @@ previews. Call MLS groups and authenticated SFrame member binding are
 implemented. The call screen can start and end a WebRTC offer/answer negotiation
 over pinned QUIC after validating the peer's current call-group membership and
 epoch; gathered host candidates are included in SDP. Local ICE/DTLS loopback is
-tested, but audio/video tracks, microphone/camera capture, SFrame frame transport,
-and a two-machine VPN call are not implemented or verified. Screen capture,
+tested. A separate Opus/SFrame codec path now round-trips protected 20 ms voice
+frames in local tests, but it is not connected to CPAL or WebRTC RTP. Audio/video
+tracks, microphone/camera capture, playback, and a two-machine VPN call are not
+implemented or verified. Screen capture,
 contact discovery, QR pairing, and guaranteed offline delivery
 are not implemented. The older web UI under
 `prototypes/web/` is a design benchmark, not the product runtime.

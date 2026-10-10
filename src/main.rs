@@ -3,6 +3,7 @@ use iced::{Element, Task, Theme, task::Handle};
 
 pub mod audio;
 pub mod blob_store;
+pub mod call_audio;
 pub mod call_rtc;
 pub mod file_transfer;
 pub mod identity;
