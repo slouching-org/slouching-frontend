@@ -9,6 +9,7 @@ use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
 };
+use std::io::{Read, Write};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
@@ -262,6 +263,83 @@ pub fn ciphertext_digest(ciphertext_chunks: &[&[u8]]) -> [u8; 32] {
         hasher.update(chunk);
     }
     *hasher.finalize().as_bytes()
+}
+
+/// Encrypt exactly the declared number of bytes without buffering the whole file.
+/// The caller should read the result from the peer's authenticated QUIC stream.
+pub fn encrypt_file_stream<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    transfer_id: &[u8; 16],
+    content_key: &[u8; 32],
+    total_bytes: u64,
+) -> Result<[u8; 32], String> {
+    let count = chunk_count(total_bytes)?;
+    let mut digest = blake3::Hasher::new();
+    for index in 0..count {
+        let length = expected_plaintext_chunk_len(total_bytes, index)?;
+        let mut plaintext = vec![0; length];
+        reader
+            .read_exact(&mut plaintext)
+            .map_err(|error| format!("file source ended before its declared size: {error}"))?;
+        let ciphertext = encrypt_chunk(transfer_id, content_key, total_bytes, index, &plaintext)?;
+        digest.update(&ciphertext);
+        writer
+            .write_all(&ciphertext)
+            .map_err(|error| format!("could not write encrypted file chunk: {error}"))?;
+        plaintext.zeroize();
+    }
+    let mut extra = [0; 1];
+    if reader
+        .read(&mut extra)
+        .map_err(|error| format!("could not verify file source length: {error}"))?
+        != 0
+    {
+        return Err("file source contains bytes beyond its declared size".to_owned());
+    }
+    Ok(*digest.finalize().as_bytes())
+}
+
+/// Authenticate and decrypt a bounded ciphertext stream to a temporary writer.
+/// The writer may contain partial plaintext if verification fails; callers must
+/// discard the temporary destination unless this function returns successfully.
+pub fn decrypt_file_stream<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    transfer_id: &[u8; 16],
+    content_key: &[u8; 32],
+    total_bytes: u64,
+    expected_ciphertext_digest: &[u8; 32],
+) -> Result<(), String> {
+    let count = chunk_count(total_bytes)?;
+    let mut digest = blake3::Hasher::new();
+    for index in 0..count {
+        let length = expected_plaintext_chunk_len(total_bytes, index)?;
+        let mut ciphertext = vec![0; length + FILE_CHUNK_TAG_BYTES];
+        reader
+            .read_exact(&mut ciphertext)
+            .map_err(|error| format!("encrypted file stream is truncated: {error}"))?;
+        digest.update(&ciphertext);
+        let mut plaintext =
+            decrypt_chunk(transfer_id, content_key, total_bytes, index, &ciphertext)?;
+        writer
+            .write_all(&plaintext)
+            .map_err(|error| format!("could not write decrypted file chunk: {error}"))?;
+        ciphertext.zeroize();
+        plaintext.zeroize();
+    }
+    let mut extra = [0; 1];
+    if reader
+        .read(&mut extra)
+        .map_err(|error| format!("could not verify encrypted file length: {error}"))?
+        != 0
+    {
+        return Err("encrypted file stream contains trailing bytes".to_owned());
+    }
+    if digest.finalize().as_bytes() != expected_ciphertext_digest {
+        return Err("encrypted file digest does not match the offer".to_owned());
+    }
+    Ok(())
 }
 
 pub fn validate_filename(name: &str) -> Result<(), String> {
@@ -528,5 +606,75 @@ mod tests {
         let secrets = FileTransferSecrets::from_parts([0x31; 16], [0x52; 32]);
         assert!(FileOffer::from_secrets(&secrets, MAX_FILE_BYTES + 1, "too-big".into()).is_err());
         assert!(FileOffer::from_secrets(&secrets, 12, "../escape".into()).is_err());
+    }
+
+    #[test]
+    fn streaming_file_cipher_handles_multiple_chunks_and_verifies_ciphertext_digest() {
+        let secrets = FileTransferSecrets::from_parts([0x31; 16], [0x52; 32]);
+        let mut source = vec![0x8a; FILE_CHUNK_PLAINTEXT_BYTES + 17];
+        source[FILE_CHUNK_PLAINTEXT_BYTES] = 0x4b;
+        let mut encrypted = Vec::new();
+        let digest = encrypt_file_stream(
+            &mut source.as_slice(),
+            &mut encrypted,
+            secrets.transfer_id(),
+            secrets.content_key(),
+            source.len() as u64,
+        )
+        .unwrap();
+        let mut restored = Vec::new();
+        decrypt_file_stream(
+            &mut encrypted.as_slice(),
+            &mut restored,
+            secrets.transfer_id(),
+            secrets.content_key(),
+            source.len() as u64,
+            &digest,
+        )
+        .unwrap();
+        assert_eq!(restored, source);
+
+        encrypted[0] ^= 1;
+        assert!(
+            decrypt_file_stream(
+                &mut encrypted.as_slice(),
+                &mut Vec::new(),
+                secrets.transfer_id(),
+                secrets.content_key(),
+                source.len() as u64,
+                &digest,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn streaming_file_cipher_rejects_short_and_long_sources() {
+        let secrets = FileTransferSecrets::from_parts([0x31; 16], [0x52; 32]);
+        let mut short = b"short".as_slice();
+        assert!(
+            encrypt_file_stream(
+                &mut short,
+                &mut Vec::new(),
+                secrets.transfer_id(),
+                secrets.content_key(),
+                8,
+            )
+            .unwrap_err()
+            .contains("declared size")
+        );
+
+        let mut long = b"longer".as_slice();
+        assert!(
+            encrypt_file_stream(
+                &mut long,
+                &mut Vec::new(),
+                secrets.transfer_id(),
+                secrets.content_key(),
+                4,
+            )
+            .unwrap_err()
+            .contains("beyond its declared size")
+        );
     }
 }
