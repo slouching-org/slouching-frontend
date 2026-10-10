@@ -19,6 +19,7 @@ pub mod pairing_spake2;
 mod peer;
 mod peer_invite;
 pub mod screen_capture;
+pub mod sfu_call;
 pub mod storage;
 mod ui;
 pub mod verification_fingerprint;
@@ -58,6 +59,7 @@ struct BackendStatus {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum CapabilityStatus {
+    Available,
     NotImplemented,
 }
 
@@ -197,6 +199,7 @@ struct CallOfferReady {
     peer_device: [u8; 32],
     rtc: std::sync::Arc<call_rtc::CallRtcSession>,
     offer: Vec<u8>,
+    sfu_transport: Option<std::sync::Arc<tokio::sync::Mutex<sfu_call::SfuCallTransport>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -365,6 +368,7 @@ struct Slouching {
     call_room_messages: Vec<call_chat::RoomMessage>,
     call_group_creating: bool,
     call_rtc_session: Option<std::sync::Arc<call_rtc::CallRtcSession>>,
+    sfu_call_transport: Option<std::sync::Arc<tokio::sync::Mutex<sfu_call::SfuCallTransport>>>,
     call_rtc_generation: u64,
     mls_fanout_running: bool,
     mls_event_fanout_running: bool,
@@ -591,6 +595,7 @@ impl Default for Slouching {
             call_room_messages: Vec::new(),
             call_group_creating: false,
             call_rtc_session: None,
+            sfu_call_transport: None,
             call_rtc_generation: 0,
             mls_fanout_running: false,
             mls_event_fanout_running: false,
@@ -819,6 +824,7 @@ enum Message {
     ToggleCallMic,
     EndCall,
     CallOfferCreated(Result<CallOfferReady, String>),
+    SfuCallStatus(u64, String),
     CallSignalProcessed(
         u64,
         u64,
@@ -1285,14 +1291,16 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.call_group_status = "Crie ou selecione um grupo MLS de chamada primeiro.".into();
         }
         Message::StartCall => {
-            let Some(peer_device) = state
+            let sfu_configured =
+                std::env::var("SLOUCHING_SFU_WS_URL").is_ok_and(|value| !value.trim().is_empty());
+            let peer_device = state
                 .active_peer_device
-                .filter(|_| active_peer_is_pinned(state))
-            else {
+                .filter(|_| active_peer_is_pinned(state));
+            if peer_device.is_none() && !sfu_configured {
                 state.call_group_status =
                     "Conecte primeiro ao peer fixado em Texto direto · LAN/VPN.".into();
                 return Task::none();
-            };
+            }
             let group_id = match hex_decode_bytes(&state.call_group_id) {
                 Ok(bytes) if bytes.len() == 16 => <[u8; 16]>::try_from(bytes.as_slice()).unwrap(),
                 _ => {
@@ -1317,7 +1325,11 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     "Selecione um microfone e uma saída de áudio em Configurações antes de iniciar a chamada.".into();
                 return Task::none();
             };
-            state.call_group_status = "Validando grupo MLS e reunindo candidatos WebRTC…".into();
+            state.call_group_status = if sfu_configured {
+                "Entrando no helper SFU e preparando a chamada…".into()
+            } else {
+                "Validando grupo MLS e reunindo candidatos WebRTC…".into()
+            };
             return Task::perform(
                 prepare_call_offer_task(group_id, peer_device, input_device, output_device),
                 Message::CallOfferCreated,
@@ -1520,17 +1532,25 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.screen = Screen::Home;
             if let Some(session) = state.call_rtc_session.take() {
                 let commands = state.peer_session_commands.clone();
+                let sfu_transport = state.sfu_call_transport.take();
                 let group_id = hex_decode_bytes(&state.call_group_id)
                     .ok()
                     .and_then(|bytes| <[u8; 16]>::try_from(bytes.as_slice()).ok());
                 let request_id = state.peer_next_request_id;
                 state.peer_next_request_id = state.peer_next_request_id.saturating_add(1);
                 state.call_rtc_generation = state.call_rtc_generation.saturating_add(1);
-                state.call_group_status = "Encerrando chamada direta…".into();
+                state.call_group_status = "Encerrando chamada…".into();
                 return Task::perform(
                     async move {
                         session.close().await?;
-                        if let (Some(commands), Some(group_id)) = (commands, group_id) {
+                        if let Some(transport) = sfu_transport {
+                            transport
+                                .lock()
+                                .await
+                                .leave()
+                                .await
+                                .map_err(|error| format!("could not leave SFU call: {error}"))?;
+                        } else if let (Some(commands), Some(group_id)) = (commands, group_id) {
                             let context = tokio::task::spawn_blocking(move || {
                                 storage::load_call_media_context(&group_id)
                             })
@@ -1567,13 +1587,9 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         }
         Message::CallOfferCreated(result) => match result {
             Ok(ready) => {
-                let Some(commands) = state.peer_session_commands.as_ref() else {
-                    state.call_group_status =
-                        "Sessão P2P foi encerrada antes de enviar a oferta.".into();
-                    return Task::none();
-                };
-                if !active_peer_is_pinned(state)
-                    || state.active_peer_device != Some(ready.peer_device)
+                if ready.sfu_transport.is_none()
+                    && (!active_peer_is_pinned(state)
+                        || state.active_peer_device != Some(ready.peer_device))
                 {
                     state.call_group_status =
                         "Peer mudou durante a preparação; oferta descartada.".into();
@@ -1586,6 +1602,21 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 state.call_rtc_generation = state.call_rtc_generation.saturating_add(1);
                 let generation = state.call_rtc_generation;
                 let rtc = ready.rtc.clone();
+                if let Some(transport) = ready.sfu_transport.clone() {
+                    state.sfu_call_transport = Some(transport.clone());
+                    state.call_group_status =
+                        "Oferta enviada ao helper Elixir; ICE/DTLS conectando pelo SFU.".into();
+                    return Task::batch([
+                        watch_call_rtc_state(generation, rtc.clone()),
+                        watch_sfu_call_events(generation, transport, rtc),
+                    ]);
+                }
+                let Some(commands) = state.peer_session_commands.as_ref() else {
+                    state.call_rtc_session = None;
+                    state.call_group_status =
+                        "Sessão P2P foi encerrada antes de enviar a oferta.".into();
+                    return Task::none();
+                };
                 let signal = peer::CallSignal {
                     group_id: ready.group_id,
                     epoch: ready.epoch,
@@ -1678,12 +1709,51 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 }
                 state.call_group_status = state_name;
                 if generation == 0 || terminal {
-                    state.call_rtc_session = None;
+                    let session = state.call_rtc_session.take();
+                    let transport = state.sfu_call_transport.take();
                     state.call_mic_muted = false;
                     state.screen_sharing_active = false;
                     state.remote_screen_frame = None;
                     state.call_room_messages.clear();
                     state.call_room_draft.clear();
+                    if session.is_some() || transport.is_some() {
+                        return Task::perform(
+                            async move {
+                                if let Some(session) = session {
+                                    let _ = session.close().await;
+                                }
+                                if let Some(transport) = transport {
+                                    let _ = transport.lock().await.leave().await;
+                                }
+                            },
+                            |_| Message::SfuCallStatus(0, "Chamada finalizada.".into()),
+                        );
+                    }
+                }
+            }
+        }
+        Message::SfuCallStatus(generation, status) => {
+            if generation == state.call_rtc_generation {
+                let terminal = status.contains("falhou")
+                    || status.contains("fechou")
+                    || status.contains("rejeitou")
+                    || status.contains("terminou")
+                    || status.contains("encerrada");
+                state.call_group_status = status;
+                if terminal {
+                    let session = state.call_rtc_session.take();
+                    let transport = state.sfu_call_transport.take();
+                    return Task::perform(
+                        async move {
+                            if let Some(session) = session {
+                                let _ = session.close().await;
+                            }
+                            if let Some(transport) = transport {
+                                let _ = transport.lock().await.leave().await;
+                            }
+                        },
+                        move |_| Message::SfuCallStatus(generation, "Chamada finalizada.".into()),
+                    );
                 }
             }
         }
@@ -5948,6 +6018,9 @@ fn decode_server_hello(bytes: &[u8]) -> Result<protocol::ServerHello, HandshakeE
         Some(protocol::server_frame::Payload::Authenticated(_)) => Err(HandshakeError::Protocol(
             "authentication response arrived before challenge".into(),
         )),
+        Some(_) => Err(HandshakeError::Protocol(
+            "unexpected application frame before authentication".into(),
+        )),
         None => Err(HandshakeError::Protocol("empty ServerFrame".into())),
     }
 }
@@ -5968,8 +6041,7 @@ fn decode_authenticated(
         .map_err(|error| HandshakeError::Protocol(error.to_string()))?;
     match frame.payload {
         Some(protocol::server_frame::Payload::Authenticated(authenticated))
-            if authenticated.device_public_key == expected_device_public_key
-                && !authenticated.application_routes_available =>
+            if authenticated.device_public_key == expected_device_public_key =>
         {
             Ok(())
         }
@@ -6167,6 +6239,15 @@ fn boot() -> (Slouching, Task<Message>) {
         state.call_group_status =
             "Pronto para negociar com o peer MLS fixado · áudio Opus/SFrame e vídeo H.264/SFrame."
                 .to_owned();
+    }
+    if args.iter().any(|arg| arg == "--capture-call-sfu") {
+        state.screen = Screen::Call;
+        state.identity_status = IdentityStatus::Ready([0x11; 32]);
+        state.active_peer_device = None;
+        state.peer_public_key.clear();
+        state.call_group_id = "5f8d4d2a7c314e6a9b0f123456789abc".to_owned();
+        state.call_group_status =
+            "Pronto para entrar pelo SFU · ambos os membros iniciam pelo mesmo helper.".to_owned();
     }
     if capture_peer_verification {
         let peer_key = [0x22; 32];
@@ -6801,7 +6882,7 @@ async fn create_call_mls_group_task() -> Result<storage::CreatedMlsGroup, String
 
 async fn prepare_call_offer_task(
     group_id: [u8; 16],
-    peer_device: [u8; 32],
+    peer_device: Option<[u8; 32]>,
     input_device: String,
     output_device: String,
 ) -> Result<CallOfferReady, String> {
@@ -6809,9 +6890,74 @@ async fn prepare_call_offer_task(
         .await
         .map_err(|error| format!("call MLS context task failed: {error}"))??;
     let epoch = context.epoch;
+    let sfu_url = std::env::var("SLOUCHING_SFU_WS_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+
+    if let Some(ws_url) = sfu_url {
+        if context.members.len() != 2 {
+            return Err(
+                "o modo SFU inicial requer um grupo de chamada com exatamente dois dispositivos"
+                    .to_owned(),
+            );
+        }
+
+        let roster = context
+            .members
+            .iter()
+            .map(|member| member.device_public_key)
+            .collect::<Vec<_>>();
+        let signer = tokio::task::spawn_blocking(storage::load_device_peer_secret_key)
+            .await
+            .map_err(|error| format!("device identity task failed: {error}"))??;
+        let local_device = *signer.public().as_bytes();
+        let remote_device = context
+            .members
+            .iter()
+            .map(|member| member.device_public_key)
+            .find(|device| *device != local_device)
+            .ok_or_else(|| "o grupo MLS não contém outro dispositivo".to_owned())?;
+        if !roster.contains(&local_device)
+            || peer_device.is_some_and(|expected| expected != remote_device)
+        {
+            return Err(
+                "a identidade local ou o peer pinado não corresponde ao grupo MLS de chamada"
+                    .to_owned(),
+            );
+        }
+        let transport = sfu_call::SfuCallTransport::connect_and_join(
+            &ws_url, group_id, group_id, epoch, &roster, signer,
+        )
+        .await?;
+        let transport = std::sync::Arc::new(tokio::sync::Mutex::new(transport));
+        let rtc = std::sync::Arc::new(
+            call_rtc::CallRtcSession::new_for_call_group(
+                group_id,
+                remote_device,
+                input_device,
+                output_device,
+            )
+            .await?,
+        );
+        let offer = rtc.create_sfu_offer().await?;
+        transport.lock().await.send_offer(offer.clone()).await?;
+
+        return Ok(CallOfferReady {
+            group_id,
+            epoch,
+            peer_device: remote_device,
+            rtc,
+            offer,
+            sfu_transport: Some(transport),
+        });
+    }
+
+    let peer_device = peer_device
+        .ok_or_else(|| "conecte primeiro ao peer fixado em Texto direto · LAN/VPN".to_owned())?;
     if context.member_index(&peer_device).is_none() {
         return Err("o peer pinado não pertence ao grupo MLS de chamada ativo".to_owned());
     }
+
     let rtc = std::sync::Arc::new(
         call_rtc::CallRtcSession::new_for_call_group(
             group_id,
@@ -6828,6 +6974,7 @@ async fn prepare_call_offer_task(
         peer_device,
         rtc,
         offer,
+        sfu_transport: None,
     })
 }
 
@@ -6966,6 +7113,80 @@ fn watch_call_rtc_state(
         }
     };
     Task::run(events, |message| message)
+}
+
+fn watch_sfu_call_events(
+    generation: u64,
+    transport: std::sync::Arc<tokio::sync::Mutex<sfu_call::SfuCallTransport>>,
+    rtc: std::sync::Arc<call_rtc::CallRtcSession>,
+) -> Task<Message> {
+    let events = async_stream::stream! {
+        let mut remote_description_set = false;
+        let mut pending_candidates = std::collections::VecDeque::new();
+        let mut event_receiver = match transport.lock().await.take_events() {
+            Some(receiver) => receiver,
+            None => {
+                yield "SFU event stream was already claimed.".to_owned();
+                return;
+            }
+        };
+        loop {
+            let event = event_receiver.recv().await;
+            match event {
+                Some(sfu_call::SfuCallEvent::Answer(sdp)) => {
+                    if let Err(error) = rtc.accept_sfu_answer_sdp(&sdp).await {
+                        let _ = rtc.close().await;
+                        yield format!("Resposta do SFU inválida; chamada encerrada: {error}");
+                        break;
+                    }
+                    remote_description_set = true;
+                    let mut candidates_ok = true;
+                    while let Some(candidate) = pending_candidates.pop_front() {
+                        if let Err(error) = rtc.add_ice_candidate_init(candidate).await {
+                            let _ = rtc.close().await;
+                            yield format!("Candidato ICE do SFU rejeitado: {error}");
+                            candidates_ok = false;
+                            break;
+                        }
+                    }
+                    if !candidates_ok {
+                        break;
+                    }
+                    yield "Resposta do SFU aplicada; aguardando ICE/DTLS.".to_owned();
+                }
+                Some(sfu_call::SfuCallEvent::IceCandidate(candidate)) => {
+                    if remote_description_set {
+                        if let Err(error) = rtc.add_ice_candidate_init(candidate).await {
+                            let _ = rtc.close().await;
+                            yield format!("Candidato ICE do SFU rejeitado: {error}");
+                            break;
+                        }
+                    } else {
+                        pending_candidates.push_back(candidate);
+                    }
+                }
+                Some(sfu_call::SfuCallEvent::Rejected { code, message }) => {
+                    let _ = rtc.close().await;
+                    yield format!("O helper SFU rejeitou a chamada ({code}): {message}");
+                    break;
+                }
+                Some(sfu_call::SfuCallEvent::Disconnected(reason)) => {
+                    let _ = rtc.close().await;
+                    yield format!("Conexão com o helper SFU fechou a conexão: {reason}");
+                    break;
+                }
+                None => {
+                    let _ = rtc.close().await;
+                    yield "Conexão de sinalização SFU terminou; chamada encerrada.".to_owned();
+                    break;
+                }
+            }
+        }
+    };
+
+    Task::run(events, move |status| {
+        Message::SfuCallStatus(generation, status)
+    })
 }
 
 fn stop_call_media_for_mls_group(
@@ -9194,7 +9415,7 @@ mod tests {
 
     #[test]
     fn accepts_only_elixir_status_contract_v1() {
-        let valid = r#"{"contract_version":1,"backend":"elixir_scaffold","identity":"not_implemented","messaging":"not_implemented","calls":"not_implemented","peer_connections":0}"#;
+        let valid = r#"{"contract_version":1,"backend":"elixir_scaffold","identity":"not_implemented","messaging":"not_implemented","calls":"available","peer_connections":0}"#;
         assert!(parse_status(valid).is_ok());
         assert!(matches!(
             parse_status(&valid.replace("\"elixir_scaffold\"", "\"rust_scaffold\"")),
@@ -9219,7 +9440,7 @@ mod tests {
                     server_role: "elixir".into(),
                     identity_available: false,
                     messaging_available: false,
-                    calls_available: false,
+                    calls_available: true,
                     auth_nonce: vec![0x51; 32],
                 },
             )),
@@ -9274,7 +9495,7 @@ mod tests {
         assert!(decode_authenticated(&authenticated.encode_to_vec(), &public_key).is_ok());
         assert!(decode_authenticated(&authenticated.encode_to_vec(), &[0x55; 32]).is_err());
 
-        let unauthorized_capability = protocol::ServerFrame {
+        let available_routes = protocol::ServerFrame {
             payload: Some(protocol::server_frame::Payload::Authenticated(
                 protocol::Authenticated {
                     device_public_key: public_key.to_vec(),
@@ -9282,9 +9503,7 @@ mod tests {
                 },
             )),
         };
-        assert!(
-            decode_authenticated(&unauthorized_capability.encode_to_vec(), &public_key).is_err()
-        );
+        assert!(decode_authenticated(&available_routes.encode_to_vec(), &public_key).is_ok());
     }
 
     #[tokio::test]

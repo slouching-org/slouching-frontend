@@ -13,7 +13,7 @@ futures-util = "0.3"
 async-stream = "0.3"
 prost = "=0.14.4"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
-tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["connect"] }
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 bytes = "=1.12.1"
 hex = "=0.4.3"
 base64 = "=0.22.1"

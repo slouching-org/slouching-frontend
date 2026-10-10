@@ -108,12 +108,20 @@ The helper contract and limits are in
 [`docs/fichas/identity/pairing-rendezvous-v1.md`](../../docs/fichas/identity/pairing-rendezvous-v1.md).
 
 The local development WebSocket gateway proves possession of the same device
-key with a fresh Ed25519 challenge. It does not enroll devices or authorize
-product routes. From the project root, `./scripts/smoke-gateway-auth-e2e.sh`
-starts an isolated SQLite-backed Elixir helper and verifies the Rust/Iroh
-signature against its live WebSocket, including Ping/Pong. The fixed test key
-is used only by this smoke test; the desktop client signs with the key in
-Secret Service.
+key with a fresh Ed25519 challenge. The Rust client also has an experimental
+two-device SFU signaling mode. Set `SLOUCHING_SFU_WS_URL` on both clients to
+the same helper URL (for example `wss://helper.example/ws`), load the same
+two-member call MLS group, and each participant starts the call from the
+**Chamada** panel. The helper checks device-signed roster consistency but
+cannot verify MLS membership independently. A smoke test covers two software
+clients and protected audio forwarded by a local helper; physical audio
+devices and different networks have not been tested.
+From the project root, `./scripts/smoke-gateway-auth-e2e.sh` starts an isolated
+SQLite-backed Elixir helper and verifies device authentication, Ping/Pong,
+signed roster admission, SDP negotiation, ICE/DTLS, and protected audio
+forwarding between two Rust software clients. The fixed test keys are used
+only by this smoke test; the desktop client
+signs with the key in Secret Service.
 
 ## Camera video in a call
 
@@ -134,7 +142,8 @@ cargo run -- --list-cameras
 Capture currently targets Linux V4L2, Windows Media Foundation, and macOS
 AVFoundation. Frames are bounded to 1920 × 1080 at capture and scaled for the
 protected call-video limit. System-audio capture, noise suppression, echo
-cancellation, push-to-talk, and an SFU remain unimplemented. Camera permission
+cancellation, and push-to-talk remain unimplemented. The experimental SFU mode
+is not yet validated across clients or networks. Camera permission
 and cross-machine video still need runtime validation.
 
 The **Janelas** tab in **Escolher tela** lists visible, non-minimized windows.
@@ -153,8 +162,9 @@ currently enumerate X11/XWayland windows.
 The **Conexão & rotas** screen reads the current local identity, UDP listener,
 QUIC send result, WebRTC peer-connection state, and Elixir diagnostic status.
 Its actions open the direct-text, MLS, call, and Network & P2P screens. It does
-not claim automatic discovery, TURN, or SFU availability. Relay configuration
-for text is separate from TURN for WebRTC media.
+not claim automatic discovery or TURN availability. The experimental SFU call
+route is selected separately with `SLOUCHING_SFU_WS_URL`; text relay settings
+do not configure WebRTC media routes.
 
 ## Direct peer messages
 
@@ -654,6 +664,7 @@ SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-capture
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-invite
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-invite-imported
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 10-call --capture-call-negotiation
+SLOUCHING_WINDOW_SIZE=1280x800 SLOUCHING_SFU_WS_URL=ws://127.0.0.1:3707/ws cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 10-call --capture-call-sfu
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 05-share --capture-share-camera
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 05-share --capture-share-window
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 04-connecting
@@ -669,6 +680,10 @@ addresses for the direct-chat capture; they are fixtures, not live interfaces.
 The route labels were updated after the current `06-chat.png` capture; this
 headless checkout cannot refresh it because Iced requires a Wayland or X11
 display.
+The SFU entry action was added to the call view, but its screenshot could not
+be captured in this checkout because neither `WAYLAND_DISPLAY` nor `DISPLAY`
+is available; run the `--capture-call-sfu` command above in a graphical
+session to refresh it.
 `SLOUCHING_WINDOW_SIZE` only requests an initial size. The normal
 default is a compact 1100 × 720 window.
 `--capture-mls-review` adds sample pending, approved, and rejected proposals to

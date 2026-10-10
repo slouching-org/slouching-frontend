@@ -1370,6 +1370,9 @@ fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
     ]
     .spacing(l.px(6.0));
     let identity_ready = matches!(state.identity_status, crate::IdentityStatus::Ready(_));
+    let sfu_configured =
+        std::env::var("SLOUCHING_SFU_WS_URL").is_ok_and(|url| !url.trim().is_empty());
+    let can_start_call = state.active_peer_device.is_some() || sfu_configured;
     let call_group_controls: Element<'_, Message> = if state.call_group_id.is_empty() {
         column![
             l.label("Nenhum grupo MLS de chamada neste perfil.", 10.0, MUTED),
@@ -1406,6 +1409,8 @@ fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 "headphones",
                 if state.call_rtc_session.is_some() {
                     "Encerrar chamada"
+                } else if state.active_peer_device.is_none() && sfu_configured {
+                    "Entrar pelo SFU"
                 } else {
                     "Negociar WebRTC"
                 },
@@ -1414,7 +1419,7 @@ fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 } else {
                     Message::StartCall
                 }),
-                state.call_rtc_session.is_some() || state.active_peer_device.is_some()
+                state.call_rtc_session.is_some() || can_start_call
             ),
             l.control(
                 "plus",
