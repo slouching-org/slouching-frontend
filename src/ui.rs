@@ -3531,8 +3531,98 @@ fn verification(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 can_toggle.then_some(Message::TogglePeerVerification),
                 state.peer_key_verified
             ),
+            l.label("NOME LOCAL DO CONTATO · OPCIONAL", 9.0, GOLD),
+            l.input_maybe(
+                "Nome salvo só neste dispositivo",
+                &state.peer_contact_alias,
+                can_toggle.then_some(Message::PeerContactAliasChanged as fn(String) -> Message)
+            ),
+            l.control(
+                "check",
+                "Salvar nome local",
+                can_toggle.then_some(Message::SavePeerContactAlias),
+                false
+            ),
+            l.label(state.peer_contact_status.clone(), 9.0, MUTED),
         ]
         .spacing(l.px(12.0)),
+    );
+    let contact_rows: Vec<Element<'_, Message>> = state
+        .verified_peers
+        .iter()
+        .map(|contact| {
+            let encoded = crate::hex_encode_bytes(&contact.device_public_key);
+            let title = if contact.display_name.is_empty() {
+                format!("Dispositivo {}…{}", &encoded[..8], &encoded[56..])
+            } else {
+                contact.display_name.clone()
+            };
+            let route = state
+                .peer_routes
+                .iter()
+                .find(|route| route.device_public_key == contact.device_public_key)
+                .map(|route| {
+                    if route.relay_only {
+                        "relay do grupo".to_owned()
+                    } else {
+                        route.address.clone()
+                    }
+                })
+                .unwrap_or_else(|| "sem rota salva".to_owned());
+            button(
+                row![
+                    column![
+                        l.label(title, 10.0, PAPER),
+                        l.label(
+                            format!("{}…{} · {route}", &encoded[..12], &encoded[60..]),
+                            8.0,
+                            MUTED
+                        )
+                    ]
+                    .spacing(l.px(2.0)),
+                    space().width(Fill),
+                    l.label("Abrir", 9.0, GOLD)
+                ]
+                .align_y(iced::Center)
+                .spacing(l.px(8.0)),
+            )
+            .on_press(Message::SelectVerifiedPeer(contact.device_public_key))
+            .padding([l.px(6.0), l.px(8.0)])
+            .width(Fill)
+            .style(|_, status| button_style(status, false, false))
+            .into()
+        })
+        .collect::<Vec<_>>();
+    let contacts_content: Element<'_, Message> = if let Some(error) =
+        state.verified_peers_error.as_ref()
+    {
+        l.label(format!("Falha ao carregar contatos: {error}"), 9.0, RED)
+            .into()
+    } else if contact_rows.is_empty() {
+        l.label(
+            "Nenhuma chave verificada ainda. Pareie ou importe um convite, compare o fingerprint e marque a chave como conferida.",
+            9.0,
+            MUTED,
+        )
+        .into()
+    } else {
+        scrollable(column(contact_rows).spacing(l.px(4.0)))
+            .height(l.px(112.0))
+            .into()
+    };
+    let contacts = l.panel(
+        column![
+            l.label(
+                format!(
+                    "CONTATOS CONFERIDOS NESTE DISPOSITIVO · {}",
+                    state.verified_peers.len()
+                ),
+                10.0,
+                GOLD
+            ),
+            contacts_content
+        ]
+        .spacing(l.px(6.0)),
     );
     let instructions = l.panel(
         column![
@@ -3654,6 +3744,7 @@ fn verification(state: &Slouching, l: Layout) -> Element<'_, Message> {
             .spacing(l.px(8.0)),
             pairing,
             row![own, peer].spacing(l.px(16.0)),
+            contacts,
             instructions
         ]
         .spacing(l.px(16.0)),

@@ -30,7 +30,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 25;
+const PROFILE_SCHEMA_VERSION: u32 = 26;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 const MAX_DELEGATED_COPY_BYTES: usize = 32 * 1024;
@@ -299,6 +299,13 @@ pub struct StoredPeerRoute {
     pub device_public_key: [u8; 32],
     pub address: String,
     pub relay_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredVerifiedPeer {
+    pub device_public_key: [u8; 32],
+    pub display_name: String,
+    pub verified_at_unix: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -606,6 +613,64 @@ pub fn list_peer_routes() -> Result<Vec<StoredPeerRoute>, String> {
 pub fn peer_key_is_verified(device_public_key: [u8; 32]) -> Result<bool, String> {
     let connection = open_local_database()?;
     peer_key_is_verified_in(&connection, device_public_key)
+}
+
+/// Lists only device keys that the user manually verified in this profile.
+pub fn list_verified_peers() -> Result<Vec<StoredVerifiedPeer>, String> {
+    let connection = open_local_database()?;
+    list_verified_peers_in(&connection)
+}
+
+fn list_verified_peers_in(connection: &Connection) -> Result<Vec<StoredVerifiedPeer>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT device_public_key, display_name, verified_at_unix
+             FROM local_verified_peers
+             ORDER BY CASE WHEN display_name = '' THEN 1 ELSE 0 END,
+                      display_name COLLATE NOCASE, device_public_key",
+        )
+        .map_err(|error| format!("could not prepare verified peer list: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            let key: Vec<u8> = row.get(0)?;
+            let device_public_key =
+                <[u8; 32]>::try_from(key.as_slice()).map_err(|_| rusqlite::Error::InvalidQuery)?;
+            Ok(StoredVerifiedPeer {
+                device_public_key,
+                display_name: row.get(1)?,
+                verified_at_unix: row.get(2)?,
+            })
+        })
+        .map_err(|error| format!("could not query verified peers: {error}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("could not decode verified peer list: {error}"))
+}
+
+/// Saves an optional local label only for an already verified exact device key.
+pub fn set_verified_peer_name(device_public_key: [u8; 32], name: &str) -> Result<(), String> {
+    let connection = open_local_database()?;
+    set_verified_peer_name_in(&connection, device_public_key, name)
+}
+
+fn set_verified_peer_name_in(
+    connection: &Connection,
+    device_public_key: [u8; 32],
+    name: &str,
+) -> Result<(), String> {
+    let normalized = name.trim();
+    if normalized.chars().count() > 64 || normalized.chars().any(char::is_control) {
+        return Err("contact name must be at most 64 characters without control characters".into());
+    }
+    if !peer_key_is_verified_in(connection, device_public_key)? {
+        return Err("verify this exact device key before naming it as a contact".into());
+    }
+    connection
+        .execute(
+            "UPDATE local_verified_peers SET display_name = ?1 WHERE device_public_key = ?2",
+            params![normalized, device_public_key.as_slice()],
+        )
+        .map_err(|error| format!("could not save verified peer name: {error}"))?;
+    Ok(())
 }
 
 fn peer_key_is_verified_in(
@@ -6208,6 +6273,16 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
             )
             .map_err(|error| format!("could not create delivery mailbox settings: {error}"))?;
     }
+    if version < 26 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE local_verified_peers
+                     ADD COLUMN display_name TEXT NOT NULL DEFAULT ''
+                         CHECK (length(display_name) <= 64);
+                 PRAGMA user_version = 26;",
+            )
+            .map_err(|error| format!("could not add local verified contact names: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -6350,6 +6425,7 @@ mod tests {
         connection
             .execute_batch(
                 "ALTER TABLE local_profile DROP COLUMN familiar_image_png;
+                 ALTER TABLE local_verified_peers DROP COLUMN display_name;
                  PRAGMA user_version = 23;",
             )
             .expect("test should restore the prior profile schema");
@@ -6432,15 +6508,28 @@ mod tests {
         let verified_key = [0x77; 32];
         let changed_key = [0x78; 32];
         assert!(!peer_key_is_verified_in(&connection, verified_key).unwrap());
+        assert!(set_verified_peer_name_in(&connection, verified_key, "Vitchola").is_err());
         set_peer_key_verified_in(&connection, verified_key, true).unwrap();
+        assert!(set_verified_peer_name_in(&connection, verified_key, &"x".repeat(65)).is_err());
+        assert!(set_verified_peer_name_in(&connection, verified_key, "invalid\nname").is_err());
+        set_verified_peer_name_in(&connection, verified_key, "  Vitchola  ").unwrap();
         assert!(peer_key_is_verified_in(&connection, verified_key).unwrap());
         assert!(!peer_key_is_verified_in(&connection, changed_key).unwrap());
+        let contacts = list_verified_peers_in(&connection).unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].device_public_key, verified_key);
+        assert_eq!(contacts[0].display_name, "Vitchola");
         drop(connection);
 
         connection = open_database(&path, &[0x76; 32]).expect("profile should reopen");
         assert!(peer_key_is_verified_in(&connection, verified_key).unwrap());
+        assert_eq!(
+            list_verified_peers_in(&connection).unwrap()[0].display_name,
+            "Vitchola"
+        );
         set_peer_key_verified_in(&connection, verified_key, false).unwrap();
         assert!(!peer_key_is_verified_in(&connection, verified_key).unwrap());
+        assert!(list_verified_peers_in(&connection).unwrap().is_empty());
         connection
             .execute_batch(
                 "DROP TABLE local_verified_peers;
@@ -8968,7 +9057,8 @@ mod tests {
             .execute_batch(
                 "ALTER TABLE local_mls_groups DROP COLUMN purpose;
                  ALTER TABLE local_mls_welcome_receipts DROP COLUMN purpose;
-                 ALTER TABLE local_profile DROP COLUMN familiar_image_png;",
+                 ALTER TABLE local_profile DROP COLUMN familiar_image_png;
+                 ALTER TABLE local_verified_peers DROP COLUMN display_name;",
             )
             .expect("test should restore the version 21 MLS schema");
         connection

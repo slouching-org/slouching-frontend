@@ -463,9 +463,13 @@ manual comparison. The experimental Iced SPAKE2 flow uses a fresh 100-bit code,
 transcript-bound key confirmation, and encrypted signed device proofs relayed
 by the Elixir helper. A live-helper two-client test covers successful exchange
 and mismatched-code rejection. The flow does not establish human identity or
-mark contacts trusted; see the [client boundary](https://github.com/slouching-org/slouching/blob/main/docs/fichas/identity/spake2-prototype.md)
+mark contacts trusted. Manually verified device keys appear in a local
+SQLCipher-backed contacts list with optional local labels and saved-route
+hints. Selecting a contact opens direct chat with that exact pinned key; it does
+not prove the saved route still works. Cross-device directory discovery remains
+open. See the [client boundary](https://github.com/slouching-org/slouching/blob/main/docs/fichas/identity/spake2-prototype.md)
 and [rendezvous contract](https://github.com/slouching-org/slouching/blob/main/docs/fichas/identity/pairing-rendezvous-v1.md).
-Contact discovery remains open. OpenMLS credentials include a versioned binding signed by the durable device key. One-use
+Authenticated remote contact discovery remains open. OpenMLS credentials include a versioned binding signed by the durable device key. One-use
 KeyPackages and private MLS state are stored in SQLCipher. The direct-chat
 screen separately pins device public keys. Character scenes remain visual
 previews. **Áudio & vídeo** enumerates real audio inputs and outputs, and lets
@@ -641,9 +645,10 @@ and playback, but not this illustrative capture.
 `--capture-lan-discovery` shows a sample mDNS result; it is a fixture, not a
 live listener.
 `--capture-peer-verification` supplies sample local and peer keys for the trust
-screen capture and its derived 256-bit fingerprint; they are fixtures, not
-identities from the keyring. Refresh the identity screenshot from a graphical
-Wayland or X11 session; this checkout has no display server.
+screen, verified-contact list, and derived 256-bit fingerprint; they are
+fixtures, not identities from the keyring. The updated capture was attempted
+here, but Iced cannot start without `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, or
+`DISPLAY`; refresh the identity screenshot in a graphical Wayland or X11 session.
 `--capture-contact-pairing` shows the experimental code-pairing controls with
 sample session and code values; they are fixtures and cannot connect to a peer.
 Refreshing this capture was attempted after adding the controls, but this

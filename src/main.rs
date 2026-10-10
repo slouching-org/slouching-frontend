@@ -282,6 +282,11 @@ struct Slouching {
     peer_verification_loaded_for: Option<String>,
     peer_key_verified: bool,
     peer_verification_status: String,
+    peer_contact_alias: String,
+    peer_contact_status: String,
+    verified_peers: Vec<storage::StoredVerifiedPeer>,
+    verified_peers_error: Option<String>,
+    verified_peers_generation: u64,
     pairing_helper_url: String,
     pairing_session_id: String,
     pairing_code: String,
@@ -502,6 +507,11 @@ impl Default for Slouching {
             peer_key_verified: false,
             peer_verification_status: "Compare a chave completa por um canal independente."
                 .to_owned(),
+            peer_contact_alias: String::new(),
+            peer_contact_status: String::new(),
+            verified_peers: Vec::new(),
+            verified_peers_error: None,
+            verified_peers_generation: 0,
             pairing_helper_url: "http://127.0.0.1:3707".to_owned(),
             pairing_session_id: String::new(),
             pairing_code: String::new(),
@@ -711,6 +721,11 @@ enum Message {
     PeerVerificationLoaded(String, Result<bool, String>),
     TogglePeerVerification,
     PeerVerificationSaved(String, bool, Result<(), String>),
+    VerifiedPeersLoaded(u64, Result<Vec<storage::StoredVerifiedPeer>, String>),
+    PeerContactAliasChanged(String),
+    SavePeerContactAlias,
+    PeerContactAliasSaved(String, Result<Vec<storage::StoredVerifiedPeer>, String>),
+    SelectVerifiedPeer([u8; 32]),
     PeerHistoryLoaded(
         u64,
         String,
@@ -2428,6 +2443,17 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         Message::PeerPublicKeyChanged(value) => {
             if state.peer_public_key != value {
                 state.peer_public_key = value.clone();
+                state.peer_contact_alias = parse_peer_id(&value)
+                    .ok()
+                    .and_then(|peer| {
+                        state
+                            .verified_peers
+                            .iter()
+                            .find(|contact| contact.device_public_key == *peer.as_bytes())
+                    })
+                    .map(|contact| contact.display_name.clone())
+                    .unwrap_or_default();
+                state.peer_contact_status.clear();
                 state.peer_invite_addresses.clear();
                 state.peer_invite_status =
                     "Chave manual alterada; endereços do convite anterior removidos.".to_owned();
@@ -2523,12 +2549,17 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     Ok(()) => {
                         state.peer_verification_loaded_for = Some(peer_key);
                         state.peer_key_verified = verified;
+                        if !verified {
+                            state.peer_contact_alias.clear();
+                            state.peer_contact_status.clear();
+                        }
                         state.peer_verification_status = if verified {
                             "Chave conferida e marcada como verificada neste dispositivo."
                         } else {
                             "Verificação local removida para esta chave."
                         }
                         .to_owned();
+                        return load_verified_peers(state);
                     }
                     Err(error) => {
                         state.peer_verification_status =
@@ -2536,6 +2567,90 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     }
                 }
             }
+        }
+        Message::VerifiedPeersLoaded(generation, result)
+            if generation == state.verified_peers_generation =>
+        {
+            match result {
+                Ok(contacts) => {
+                    state.verified_peers = contacts;
+                    state.verified_peers_error = None;
+                    if let Ok(peer) = parse_peer_id(&state.peer_public_key) {
+                        state.peer_contact_alias = state
+                            .verified_peers
+                            .iter()
+                            .find(|contact| contact.device_public_key == *peer.as_bytes())
+                            .map(|contact| contact.display_name.clone())
+                            .unwrap_or_default();
+                    }
+                }
+                Err(error) => state.verified_peers_error = Some(error),
+            }
+        }
+        Message::VerifiedPeersLoaded(_, _) => {}
+        Message::PeerContactAliasChanged(name) => state.peer_contact_alias = name,
+        Message::SavePeerContactAlias => {
+            if !state.peer_key_verified {
+                state.peer_contact_status =
+                    "Verifique a chave completa antes de salvar um nome de contato.".to_owned();
+                return Task::none();
+            }
+            let peer = match parse_peer_id(&state.peer_public_key) {
+                Ok(peer) => *peer.as_bytes(),
+                Err(error) => {
+                    state.peer_contact_status = error;
+                    return Task::none();
+                }
+            };
+            state.peer_contact_status = "Salvando nome neste perfil…".to_owned();
+            let name = state.peer_contact_alias.clone();
+            return Task::perform(save_peer_contact_alias_task(peer, name), move |result| {
+                Message::PeerContactAliasSaved(hex_encode_key(&peer), result)
+            });
+        }
+        Message::PeerContactAliasSaved(peer_key, result) => {
+            let current = parse_peer_id(&state.peer_public_key)
+                .ok()
+                .map(|peer| hex_encode_key(peer.as_bytes()));
+            if current.as_deref() == Some(peer_key.as_str()) {
+                match result {
+                    Ok(contacts) => {
+                        state.verified_peers_generation =
+                            state.verified_peers_generation.saturating_add(1);
+                        state.verified_peers = contacts;
+                        state.verified_peers_error = None;
+                        state.peer_contact_status = "Nome salvo neste perfil.".to_owned();
+                    }
+                    Err(error) => state.peer_contact_status = error,
+                }
+            }
+        }
+        Message::SelectVerifiedPeer(peer_key) => {
+            let Some(contact) = state
+                .verified_peers
+                .iter()
+                .find(|contact| contact.device_public_key == peer_key)
+            else {
+                return Task::none();
+            };
+            let display_name = contact.display_name.clone();
+            if let Some(route) = state
+                .peer_routes
+                .iter()
+                .find(|route| route.device_public_key == peer_key && !route.relay_only)
+            {
+                state.peer_address = route.address.clone();
+            } else {
+                state.peer_address.clear();
+            }
+            state.screen = Screen::Chat;
+            state.show_gallery = false;
+            let task = update(
+                state,
+                Message::PeerPublicKeyChanged(hex_encode_key(&peer_key)),
+            );
+            state.peer_contact_alias = display_name;
+            return task;
         }
         Message::PeerHistoryLoaded(generation, peer_key, result) => {
             if generation == state.peer_history_generation
@@ -5920,6 +6035,36 @@ fn boot() -> (Slouching, Task<Message>) {
         state.peer_key_verified = true;
         state.peer_verification_status =
             "Chave conferida e marcada como verificada neste dispositivo.".to_owned();
+        state.peer_contact_alias = "Vitchola".to_owned();
+        state.verified_peers = vec![
+            storage::StoredVerifiedPeer {
+                device_public_key: peer_key,
+                display_name: "Vitchola".to_owned(),
+                verified_at_unix: 1_800_000_000,
+            },
+            storage::StoredVerifiedPeer {
+                device_public_key: [0x33; 32],
+                display_name: "Mara".to_owned(),
+                verified_at_unix: 1_800_000_001,
+            },
+            storage::StoredVerifiedPeer {
+                device_public_key: [0x44; 32],
+                display_name: String::new(),
+                verified_at_unix: 1_800_000_002,
+            },
+        ];
+        state.peer_routes = vec![
+            storage::StoredPeerRoute {
+                device_public_key: peer_key,
+                address: "192.168.1.42:45873".to_owned(),
+                relay_only: false,
+            },
+            storage::StoredPeerRoute {
+                device_public_key: [0x33; 32],
+                address: "via group relay".to_owned(),
+                relay_only: true,
+            },
+        ];
     }
     if capture_contact_pairing {
         state.screen = Screen::Verify;
@@ -5999,6 +6144,11 @@ fn boot() -> (Slouching, Task<Message>) {
     };
     let (transport, handle) = transport_task(state.transport_generation);
     state.transport_handle = Some(handle);
+    let verified_peers = if capture_peer_verification || capture_contact_pairing {
+        Task::none()
+    } else {
+        load_verified_peers(&mut state)
+    };
     (
         state,
         Task::batch([
@@ -6027,6 +6177,7 @@ fn boot() -> (Slouching, Task<Message>) {
             },
             load_mls_groups(),
             Task::perform(load_peer_routes_task(), Message::PeerRoutesLoaded),
+            verified_peers,
             Task::perform(load_audio_devices_task(), Message::AudioDevicesLoaded),
             if capture_share_camera {
                 Task::perform(enumerate_cameras_task(), Message::CameraSourcesLoaded)
@@ -6396,6 +6547,32 @@ async fn set_peer_verification_task(
     tokio::task::spawn_blocking(move || storage::set_peer_key_verified(device_public_key, verified))
         .await
         .map_err(|error| format!("peer verification save task failed: {error}"))?
+}
+
+fn load_verified_peers(state: &mut Slouching) -> Task<Message> {
+    state.verified_peers_generation = state.verified_peers_generation.saturating_add(1);
+    let generation = state.verified_peers_generation;
+    Task::perform(load_verified_peers_task(), move |result| {
+        Message::VerifiedPeersLoaded(generation, result)
+    })
+}
+
+async fn load_verified_peers_task() -> Result<Vec<storage::StoredVerifiedPeer>, String> {
+    tokio::task::spawn_blocking(storage::list_verified_peers)
+        .await
+        .map_err(|error| format!("verified contact list task failed: {error}"))?
+}
+
+async fn save_peer_contact_alias_task(
+    device_public_key: [u8; 32],
+    name: String,
+) -> Result<Vec<storage::StoredVerifiedPeer>, String> {
+    tokio::task::spawn_blocking(move || {
+        storage::set_verified_peer_name(device_public_key, &name)?;
+        storage::list_verified_peers()
+    })
+    .await
+    .map_err(|error| format!("verified contact name task failed: {error}"))?
 }
 
 async fn clear_direct_history_task(peer_device: [u8; 32]) -> Result<usize, String> {
@@ -8461,6 +8638,47 @@ mod tests {
         assert!(state.peer_public_key.is_empty());
         assert!(state.peer_verification_loaded_for.is_none());
         assert!(!state.peer_key_verified);
+    }
+
+    #[test]
+    fn selecting_verified_contact_opens_chat_with_its_exact_key_and_saved_route() {
+        let device_public_key = [0x37; 32];
+        let mut state = Slouching {
+            screen: Screen::Verify,
+            verified_peers: vec![storage::StoredVerifiedPeer {
+                device_public_key,
+                display_name: "Vitchola".to_owned(),
+                verified_at_unix: 1_800_000_000,
+            }],
+            peer_routes: vec![storage::StoredPeerRoute {
+                device_public_key,
+                address: "192.168.1.42:45873".to_owned(),
+                relay_only: false,
+            }],
+            ..Slouching::default()
+        };
+
+        let _ = update(&mut state, Message::SelectVerifiedPeer(device_public_key));
+
+        assert_eq!(state.screen, Screen::Chat);
+        assert_eq!(state.peer_public_key, hex_encode_key(&device_public_key));
+        assert_eq!(state.peer_address, "192.168.1.42:45873");
+        assert_eq!(state.peer_contact_alias, "Vitchola");
+        assert!(!state.peer_key_verified);
+        assert!(state.peer_verification_loaded_for.is_none());
+    }
+
+    #[test]
+    fn verified_contact_picker_rejects_keys_outside_the_local_roster() {
+        let mut state = Slouching {
+            screen: Screen::Verify,
+            ..Slouching::default()
+        };
+
+        let _ = update(&mut state, Message::SelectVerifiedPeer([0x37; 32]));
+
+        assert_eq!(state.screen, Screen::Verify);
+        assert!(state.peer_public_key.is_empty());
     }
 
     #[test]
