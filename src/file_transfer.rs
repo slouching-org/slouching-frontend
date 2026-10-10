@@ -20,6 +20,11 @@ const FILE_AAD_PREFIX: &[u8] = b"SLCH-FILE-CHUNK-v1";
 const FILE_OFFER_MAGIC: &[u8; 4] = b"SLFO";
 const FILE_OFFER_VERSION: u16 = 1;
 const FILE_OFFER_FIXED_BYTES: usize = 4 + 2 + 16 + 32 + 8 + 4 + 2;
+const MLS_FILE_OFFER_MAGIC: &[u8; 4] = b"SLFA";
+const MLS_FILE_OFFER_VERSION: u16 = 1;
+const MLS_FILE_OFFER_HEADER_BYTES: usize = 4 + 2 + 32;
+const MLS_FILE_OFFER_TEXT_PREFIX: &str = "slouching:file:v1:";
+const MLS_FILE_OFFER_MAX_BYTES: usize = MLS_FILE_OFFER_HEADER_BYTES + FILE_OFFER_FIXED_BYTES + 255;
 
 /// Metadata and per-file key sent only inside the pinned QUIC session.
 #[derive(PartialEq, Eq)]
@@ -132,6 +137,63 @@ impl FileOffer {
             chunk_count: declared_chunk_count,
             filename,
         })
+    }
+}
+
+/// A small group-encrypted attachment reference. The blob itself remains in
+/// the Iroh store; only its ciphertext hash and key-bearing offer enter MLS.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FileAttachmentOffer {
+    pub offer: FileOffer,
+    pub ciphertext_hash: [u8; 32],
+}
+
+impl FileAttachmentOffer {
+    pub fn encode_mls_text(&self) -> Result<String, String> {
+        let encoded_offer = self.offer.encode()?;
+        let mut payload = Vec::with_capacity(MLS_FILE_OFFER_HEADER_BYTES + encoded_offer.len());
+        payload.extend_from_slice(MLS_FILE_OFFER_MAGIC);
+        payload.extend_from_slice(&MLS_FILE_OFFER_VERSION.to_be_bytes());
+        payload.extend_from_slice(&self.ciphertext_hash);
+        payload.extend_from_slice(&encoded_offer);
+        Ok(format!(
+            "{MLS_FILE_OFFER_TEXT_PREFIX}{}",
+            hex::encode(payload)
+        ))
+    }
+
+    /// Returns `None` for ordinary chat text. Any text using the reserved
+    /// attachment prefix must decode strictly or is rejected as malformed.
+    pub fn decode_mls_text(text: &str) -> Result<Option<Self>, String> {
+        let Some(encoded) = text.strip_prefix(MLS_FILE_OFFER_TEXT_PREFIX) else {
+            return Ok(None);
+        };
+        if encoded.len() > MLS_FILE_OFFER_MAX_BYTES * 2 || encoded.len() % 2 != 0 {
+            return Err("MLS attachment offer exceeds its encoded size limit".to_owned());
+        }
+        let payload = hex::decode(encoded)
+            .map_err(|_| "MLS attachment offer is not valid hexadecimal".to_owned())?;
+        if payload.len() < MLS_FILE_OFFER_HEADER_BYTES + FILE_OFFER_FIXED_BYTES
+            || payload.len() > MLS_FILE_OFFER_MAX_BYTES
+        {
+            return Err("MLS attachment offer has an invalid length".to_owned());
+        }
+        if &payload[..4] != MLS_FILE_OFFER_MAGIC {
+            return Err("MLS attachment offer has an invalid marker".to_owned());
+        }
+        let version = u16::from_be_bytes([payload[4], payload[5]]);
+        if version != MLS_FILE_OFFER_VERSION {
+            return Err(format!(
+                "unsupported MLS attachment offer version: {version}"
+            ));
+        }
+        let mut ciphertext_hash = [0; 32];
+        ciphertext_hash.copy_from_slice(&payload[6..MLS_FILE_OFFER_HEADER_BYTES]);
+        let offer = FileOffer::decode(&payload[MLS_FILE_OFFER_HEADER_BYTES..])?;
+        Ok(Some(Self {
+            offer,
+            ciphertext_hash,
+        }))
     }
 }
 
@@ -703,6 +765,50 @@ mod tests {
         assert_eq!(decoded.chunk_count, 2);
         assert_eq!(decoded.filename, "crew notes.txt");
         assert!(!format!("{decoded:?}").contains(&"52".repeat(32)));
+    }
+
+    #[test]
+    fn mls_file_attachment_offer_round_trips_and_rejects_malformed_reserved_text() {
+        let secrets = FileTransferSecrets::from_parts([0x36; 16], [0x57; 32]);
+        let attachment = FileAttachmentOffer {
+            offer: FileOffer::from_secrets(&secrets, 98_765, "notes.pdf".to_owned()).unwrap(),
+            ciphertext_hash: [0x78; 32],
+        };
+        let encoded = attachment.encode_mls_text().unwrap();
+        assert!(encoded.len() < 1024);
+        let decoded = FileAttachmentOffer::decode_mls_text(&encoded)
+            .unwrap()
+            .expect("reserved attachment text should decode as a file offer");
+        assert_eq!(decoded.ciphertext_hash, [0x78; 32]);
+        assert_eq!(decoded.offer.transfer_id, [0x36; 16]);
+        assert_eq!(decoded.offer.content_key, [0x57; 32]);
+        assert_eq!(decoded.offer.total_bytes, 98_765);
+        assert_eq!(decoded.offer.filename, "notes.pdf");
+        assert_eq!(
+            FileAttachmentOffer::decode_mls_text("hello crew").unwrap(),
+            None
+        );
+
+        let malformed = format!("{MLS_FILE_OFFER_TEXT_PREFIX}xyz");
+        assert!(FileAttachmentOffer::decode_mls_text(&malformed).is_err());
+        let mut wrong_version =
+            hex::decode(encoded.strip_prefix(MLS_FILE_OFFER_TEXT_PREFIX).unwrap()).unwrap();
+        wrong_version[5] = 2;
+        let wrong_version = format!("{MLS_FILE_OFFER_TEXT_PREFIX}{}", hex::encode(wrong_version));
+        assert!(
+            FileAttachmentOffer::decode_mls_text(&wrong_version)
+                .unwrap_err()
+                .contains("version")
+        );
+        let oversized = format!(
+            "{MLS_FILE_OFFER_TEXT_PREFIX}{}",
+            "a".repeat(MLS_FILE_OFFER_MAX_BYTES * 2 + 2)
+        );
+        assert!(
+            FileAttachmentOffer::decode_mls_text(&oversized)
+                .unwrap_err()
+                .contains("size limit")
+        );
     }
 
     #[test]

@@ -45,9 +45,12 @@ offer, and the schema migration backfills sizes from existing offers. The
 receive core stages plaintext in a temporary file and publishes it
 only after digest validation, without replacing an existing destination. Local
 two-endpoint tests cover authorized retrieval and rejection of an unauthorized
-peer. The app does not yet wire blob serving to MLS membership authorization,
-coordinate offer persistence with blob lifecycle, or expose a send/accept/save
-flow in the UI. The pinned iroh-blobs 0.103.1 release is marked by its
+peer. A bounded, versioned attachment-offer text codec is ready for carrying
+the blob hash and key-bearing offer inside an MLS application event. The app
+does not yet wire blob serving to MLS membership authorization, coordinate
+offer persistence with blob lifecycle, or expose a send/accept/save flow in the
+UI. The current composer does not create file offers. The pinned iroh-blobs
+0.103.1 release is marked by its
 maintainers as not production quality, so this remains experimental.
 
 The app also opens `ws://127.0.0.1:3707/ws` asynchronously, sends a binary
