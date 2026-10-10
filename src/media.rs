@@ -110,6 +110,26 @@ pub struct MediaFrameReceiver {
 }
 
 impl MediaFrameReceiver {
+    #[cfg(test)]
+    pub(crate) fn member_index(&self) -> u64 {
+        self.member_index
+    }
+
+    pub(crate) fn sender_member_index(epoch: u64, encrypted_frame: &[u8]) -> Result<u64, String> {
+        if encrypted_frame.len() > MAX_ENCODED_FRAME_BYTES + MAX_SFRAME_OVERHEAD_BYTES {
+            return Err("encrypted media frame exceeds 64 KiB".to_owned());
+        }
+        let frame = EncryptedFrameView::try_new(encrypted_frame)
+            .map_err(|error| format!("invalid SFrame header: {error}"))?;
+        let bit_range = MlsKeyIdBitRange::try_new(16, 8)
+            .map_err(|error| format!("invalid SFrame MLS key ID format: {error}"))?;
+        let mls_key_id = MlsKeyId::from_key_id(frame.header().key_id(), bit_range);
+        if mls_key_id.epoch_lsb() != (epoch & 0xffff) {
+            return Err("SFrame key ID does not match the call epoch".to_owned());
+        }
+        Ok(mls_key_id.member_index())
+    }
+
     /// Create a receiver pinned to a current authenticated MLS group member.
     pub fn for_call_group_member(
         group_id: &[u8],

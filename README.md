@@ -245,6 +245,9 @@ MLS group**.
 The call UI currently supports one remote peer per device. The MLS call group
 can have multiple members, but three-or-more-party media and the Elixir SFU are
 not implemented; the sample characters in the call artwork are decorative.
+The audio receive pipeline now has a separate Opus decoder and SFrame replay
+window per remote MLS member, selected by the frame's sender index. This is
+internal groundwork; it does not enable multi-party calls by itself.
 
 1. On one device, open **Chamada**, create a protected call group, then use
    **Convidar participantes** to admit the other device through the MLS flow.

@@ -6,6 +6,7 @@
 
 use crate::media::{MediaFrameReceiver, MediaFrameSender};
 use opus::{Application, Channels};
+use std::collections::HashMap;
 
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
 pub const FRAME_SAMPLES: usize = 960;
@@ -111,7 +112,8 @@ pub struct CallAudioDecoder {
 /// Receives protected audio from every other member of a call MLS group.
 /// Each sender needs an independent replay window and stateful Opus decoder.
 pub struct CallAudioDecoderSet {
-    decoders: Vec<CallAudioDecoder>,
+    epoch: u64,
+    decoders: HashMap<u64, CallAudioDecoder>,
 }
 
 impl CallAudioDecoderSet {
@@ -122,38 +124,45 @@ impl CallAudioDecoderSet {
             .iter()
             .filter(|member| member.index != context.local_member_index)
             .map(|member| {
-                CallAudioDecoder::new(MediaFrameReceiver::new(
-                    context.epoch,
+                Ok((
                     member.index,
-                    context.base_key.as_slice(),
-                )?)
+                    CallAudioDecoder::new(MediaFrameReceiver::new(
+                        context.epoch,
+                        member.index,
+                        context.base_key.as_slice(),
+                    )?)?,
+                ))
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<HashMap<_, _>, String>>()?;
         if decoders.is_empty() {
             return Err("call MLS group has no remote audio members".to_owned());
         }
-        Ok(Self { decoders })
+        Ok(Self {
+            epoch: context.epoch,
+            decoders,
+        })
     }
 
     #[cfg(test)]
-    pub(crate) fn new(decoders: Vec<CallAudioDecoder>) -> Result<Self, String> {
+    pub(crate) fn new(epoch: u64, decoders: Vec<CallAudioDecoder>) -> Result<Self, String> {
         if decoders.is_empty() {
             return Err("call audio decoder set cannot be empty".to_owned());
         }
-        Ok(Self { decoders })
+        let decoders = decoders
+            .into_iter()
+            .map(|decoder| (decoder.unprotector.member_index(), decoder))
+            .collect();
+        Ok(Self { epoch, decoders })
     }
 
     /// The SFrame member index selects the decoder, preserving per-speaker
     /// replay protection and Opus state while rejecting unknown senders.
     pub fn unprotect_and_decode(&mut self, protected: &[u8]) -> Result<Vec<f32>, String> {
-        let mut last_error = None;
-        for decoder in &mut self.decoders {
-            match decoder.unprotect_and_decode(protected) {
-                Ok(pcm) => return Ok(pcm),
-                Err(error) => last_error = Some(error),
-            }
-        }
-        Err(last_error.unwrap_or_else(|| "call has no remote audio decoder".to_owned()))
+        let member_index = MediaFrameReceiver::sender_member_index(self.epoch, protected)?;
+        self.decoders
+            .get_mut(&member_index)
+            .ok_or_else(|| "SFrame sender is not a remote member of this call".to_owned())?
+            .unprotect_and_decode(protected)
     }
 }
 
@@ -229,16 +238,27 @@ mod tests {
         let mut sender_b =
             CallAudioEncoder::new(MediaFrameSender::new(4, 3, TEST_MLS_EXPORTER_KEY).unwrap())
                 .unwrap();
-        let mut receivers = CallAudioDecoderSet::new(vec![
-            CallAudioDecoder::new(MediaFrameReceiver::new(4, 2, TEST_MLS_EXPORTER_KEY).unwrap())
+        let mut unauthorized_sender =
+            CallAudioEncoder::new(MediaFrameSender::new(4, 9, TEST_MLS_EXPORTER_KEY).unwrap())
+                .unwrap();
+        let mut receivers = CallAudioDecoderSet::new(
+            4,
+            vec![
+                CallAudioDecoder::new(
+                    MediaFrameReceiver::new(4, 2, TEST_MLS_EXPORTER_KEY).unwrap(),
+                )
                 .unwrap(),
-            CallAudioDecoder::new(MediaFrameReceiver::new(4, 3, TEST_MLS_EXPORTER_KEY).unwrap())
+                CallAudioDecoder::new(
+                    MediaFrameReceiver::new(4, 3, TEST_MLS_EXPORTER_KEY).unwrap(),
+                )
                 .unwrap(),
-        ])
+            ],
+        )
         .unwrap();
         let pcm = [0.1; FRAME_SAMPLES];
         let frame_a = sender_a.encode_and_protect(&pcm).unwrap();
         let frame_b = sender_b.encode_and_protect(&pcm).unwrap();
+        let unauthorized_frame = unauthorized_sender.encode_and_protect(&pcm).unwrap();
 
         assert_eq!(
             receivers.unprotect_and_decode(&frame_a).unwrap().len(),
@@ -249,6 +269,7 @@ mod tests {
             receivers.unprotect_and_decode(&frame_b).unwrap().len(),
             FRAME_SAMPLES
         );
+        assert!(receivers.unprotect_and_decode(&unauthorized_frame).is_err());
     }
 
     #[test]

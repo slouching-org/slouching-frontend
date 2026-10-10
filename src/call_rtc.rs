@@ -1192,12 +1192,15 @@ mod tests {
                 crate::media::MediaFrameSender::new(3, 0, EXPORTER_KEY).unwrap(),
             )
             .unwrap(),
-            crate::call_audio::CallAudioDecoderSet::new(vec![
-                crate::call_audio::CallAudioDecoder::new(
-                    crate::media::MediaFrameReceiver::new(3, 1, EXPORTER_KEY).unwrap(),
-                )
-                .unwrap(),
-            ])
+            crate::call_audio::CallAudioDecoderSet::new(
+                3,
+                vec![
+                    crate::call_audio::CallAudioDecoder::new(
+                        crate::media::MediaFrameReceiver::new(3, 1, EXPORTER_KEY).unwrap(),
+                    )
+                    .unwrap(),
+                ],
+            )
             .unwrap(),
             String::new(),
             Arc::new(TestSink(caller_sink_tx)),
@@ -1209,12 +1212,15 @@ mod tests {
                 crate::media::MediaFrameSender::new(3, 1, EXPORTER_KEY).unwrap(),
             )
             .unwrap(),
-            crate::call_audio::CallAudioDecoderSet::new(vec![
-                crate::call_audio::CallAudioDecoder::new(
-                    crate::media::MediaFrameReceiver::new(3, 0, EXPORTER_KEY).unwrap(),
-                )
-                .unwrap(),
-            ])
+            crate::call_audio::CallAudioDecoderSet::new(
+                3,
+                vec![
+                    crate::call_audio::CallAudioDecoder::new(
+                        crate::media::MediaFrameReceiver::new(3, 0, EXPORTER_KEY).unwrap(),
+                    )
+                    .unwrap(),
+                ],
+            )
             .unwrap(),
             String::new(),
             Arc::new(TestSink(callee_sink_tx)),
