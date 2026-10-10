@@ -278,10 +278,21 @@ fn normalize_ws_url(value: &str) -> Result<String, String> {
     {
         return Err("SFU URL must be ws://host[:port][/ws] or wss://host[:port][/ws]".to_owned());
     }
+    if url.scheme() == "ws" && !url.host().is_some_and(is_loopback_host) {
+        return Err("remote SFU helpers require wss://".to_owned());
+    }
     if url.path() == "/" {
         url.set_path("/ws");
     }
     Ok(url.to_string())
+}
+
+fn is_loopback_host(host: url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(address) => address.is_loopback(),
+        url::Host::Ipv6(address) => address.is_loopback(),
+    }
 }
 
 async fn receive_server_frame(
@@ -305,4 +316,30 @@ async fn receive_server_frame(
 
 fn nonempty(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_ws_url;
+
+    #[test]
+    fn local_websocket_urls_are_allowed_but_remote_helpers_require_tls() {
+        assert_eq!(
+            normalize_ws_url("ws://127.0.0.1:3707").unwrap(),
+            "ws://127.0.0.1:3707/ws"
+        );
+        assert_eq!(
+            normalize_ws_url("ws://[::1]:3707/ws").unwrap(),
+            "ws://[::1]:3707/ws"
+        );
+        assert_eq!(
+            normalize_ws_url("wss://helper.example/ws").unwrap(),
+            "wss://helper.example/ws"
+        );
+        assert!(
+            normalize_ws_url("ws://helper.example/ws")
+                .unwrap_err()
+                .contains("require wss://")
+        );
+    }
 }
