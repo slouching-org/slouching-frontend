@@ -1,39 +1,34 @@
 # Frontend technology plan
 
-**Accepted client direction:** native Rust/Iced. This comes from the
-[owner's complete source PDF](https://github.com/slouching-org/slouching-backend/blob/main/docs/fichas/architecture/sources/architecture-p2p-v0.1.pdf).
-Its Elixir server/backend core and Rust/Iced client direction are retained.
+**Accepted client direction:** native Rust/Iced, with Elixir/OTP as the
+optional backend core. This follows the
+[owner's architecture specification](https://github.com/slouching-org/slouching-backend/blob/main/docs/fichas/architecture/sources/architecture-p2p-v0.1.pdf)
+and [ADR 0005](https://github.com/slouching-org/slouching/blob/main/docs/fichas/architecture/adr-0005-elixir-server-core.md).
 
 | Layer | Choice | Current state |
 | --- | --- | --- |
-| Desktop UI | Rust 2024 + pinned Iced 0.14.0 | Native state in `src/main.rs`; eleven design-board views plus an MLS group setup screen |
-| Rendering | Iced/wgpu | Native views with images, SVG icons, and canvas texture; direct chat works over manually addressed routes; call screen starts MLS-validated WebRTC offer/answer signaling |
-| Local client core | Rust identity, cryptography, storage, transport, media | SQLCipher profile and direct-chat history; OpenMLS group setup, transactional event journal, and MLS chat over pinned Iroh/QUIC sessions with durable per-device ACK, saved-route fan-out, and enforced 30-day expiry are implemented; explicit participant Iroh Relay settings support direct and relay-only routes and are covered by a local text/MLS-event transport test; the Opus/SFrame voice-frame codec is locally tested, but CPAL/RTP integration, remote relay deployment, contact discovery, offline delivery, and live media remain pending |
-| Server/backend | Elixir, separately versioned backend repo | Development status and protobuf handshake implemented |
-| State boundary | Versioned protocol | Asynchronous loopback HTTP status and binary protobuf WebSocket handshake v1 integrated; production boundary pending |
-| Browser UI | HTML/CSS/JavaScript | Historical visual prototype in `prototypes/web/`; not product runtime |
-| Identity, MLS, storage, transport, calls | Client and server responsibilities per source PDF | Device-bound MLS signer, pinned-session KeyPackage and self-update proposal delivery, durable Welcome retry with duplicate receipts, designated-committer admission, authenticated application messages with epoch member snapshots and per-device ACKs, ordered direct delivery and saved-route multi-member fan-out; participant relay is opt-in and local-test covered, while remote relay and VPN behavior remain unverified; group discovery, fingerprint verification, guaranteed offline delivery, and usable audio/video calls remain unimplemented |
+| Desktop UI | Rust 2024 + pinned Iced 0.14.0 | Twelve native design-board views with direct chat, MLS, calls, sharing, identity, and settings flows |
+| Rendering | Iced/wgpu | Native images, SVG icons, canvas scenes, local capture previews, and authenticated remote video frames |
+| Local media | CPAL, Opus/SFrame, WebRTC | Device selection and microphone test; direct call media is implemented, with experimental two-device SFU audio tested against the local Elixir helper |
+| Local client core | Rust, Tokio, Iroh/QUIC, OpenMLS | Pinned-device direct chat, MLS groups and events, durable per-device delivery, file transfer, local route book, signed QR invites, and LAN discovery hints |
+| Local persistence | SQLCipher SQLite + OS credential store | Encrypted profile, identity metadata, transcripts, MLS state, outboxes, and optional helper settings; private device keys remain in the OS credential store |
+| Backend | Elixir/OTP, separately versioned repo | Optional SPAKE2 pairing, signed opaque-copy mailbox, and experimental authenticated SFU signaling; remote helper deployment remains unverified |
+| Protocol boundary | Protobuf WebSocket v2 + HTTP helper APIs | Ed25519 device proof, Ping/Pong, signed SFU roster admission, pairing, and mailbox flows; device proof does not establish human trust or MLS membership |
+| Historical UI | HTML/CSS/JavaScript | `prototypes/web/` is a design reference; it is not the product runtime |
 
-The frontend must render authoritative implemented state. It must not generate
-security claims, route badges, presence, or capture status independently.
+Direct messaging and local state do not require a hosted server or PostgreSQL.
+Members may explicitly configure Iroh relay or Elixir helper services. The SFU
+settings page can test WSS, device authentication, and advertised call support;
+it cannot verify UDP media reachability. Calls across physical devices or
+different networks, authenticated remote contact discovery, and release
+packaging remain open.
 
-The frontend currently requests `GET http://127.0.0.1:3707/api/status`
-as a development diagnostic. It checks status contract v1 and the Elixir
-backend marker, then renders the reported capabilities. It also sends a
-single binary protobuf ClientHello v1 to `/ws`, validates the response, and
-keeps a development transport open with Ping/Pong heartbeats. Before a release, define an
-authenticated production boundary and integration tests for identity,
-routing, MLS transitions, and capture state.
+The frontend renders state reported by local transports and cryptographic
+operations. It must not invent security claims, route status, presence, or
+capture status. The local `/api/status` endpoint is a development diagnostic;
+the authenticated WebSocket is used by experimental SFU signaling and does not
+carry ordinary chat or MLS application messages.
 
-Direct peer messaging uses Iroh/QUIC independently from that local server
-diagnostic. MLS application messages also use the direct session once both
-devices have joined the same manually provisioned group. The LAN flow uses the durable Ed25519 device key as the Iroh
-EndpointId and manually pins the expected peer ID on both sides. It sends
-multiple bounded UTF-8 messages over one session stream, with sequence
-acknowledgements and relay mode disabled. This provides
-direct pairwise transport encryption and pinned endpoint authentication only;
-it does not create an MLS group or establish contact pairing. See the
-[direct peer transport v7 contract](../transport/lan-peer-v7.md).
-
-See [ADR 0003](adr-0003-native-client.md) and the
-[backend stack ficha](https://github.com/slouching-org/slouching-backend/blob/main/docs/fichas/architecture/tech-stack.md).
+See [ADR 0003](adr-0003-native-client.md), [the current
+transport contract](../transport/lan-peer-v10.md), and the
+[main project architecture](https://github.com/slouching-org/slouching/blob/main/docs/fichas/architecture/frontend-tech-stack.md).
