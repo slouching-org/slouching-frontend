@@ -4,15 +4,28 @@
 //! ICE candidates into SDP for the initial offer/answer exchange and can apply
 //! later trickled candidates. Media tracks are added by the call media layer.
 
+use bytes::Bytes;
+use media::Sample;
+use rtc::{
+    media_stream::MediaStreamTrack,
+    peer_connection::configuration::media_engine::MIME_TYPE_OPUS,
+    rtp_transceiver::rtp_sender::{
+        RTCRtpCodec, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind,
+    },
+};
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tokio::sync::watch;
+use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use webrtc::{
+    media_stream::{
+        track_local::{TrackLocal, static_sample::TrackLocalStaticSample},
+        track_remote::{TrackRemote, TrackRemoteEvent},
+    },
     peer_connection::{
         MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
         RTCConfigurationBuilder, RTCIceGatheringState, RTCPeerConnectionState, Registry,
@@ -22,11 +35,14 @@ use webrtc::{
 };
 
 const ICE_GATHERING_TIMEOUT: Duration = Duration::from_secs(10);
+const OPUS_PAYLOAD_TYPE: u8 = 111;
+const OPUS_FRAME_DURATION: Duration = Duration::from_millis(20);
 
 #[derive(Clone)]
 struct CallEvents {
     gathering_complete: watch::Sender<bool>,
     connection_state: watch::Sender<String>,
+    incoming_tracks: mpsc::UnboundedSender<Arc<dyn TrackRemote>>,
 }
 
 #[async_trait::async_trait]
@@ -40,6 +56,41 @@ impl PeerConnectionEventHandler for CallEvents {
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
         self.connection_state.send_replace(format!("{state:?}"));
     }
+
+    async fn on_track(&self, track: Arc<dyn TrackRemote>) {
+        let _ = self.incoming_tracks.send(track);
+    }
+}
+
+struct CallAudioState {
+    encoder: AsyncMutex<crate::call_audio::CallAudioEncoder>,
+    decoder: AsyncMutex<crate::call_audio::CallAudioDecoder>,
+    track: Arc<TrackLocalStaticSample>,
+    ssrc: u32,
+    input_device_id: String,
+    sink: Arc<dyn crate::call_audio::AudioSink>,
+}
+
+impl CallAudioState {
+    async fn send_audio_frame(&self, pcm: &[f32]) -> Result<(), String> {
+        let protected = self
+            .encoder
+            .lock()
+            .await
+            .encode_and_protect(pcm)
+            .map_err(|error| error.to_string())?;
+        let now = Instant::now();
+        let sample = Sample {
+            data: Bytes::from(protected),
+            timestamp: now,
+            duration: OPUS_FRAME_DURATION,
+            ..Sample::new(now)
+        };
+        self.track
+            .write_sample(self.ssrc, OPUS_PAYLOAD_TYPE, &sample, &[])
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Owns one WebRTC peer connection. Create exactly one instance per remote
@@ -48,6 +99,11 @@ pub struct CallRtcSession {
     peer_connection: Box<dyn PeerConnection>,
     gathering_complete: watch::Receiver<bool>,
     connection_state: watch::Receiver<String>,
+    audio_status: watch::Sender<String>,
+    incoming_tracks: Mutex<Option<mpsc::UnboundedReceiver<Arc<dyn TrackRemote>>>>,
+    audio: Option<Arc<CallAudioState>>,
+    audio_started: AtomicBool,
+    audio_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     data_channel_created: AtomicBool,
 }
 
@@ -55,9 +111,12 @@ impl CallRtcSession {
     pub async fn new() -> Result<Self, String> {
         let (gathering_tx, gathering_complete) = watch::channel(false);
         let (state_tx, connection_state) = watch::channel("New".to_owned());
+        let (incoming_track_tx, incoming_tracks) = mpsc::unbounded_channel();
+        let (audio_status, _) = watch::channel("Áudio ainda não conectado.".to_owned());
         let handler = Arc::new(CallEvents {
             gathering_complete: gathering_tx,
             connection_state: state_tx,
+            incoming_tracks: incoming_track_tx,
         });
         let mut media_engine = MediaEngine::default();
         media_engine
@@ -82,8 +141,90 @@ impl CallRtcSession {
             peer_connection: Box::new(peer_connection),
             gathering_complete,
             connection_state,
+            audio_status,
+            incoming_tracks: Mutex::new(Some(incoming_tracks)),
+            audio: None,
+            audio_started: AtomicBool::new(false),
+            audio_tasks: Mutex::new(Vec::new()),
             data_channel_created: AtomicBool::new(false),
         })
+    }
+
+    /// Build an audio-capable peer connection using the current call MLS group.
+    /// The microphone and output devices are opened only after ICE/DTLS connects.
+    pub async fn new_for_call_group(
+        group_id: [u8; 16],
+        remote_device: [u8; 32],
+        input_device_id: String,
+        output_device_id: String,
+    ) -> Result<Self, String> {
+        let (encoder, decoder) = tokio::task::spawn_blocking(move || {
+            Ok::<_, String>((
+                crate::call_audio::CallAudioEncoder::for_call_group(&group_id)?,
+                crate::call_audio::CallAudioDecoder::for_call_group_member(
+                    &group_id,
+                    &remote_device,
+                )?,
+            ))
+        })
+        .await
+        .map_err(|error| format!("call media context task failed: {error}"))??;
+        let sink = Arc::new(crate::audio::AudioPlayback::open(&output_device_id)?);
+        Self::new_with_audio_codecs(encoder, decoder, input_device_id, sink).await
+    }
+
+    async fn new_with_audio_codecs(
+        encoder: crate::call_audio::CallAudioEncoder,
+        decoder: crate::call_audio::CallAudioDecoder,
+        input_device_id: String,
+        sink: Arc<dyn crate::call_audio::AudioSink>,
+    ) -> Result<Self, String> {
+        let mut session = Self::new().await?;
+        let ssrc = random_ssrc()?;
+        let codec = RTCRtpCodec {
+            mime_type: MIME_TYPE_OPUS.to_owned(),
+            clock_rate: 48_000,
+            channels: 2,
+            ..Default::default()
+        };
+        let track = Arc::new(
+            TrackLocalStaticSample::new(
+                Instant::now(),
+                MediaStreamTrack::new(
+                    "slouching-call".to_owned(),
+                    format!("slouching-audio-{ssrc:08x}"),
+                    "Slouching microphone".to_owned(),
+                    RtpCodecKind::Audio,
+                    vec![RTCRtpEncodingParameters {
+                        rtp_coding_parameters: RTCRtpCodingParameters {
+                            ssrc: Some(ssrc),
+                            ..Default::default()
+                        },
+                        codec,
+                        ..Default::default()
+                    }],
+                ),
+            )
+            .map_err(|error| format!("could not create Opus RTP track: {error}"))?,
+        );
+        session
+            .peer_connection
+            .add_track(Arc::clone(&track) as Arc<dyn TrackLocal>)
+            .await
+            .map_err(|error| format!("could not add protected Opus RTP track: {error}"))?;
+        session.audio = Some(Arc::new(CallAudioState {
+            encoder: AsyncMutex::new(encoder),
+            decoder: AsyncMutex::new(decoder),
+            track,
+            ssrc,
+            input_device_id,
+            sink,
+        }));
+        session.start_audio_receiver();
+        session
+            .audio_status
+            .send_replace("Opus/SFrame track ready; aguardando conexão ICE/DTLS.".to_owned());
+        Ok(session)
     }
 
     /// Create an offer and return the completed SDP, including gathered host
@@ -168,7 +309,143 @@ impl CallRtcSession {
         self.connection_state.clone()
     }
 
+    pub fn audio_status(&self) -> watch::Receiver<String> {
+        self.audio_status.subscribe()
+    }
+
+    /// Open the selected microphone once the peer connection is established.
+    pub async fn start_microphone(&self) -> Result<(), String> {
+        let Some(audio) = self.audio.as_ref().cloned() else {
+            return Ok(());
+        };
+        if self.audio_started.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let input_device_id = audio.input_device_id.clone();
+        let capture = match tokio::task::spawn_blocking(move || {
+            crate::audio::AudioCapture::open(&input_device_id)
+        })
+        .await
+        .map_err(|error| format!("microphone startup task failed: {error}"))?
+        {
+            Ok(capture) => capture,
+            Err(error) => {
+                self.audio_started.store(false, Ordering::Release);
+                self.audio_status
+                    .send_replace(format!("Microfone indisponível: {error}"));
+                return Err(error);
+            }
+        };
+        let sample_rate = capture.sample_rate();
+        let audio_status = self.audio_status.clone();
+        let track_audio = Arc::clone(&audio);
+        let capture_task = tokio::spawn(async move {
+            let mut capture = capture;
+            let mut frames = match crate::call_audio::VoiceFrameAssembler::new(sample_rate) {
+                Ok(frames) => frames,
+                Err(error) => {
+                    audio_status.send_replace(format!("Falha na captura de áudio: {error}"));
+                    return;
+                }
+            };
+            loop {
+                match tokio::time::timeout(Duration::from_millis(250), capture.next_chunk()).await {
+                    Ok(Some(chunk)) => match frames.push(&chunk) {
+                        Ok(frames) => {
+                            for pcm in frames {
+                                if let Err(error) = track_audio.send_audio_frame(&pcm).await {
+                                    audio_status.send_replace(format!(
+                                        "Falha ao proteger/enviar áudio RTP: {error}"
+                                    ));
+                                    return;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            audio_status
+                                .send_replace(format!("Falha no formato do microfone: {error}"));
+                            return;
+                        }
+                    },
+                    Ok(None) => {
+                        audio_status.send_replace("Captura do microfone foi encerrada.".to_owned());
+                        return;
+                    }
+                    Err(_) => {
+                        if let Some(error) = capture.error() {
+                            audio_status.send_replace(format!("Falha do microfone: {error}"));
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        if let Ok(mut tasks) = self.audio_tasks.lock() {
+            tasks.push(capture_task);
+        }
+        self.audio_status
+            .send_replace("Microfone ativo · Opus/SFrame · enviando áudio protegido.".to_owned());
+        Ok(())
+    }
+
+    fn start_audio_receiver(&self) {
+        let receiver = self
+            .incoming_tracks
+            .lock()
+            .ok()
+            .and_then(|mut tracks| tracks.take());
+        let (Some(mut receiver), Some(audio)) = (receiver, self.audio.as_ref().cloned()) else {
+            return;
+        };
+        let audio_status = self.audio_status.clone();
+        let task = tokio::spawn(async move {
+            let mut track_tasks = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    incoming = receiver.recv() => match incoming {
+                        Some(track) => {
+                            let audio = Arc::clone(&audio);
+                            let audio_status = audio_status.clone();
+                            track_tasks.spawn(async move {
+                                while let Some(event) = track.poll().await {
+                                    match event {
+                                        TrackRemoteEvent::OnRtpPacket(packet) => {
+                                            match audio.decoder.lock().await.unprotect_and_decode(&packet.payload) {
+                                                Ok(pcm) => audio.sink.push_mono(&pcm),
+                                                Err(error) => {
+                                                    audio_status.send_replace(format!("Quadro SFrame de áudio rejeitado: {error}"));
+                                                }
+                                            }
+                                        }
+                                        TrackRemoteEvent::OnEnded | TrackRemoteEvent::OnEnding => break,
+                                        TrackRemoteEvent::OnError => {
+                                            audio_status.send_replace("Track de áudio remoto reportou erro.".to_owned());
+                                            break;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            });
+                        }
+                        None => break,
+                    },
+                    Some(_) = track_tasks.join_next(), if !track_tasks.is_empty() => {}
+                }
+            }
+        });
+        if let Ok(mut tasks) = self.audio_tasks.lock() {
+            tasks.push(task);
+        }
+    }
+
     pub async fn close(&self) -> Result<(), String> {
+        if let Ok(mut tasks) = self.audio_tasks.lock() {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
+        }
+        self.audio_status
+            .send_replace("Áudio encerrado.".to_owned());
         self.peer_connection
             .close()
             .await
@@ -192,6 +469,13 @@ impl CallRtcSession {
     }
 }
 
+fn random_ssrc() -> Result<u32, String> {
+    let mut bytes = [0_u8; 4];
+    getrandom::fill(&mut bytes).map_err(|error| format!("could not create audio SSRC: {error}"))?;
+    let ssrc = u32::from_be_bytes(bytes);
+    Ok(if ssrc == 0 { 1 } else { ssrc })
+}
+
 impl std::fmt::Debug for CallRtcSession {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -205,6 +489,14 @@ impl std::fmt::Debug for CallRtcSession {
 mod tests {
     use super::*;
     use tokio::time::{sleep, timeout};
+
+    struct TestSink(mpsc::UnboundedSender<Vec<f32>>);
+
+    impl crate::call_audio::AudioSink for TestSink {
+        fn push_mono(&self, samples: &[f32]) {
+            let _ = self.0.send(samples.to_vec());
+        }
+    }
 
     #[tokio::test]
     async fn loopback_peers_negotiate_webrtc_over_gathered_host_candidates() {
@@ -231,5 +523,82 @@ mod tests {
         caller.close().await.unwrap();
         callee.close().await.unwrap();
         sleep(Duration::from_millis(10)).await;
+    }
+
+    #[tokio::test]
+    async fn protected_opus_audio_crosses_webrtc_loopback_and_reaches_sink() {
+        const EXPORTER_KEY: &[u8] = b"0123456789abcdef";
+        let (caller_sink_tx, _caller_sink_rx) = mpsc::unbounded_channel();
+        let (callee_sink_tx, mut callee_sink_rx) = mpsc::unbounded_channel();
+        let caller = CallRtcSession::new_with_audio_codecs(
+            crate::call_audio::CallAudioEncoder::new(
+                crate::media::MediaFrameSender::new(3, 0, EXPORTER_KEY).unwrap(),
+            )
+            .unwrap(),
+            crate::call_audio::CallAudioDecoder::new(
+                crate::media::MediaFrameReceiver::new(3, 1, EXPORTER_KEY).unwrap(),
+            )
+            .unwrap(),
+            String::new(),
+            Arc::new(TestSink(caller_sink_tx)),
+        )
+        .await
+        .unwrap();
+        let callee = CallRtcSession::new_with_audio_codecs(
+            crate::call_audio::CallAudioEncoder::new(
+                crate::media::MediaFrameSender::new(3, 1, EXPORTER_KEY).unwrap(),
+            )
+            .unwrap(),
+            crate::call_audio::CallAudioDecoder::new(
+                crate::media::MediaFrameReceiver::new(3, 0, EXPORTER_KEY).unwrap(),
+            )
+            .unwrap(),
+            String::new(),
+            Arc::new(TestSink(callee_sink_tx)),
+        )
+        .await
+        .unwrap();
+
+        let offer = caller.create_offer().await.unwrap();
+        let answer = callee.accept_offer(&offer).await.unwrap();
+        caller.accept_answer(&answer).await.unwrap();
+        for state in [caller.connection_state(), callee.connection_state()] {
+            let mut state = state;
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if state.borrow().as_str() == "Connected" {
+                        break;
+                    }
+                    state.changed().await.unwrap();
+                }
+            })
+            .await
+            .expect("audio loopback should connect over WebRTC");
+        }
+
+        let frame = (0..crate::call_audio::FRAME_SAMPLES)
+            .map(|sample| {
+                (sample as f32 * 440.0 * std::f32::consts::TAU
+                    / crate::call_audio::SAMPLE_RATE_HZ as f32)
+                    .sin()
+                    * 0.2
+            })
+            .collect::<Vec<_>>();
+        caller
+            .audio
+            .as_ref()
+            .unwrap()
+            .send_audio_frame(&frame)
+            .await
+            .unwrap();
+        let received = timeout(Duration::from_secs(5), callee_sink_rx.recv())
+            .await
+            .expect("callee should receive an RTP frame")
+            .expect("callee audio sink should remain open");
+        assert_eq!(received.len(), crate::call_audio::FRAME_SAMPLES);
+        assert!(received.iter().any(|sample| sample.abs() > 0.01));
+
+        caller.close().await.unwrap();
+        callee.close().await.unwrap();
     }
 }

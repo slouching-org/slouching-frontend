@@ -323,12 +323,12 @@ Camera scanning, short verification codes, and contact discovery are not
 implemented. OpenMLS credentials
 include a versioned binding signed by the durable device key. One-use
 KeyPackages and private MLS state are stored in SQLCipher. The direct-chat
-screen separately pins device public keys. Character scenes and call views
-remain visual previews. **Áudio & vídeo** enumerates real audio inputs and
-outputs, and lets the user choose a device for the current app session. The
-explicit **Testar microfone localmente** action opens the selected input and
-shows an RMS level meter; samples stay in the audio callback and are neither
-saved nor sent. The test stops when the user leaves the audio tab or screen.
+screen separately pins device public keys. Character scenes remain visual
+previews. **Áudio & vídeo** enumerates real audio inputs and outputs, and lets
+the user choose a device for the current app session. The explicit
+**Testar microfone localmente** action opens the selected input and shows an
+RMS level meter; samples stay in the audio callback and are neither saved nor
+sent. The test stops when the user leaves the audio tab or screen.
 The client now has an isolated SFrame frame-protection module with per-member,
 epoch-bound key IDs, a fresh random session context, bounded frames, and replay
 rejection. It requires key material supplied by a call MLS exporter, which is
@@ -338,12 +338,17 @@ groups cannot export media keys. The SFrame sender takes its local leaf index
 from the authenticated call group; a receiver resolves the sender device key
 to that group's current leaf index. A two-device Welcome test checks distinct
 member indexes and encrypts/decrypts a frame with the shared MLS exporter. This
-still does not start a call: QUIC v10 has bounded offer, answer, ICE candidate,
-and end signals on the pinned session, but the UI rejects incoming signaling
-until the WebRTC controller is integrated. No UI path sends SFrame frames, and
-live audio capture/playback and video remain disconnected. Device choices are not
-persisted or used by calls yet.
-Camera and screen capture are also inactive. **Rede & P2P** in Settings retains
+WebRTC now carries mono 48 kHz/20 ms Opus tracks inside SFrame over RTP. The
+offer and answer use gathered host ICE candidates, and call signaling remains
+on the pinned QUIC session. The selected microphone starts after ICE/DTLS
+connects; decoded, authenticated frames go to the selected output device. The
+test suite negotiates two local WebRTC peers, sends an Opus/SFrame frame over
+RTP, and verifies decoded samples reach the remote sink. This validates the
+local media path, not audio-device behavior between physical computers. Calls
+require both devices to be members of the same dedicated call MLS group, and
+each must select a microphone and output in Settings. Camera and screen
+capture, mute controls, noise suppression, echo cancellation, and push-to-talk
+are still inactive. **Rede & P2P** in Settings retains
 the Elixir HTTP/WebSocket diagnostics and manual refresh. On Linux, this uses
 Secret Service, so a desktop password vault must
 be installed and available in the user session.
@@ -358,7 +363,7 @@ be installed and available in the user session.
 
 ![Actual native Iced peer verification screen after importing a QR, with separate LAN and VPN address choices; all values are capture fixtures](docs/design/runtime/native-vhs/08-verify-invite-imported.png)
 
-![Native Iced call preview captured before the current MLS group and WebRTC negotiation controls; media and sample messages are illustrative](docs/design/runtime/native-vhs/10-call.png)
+![Native Iced call screen capture from before protected Opus RTP integration; a fresh capture needs a Wayland or X11 display](docs/design/runtime/native-vhs/10-call.png)
 
 ![Actual 934 × 1000 native Iced MLS screen showing pending, approved, and rejected self-update proposal review controls; proposal rows are capture fixtures](docs/design/runtime/native-vhs/11-mls.png)
 
@@ -366,7 +371,7 @@ be installed and available in the user session.
 
 ![Actual native Iced Network and P2P settings with delegated MLS copy consent and helper-listener guidance; Secret Service is unavailable in this capture, so the local policy cannot load](docs/design/runtime/native-vhs/02-settings.png)
 
-![Actual native Iced audio settings with real input/output devices and an inactive local microphone-test button; names are machine-specific and no call is connected](docs/design/runtime/native-vhs/13-audio-devices.png)
+![Actual native Iced audio settings with real input/output devices and local microphone test; names are machine-specific and no call is connected](docs/design/runtime/native-vhs/13-audio-devices.png)
 
 The Network and P2P settings expose persisted opt-in for delegated encrypted
 MLS copies, with the local quota and expiry policy beside the control. QUIC v10
@@ -390,8 +395,9 @@ ends quarantined at its accepted epoch without a transient lock failure.
 
 The eleven design-board views and additional MLS screen are captured in [native-vhs](docs/design/runtime/native-vhs/).
 These are a first implementation of the visual direction, with comparison
-at 1280 × 800 and a compact 960 × 640 window. Exact visual parity,
-accessibility, and live media integration remain to be completed.
+at 1280 × 800 and a compact 960 × 640 window. Exact visual parity and
+accessibility remain to be completed; the local Opus/SFrame RTP media path is
+implemented, while physical-device calls still need validation.
 The current direct transport, delegated-copy frames, call-group Welcome purpose,
 and bounded call-signaling frames are specified in the [v10 peer protocol](docs/fichas/transport/lan-peer-v10.md). Version 9 remains as the prior compatibility contract.
 
@@ -425,8 +431,8 @@ illustrate the review controls; they are fixtures, not live MLS state.
 `--capture-mls-attachment` adds a sample attachment card and connected state;
 they are fixtures, not a transferred file or live peer session.
 The audio-settings capture uses real device enumeration from the current
-session; device names vary by machine, and selected devices are not yet used by
-live calls.
+session; device names vary by machine. Selected devices feed live call capture
+and playback, but not this illustrative capture.
 `--capture-peer-verification` supplies sample local and peer keys for the trust
 screen capture; they are fixtures, not identities from the keyring.
 `--capture-peer-invite` supplies a signed sample invitation and renders its QR
@@ -435,6 +441,10 @@ in the identity screen; its keys and address are fixtures.
 after QR import; all values are fixtures.
 `--capture-call-negotiation` shows call controls with sample identity, peer, and
 group values; they do not represent a live MLS group or WebRTC session.
+The protected-audio update could not refresh `10-call.png` in this headless
+environment: Iced/winit requires `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, or
+`DISPLAY`. Run the capture command in a graphical session to render the current
+screen.
 
 Assets and font license/provenance notes are in [assets/README.md](assets/README.md).
 

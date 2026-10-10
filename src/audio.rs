@@ -2,6 +2,7 @@ use cpal::{
     FromSample, Sample, SampleFormat,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
+use std::collections::VecDeque;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU32, Ordering},
@@ -54,6 +55,145 @@ pub struct AudioCapture {
     chunks: tokio::sync::mpsc::Receiver<Vec<f32>>,
     sample_rate: u32,
     error: tokio::sync::watch::Receiver<Option<String>>,
+}
+
+/// CPAL output backed by a bounded mono queue. A slow device callback emits
+/// silence instead of blocking the WebRTC receive task.
+pub struct AudioPlayback {
+    _stream: cpal::Stream,
+    samples: Arc<Mutex<VecDeque<f32>>>,
+    error: tokio::sync::watch::Receiver<Option<String>>,
+    sample_rate: u32,
+}
+
+impl crate::call_audio::AudioSink for AudioPlayback {
+    fn push_mono(&self, incoming: &[f32]) {
+        AudioPlayback::push_mono(self, incoming);
+    }
+}
+
+impl AudioPlayback {
+    pub fn open(device_id: &str) -> Result<Self, String> {
+        let host = cpal::default_host();
+        let device = host
+            .output_devices()
+            .map_err(|error| format!("could not enumerate audio outputs: {error}"))?
+            .find(|device| device.id().is_ok_and(|id| id.to_string() == device_id))
+            .ok_or_else(|| "selected speaker is no longer available".to_owned())?;
+        let supported = device
+            .default_output_config()
+            .map_err(|error| format!("could not read speaker format: {error}"))?;
+        let sample_rate = supported.sample_rate();
+        let channels = usize::from(supported.channels());
+        let format = supported.sample_format();
+        let samples = Arc::new(Mutex::new(VecDeque::with_capacity(48_000)));
+        let callback_samples = Arc::clone(&samples);
+        let (error_tx, error) = tokio::sync::watch::channel(None);
+        let stream = device
+            .build_output_stream_raw(
+                supported.config(),
+                format,
+                move |data, _| write_output_data(data, format, channels, &callback_samples),
+                move |stream_error| {
+                    error_tx.send_replace(Some(stream_error.to_string()));
+                },
+                None,
+            )
+            .map_err(|error| format!("could not open speaker: {error}"))?;
+        stream
+            .play()
+            .map_err(|error| format!("could not start speaker: {error}"))?;
+        Ok(Self {
+            _stream: stream,
+            samples,
+            error,
+            sample_rate,
+        })
+    }
+
+    pub fn push_mono(&self, incoming: &[f32]) {
+        let resampled = resample_mono(incoming, self.sample_rate);
+        const MAX_QUEUED_SAMPLES: usize = 96_000;
+        if let Ok(mut samples) = self.samples.lock() {
+            if samples.len().saturating_add(resampled.len()) > MAX_QUEUED_SAMPLES {
+                let excess = samples
+                    .len()
+                    .saturating_add(resampled.len())
+                    .saturating_sub(MAX_QUEUED_SAMPLES);
+                let remove = excess.min(samples.len());
+                samples.drain(..remove);
+            }
+            samples.extend(resampled.into_iter().map(|sample| sample.clamp(-1.0, 1.0)));
+        }
+    }
+
+    pub fn error(&self) -> Option<String> {
+        self.error.borrow().clone()
+    }
+}
+
+fn resample_mono(input: &[f32], output_rate: u32) -> Vec<f32> {
+    const INPUT_RATE: u32 = crate::call_audio::SAMPLE_RATE_HZ;
+    if input.len() < 2 || output_rate == 0 {
+        return Vec::new();
+    }
+    if output_rate == INPUT_RATE {
+        return input.to_vec();
+    }
+    let output_len = ((input.len() as u64 * u64::from(output_rate) + u64::from(INPUT_RATE) / 2)
+        / u64::from(INPUT_RATE)) as usize;
+    (0..output_len)
+        .map(|index| {
+            let position = index as f64 * f64::from(INPUT_RATE) / f64::from(output_rate);
+            let left = (position.floor() as usize).min(input.len() - 1);
+            let right = (left + 1).min(input.len() - 1);
+            let fraction = (position - left as f64) as f32;
+            input[left] + (input[right] - input[left]) * fraction
+        })
+        .collect()
+}
+
+fn write_output_data(
+    data: &mut cpal::Data,
+    format: SampleFormat,
+    channels: usize,
+    samples: &Arc<Mutex<VecDeque<f32>>>,
+) {
+    if channels == 0 {
+        return;
+    }
+    macro_rules! write {
+        ($sample:ty) => {
+            if let Some(output) = data.as_slice_mut::<$sample>() {
+                let mut queued = samples.try_lock().ok();
+                for frame in output.chunks_exact_mut(channels) {
+                    let mono = queued
+                        .as_mut()
+                        .and_then(|queued| queued.pop_front())
+                        .unwrap_or(0.0);
+                    for channel in frame {
+                        *channel = <$sample>::from_sample(mono);
+                    }
+                }
+            }
+        };
+    }
+    match format {
+        SampleFormat::F32 => write!(f32),
+        SampleFormat::F64 => write!(f64),
+        SampleFormat::I8 => write!(i8),
+        SampleFormat::I16 => write!(i16),
+        SampleFormat::I24 => write!(cpal::I24),
+        SampleFormat::I32 => write!(i32),
+        SampleFormat::I64 => write!(i64),
+        SampleFormat::U8 => write!(u8),
+        SampleFormat::U16 => write!(u16),
+        SampleFormat::U24 => write!(cpal::U24),
+        SampleFormat::U32 => write!(u32),
+        SampleFormat::U64 => write!(u64),
+        SampleFormat::DsdU8 | SampleFormat::DsdU16 | SampleFormat::DsdU32 => {}
+        _ => {}
+    }
 }
 
 impl AudioCapture {
@@ -311,6 +451,16 @@ mod tests {
             Some("mic-b".to_owned())
         );
         assert_eq!(choose_device_id(None, None, &[]), None);
+    }
+
+    #[test]
+    fn playback_resampler_matches_the_selected_device_sample_rate() {
+        let frame = (0..crate::call_audio::FRAME_SAMPLES)
+            .map(|index| index as f32 / crate::call_audio::FRAME_SAMPLES as f32)
+            .collect::<Vec<_>>();
+        let resampled = resample_mono(&frame, 44_100);
+        assert_eq!(resampled.len(), 882);
+        assert_eq!(resample_mono(&frame, 48_000), frame);
     }
 
     #[test]

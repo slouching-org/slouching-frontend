@@ -455,7 +455,7 @@ fn gallery(l: Layout) -> Element<'static, Message> {
         choices = choices.push(l.nav(s.label(), Message::Navigate(s), false));
     }
     choices = choices.push(l.label(
-        "11 telas · chamadas indisponíveis\nChat texto · LAN manual",
+        "12 telas · chamadas de áudio em desenvolvimento\nChat texto · LAN/VPN manual",
         11.0,
         MUTED,
     ));
@@ -499,7 +499,11 @@ fn home(state: &Slouching, l: Layout) -> Element<'_, Message> {
         ]
         .spacing(l.px(8.0))
         .align_y(iced::Center),
-        l.label("Explore a prévia · chamadas indisponíveis", 10.0, MUTED)
+        l.label(
+            "Explore a prévia · áudio direto em desenvolvimento",
+            10.0,
+            MUTED
+        )
     ]
     .spacing(l.px(14.0));
     let features = row![
@@ -1200,9 +1204,9 @@ fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
         l.label(&state.call_group_status, 10.0, MUTED),
         l.label(
             if state.call_rtc_session.is_some() {
-                "WEBRTC · negociação em andamento; mídia ainda não conectada"
+                "WEBRTC · Opus/SFrame; vídeo ainda indisponível"
             } else {
-                "ÁUDIO E VÍDEO · ainda não conectados"
+                "ÁUDIO · Opus/SFrame · grupo MLS dedicado"
             },
             9.0,
             VIOLET

@@ -910,7 +910,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     state.call_group_id = hex_encode_bytes(&group.group_id);
                     state.mls_group_id = state.call_group_id.clone();
                     state.call_group_status = format!(
-                        "Grupo de chamada criado no epoch {}. Convide dispositivos pelo fluxo MLS; mídia ainda não conectada.",
+                        "Grupo de chamada criado no epoch {}. Convide dispositivos pelo fluxo MLS; áudio Opus/SFrame inicia após a conexão.",
                         group.epoch
                     );
                     let history = load_mls_history(state, group.group_id);
@@ -956,9 +956,17 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     "A sessão WebRTC já foi iniciada; aguarde a negociação ou encerre-a.".into();
                 return Task::none();
             }
+            let (Some(input_device), Some(output_device)) = (
+                state.audio_input_selected.clone(),
+                state.audio_output_selected.clone(),
+            ) else {
+                state.call_group_status =
+                    "Selecione um microfone e uma saída de áudio em Configurações antes de iniciar a chamada.".into();
+                return Task::none();
+            };
             state.call_group_status = "Validando grupo MLS e reunindo candidatos WebRTC…".into();
             return Task::perform(
-                prepare_call_offer_task(group_id, peer_device),
+                prepare_call_offer_task(group_id, peer_device, input_device, output_device),
                 Message::CallOfferCreated,
             );
         }
@@ -1044,7 +1052,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         format!("Não foi possível enviar a oferta pela sessão fixada: {error}");
                     return Task::none();
                 }
-                state.call_group_status = "Oferta WebRTC enviada pelo canal QUIC pinado; aguardando resposta do peer (sem áudio/vídeo ainda).".into();
+                state.call_group_status = "Oferta WebRTC com track Opus/SFrame enviada pelo canal QUIC pinado; aguardando resposta do peer.".into();
                 return watch_call_rtc_state(generation, rtc);
             }
             Err(error) => {
@@ -1084,8 +1092,8 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     state.call_rtc_session = Some(session.clone());
                     state.call_rtc_generation = generation;
                     state.call_group_status = match signal.kind {
-                        peer::CallSignalKind::Offer => "Resposta WebRTC enviada pelo canal QUIC pinado; ICE/DTLS conectando (sem mídia ainda).".into(),
-                        peer::CallSignalKind::Answer => "Resposta recebida; ICE/DTLS conectando (sem mídia ainda).".into(),
+                        peer::CallSignalKind::Offer => "Resposta WebRTC enviada pelo canal QUIC pinado; ICE/DTLS conectando com Opus/SFrame.".into(),
+                        peer::CallSignalKind::Answer => "Resposta recebida; ICE/DTLS conectando com Opus/SFrame.".into(),
                         peer::CallSignalKind::IceCandidate => "Candidato ICE validado e aplicado.".into(),
                         peer::CallSignalKind::End => "Peer encerrou a chamada.".into(),
                     };
@@ -1148,7 +1156,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 &state.audio_output_devices,
             );
             state.audio_devices_status = format!(
-                "{} entrada(s) · {} saída(s). Seleções ainda não alimentam chamadas.",
+                "{} entrada(s) · {} saída(s). Seleções locais usadas nas chamadas de áudio.",
                 state.audio_input_devices.len(),
                 state.audio_output_devices.len()
             );
@@ -2204,16 +2212,38 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                                 format!("Sinal de chamada recusado: {reason}.");
                             return Task::none();
                         }
+                        if signal.kind == peer::CallSignalKind::Offer
+                            && (state.audio_input_selected.is_none()
+                                || state.audio_output_selected.is_none())
+                        {
+                            let reason = "selecione microfone e saída de áudio em Configurações para aceitar a chamada";
+                            if let Some(commands) = state.peer_session_commands.as_ref() {
+                                let _ = commands.try_send(peer::PeerCommand::RejectInbound {
+                                    sequence,
+                                    reason: reason.to_owned(),
+                                });
+                            }
+                            state.call_group_status = format!("Oferta recusada: {reason}.");
+                            return Task::none();
+                        }
                         let generation = if signal.kind == peer::CallSignalKind::Offer {
                             state.call_rtc_generation.saturating_add(1)
                         } else {
                             state.call_rtc_generation
                         };
                         let existing = state.call_rtc_session.clone();
+                        let input_device = state.audio_input_selected.clone().unwrap_or_default();
+                        let output_device = state.audio_output_selected.clone().unwrap_or_default();
                         state.call_group_status =
                             "Validando época e membro MLS antes de aplicar sinal WebRTC…".into();
                         return Task::perform(
-                            process_call_signal_task(signal.clone(), peer_device, existing),
+                            process_call_signal_task(
+                                signal.clone(),
+                                peer_device,
+                                existing,
+                                input_device,
+                                output_device,
+                            ),
                             move |result| {
                                 Message::CallSignalProcessed(generation, sequence, signal, result)
                             },
@@ -2940,7 +2970,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 if group.purpose == peer::MlsGroupPurpose::Call {
                     state.call_group_id = state.mls_group_id.clone();
                     state.call_group_status =
-                        "Você entrou no grupo MLS da chamada; mídia ainda não está conectada."
+                        "Você entrou no grupo MLS da chamada; configure os dispositivos de áudio para iniciar chamadas."
                             .to_owned();
                 }
                 state.mls_status = format!(
@@ -2976,7 +3006,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 if group.purpose == peer::MlsGroupPurpose::Call {
                     state.call_group_id = state.mls_group_id.clone();
                     state.call_group_status =
-                        "Você entrou no grupo MLS da chamada; mídia ainda não está conectada."
+                        "Você entrou no grupo MLS da chamada; configure os dispositivos de áudio para iniciar chamadas."
                             .to_owned();
                 }
                 let history = load_mls_history(state, group.group_id);
@@ -4597,7 +4627,7 @@ fn boot() -> (Slouching, Task<Message>) {
         state.peer_public_key = hex_encode_key(&[0x22; 32]);
         state.call_group_id = "5f8d4d2a7c314e6a9b0f123456789abc".to_owned();
         state.call_group_status =
-            "Pronto para negociar com o peer MLS fixado · áudio/vídeo ainda não conectados."
+            "Pronto para negociar com o peer MLS fixado · áudio Opus/SFrame; vídeo ainda indisponível."
                 .to_owned();
     }
     if capture_peer_verification {
@@ -5045,6 +5075,8 @@ async fn create_call_mls_group_task() -> Result<storage::CreatedMlsGroup, String
 async fn prepare_call_offer_task(
     group_id: [u8; 16],
     peer_device: [u8; 32],
+    input_device: String,
+    output_device: String,
 ) -> Result<CallOfferReady, String> {
     let context = tokio::task::spawn_blocking(move || storage::load_call_media_context(&group_id))
         .await
@@ -5053,7 +5085,15 @@ async fn prepare_call_offer_task(
     if context.member_index(&peer_device).is_none() {
         return Err("o peer pinado não pertence ao grupo MLS de chamada ativo".to_owned());
     }
-    let rtc = std::sync::Arc::new(call_rtc::CallRtcSession::new().await?);
+    let rtc = std::sync::Arc::new(
+        call_rtc::CallRtcSession::new_for_call_group(
+            group_id,
+            peer_device,
+            input_device,
+            output_device,
+        )
+        .await?,
+    );
     let offer = rtc.create_offer().await?;
     Ok(CallOfferReady {
         group_id,
@@ -5068,6 +5108,8 @@ async fn process_call_signal_task(
     signal: peer::CallSignal,
     peer_device: [u8; 32],
     existing: Option<std::sync::Arc<call_rtc::CallRtcSession>>,
+    input_device: String,
+    output_device: String,
 ) -> Result<ProcessedCallSignal, String> {
     let group_id = signal.group_id;
     let context = tokio::task::spawn_blocking(move || storage::load_call_media_context(&group_id))
@@ -5087,7 +5129,15 @@ async fn process_call_signal_task(
             if existing.is_some() {
                 return Err("já existe uma sessão WebRTC para este peer".to_owned());
             }
-            let rtc = std::sync::Arc::new(call_rtc::CallRtcSession::new().await?);
+            let rtc = std::sync::Arc::new(
+                call_rtc::CallRtcSession::new_for_call_group(
+                    group_id,
+                    peer_device,
+                    input_device,
+                    output_device,
+                )
+                .await?,
+            );
             let answer = rtc.accept_offer(&signal.payload).await?;
             Ok((Some(rtc), Some(answer)))
         }
@@ -5120,9 +5170,31 @@ fn watch_call_rtc_state(
 ) -> Task<Message> {
     let events = async_stream::stream! {
         let mut state = rtc.connection_state();
-        yield Message::CallRtcStateChanged(generation, format!("WebRTC: {} · áudio/vídeo ainda não conectados.", *state.borrow()));
-        while state.changed().await.is_ok() {
-            yield Message::CallRtcStateChanged(generation, format!("WebRTC: {} · áudio/vídeo ainda não conectados.", *state.borrow()));
+        let mut audio_status = rtc.audio_status();
+        let mut mic_started = false;
+        yield Message::CallRtcStateChanged(generation, format!("WebRTC: {} · áudio protegido aguardando conexão.", *state.borrow()));
+        loop {
+            tokio::select! {
+                changed = state.changed() => {
+                    if changed.is_err() { break; }
+                    let state_name = state.borrow().clone();
+                    if state_name == "Connected" && !mic_started {
+                        mic_started = true;
+                        let status = match rtc.start_microphone().await {
+                            Ok(()) => "Conexão WebRTC ativa; iniciando microfone.".to_owned(),
+                            Err(error) => format!("Conexão WebRTC ativa, mas o microfone falhou: {error}"),
+                        };
+                        yield Message::CallRtcStateChanged(generation, status);
+                    } else {
+                        yield Message::CallRtcStateChanged(generation, format!("WebRTC: {state_name} · Opus/SFrame."));
+                    }
+                }
+                changed = audio_status.changed() => {
+                    if changed.is_err() { break; }
+                    let status = audio_status.borrow().clone();
+                    yield Message::CallRtcStateChanged(generation, status);
+                }
+            }
         }
     };
     Task::run(events, |message| message)

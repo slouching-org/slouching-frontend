@@ -8215,6 +8215,8 @@ dependencies = [
  "reqwest 0.12.28",
  "rfd",
  "rqrr",
+ "rtc",
+ "rtc-media",
  "rusqlite",
  "serde",
  "serde_json",

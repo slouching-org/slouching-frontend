@@ -12,6 +12,10 @@ pub const FRAME_SAMPLES: usize = 960;
 const MAX_OPUS_PACKET_BYTES: usize = 4_000;
 const MAX_OPUS_FRAME_SAMPLES: usize = 5_760;
 
+pub trait AudioSink: Send + Sync + 'static {
+    fn push_mono(&self, samples: &[f32]);
+}
+
 pub struct CallAudioEncoder {
     encoder: opus::Encoder,
     protector: MediaFrameSender,
