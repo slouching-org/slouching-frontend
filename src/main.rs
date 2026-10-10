@@ -4,6 +4,7 @@ use iced::{Element, Task, Theme, task::Handle};
 pub mod audio;
 pub mod blob_store;
 pub mod call_audio;
+pub mod call_chat;
 pub mod call_rtc;
 pub mod call_video;
 pub mod file_transfer;
@@ -318,6 +319,8 @@ struct Slouching {
     call_group_status: String,
     pending_call_offer: Option<PendingCallOffer>,
     call_mic_muted: bool,
+    call_room_draft: String,
+    call_room_messages: Vec<call_chat::RoomMessage>,
     call_group_creating: bool,
     call_rtc_session: Option<std::sync::Arc<call_rtc::CallRtcSession>>,
     call_rtc_generation: u64,
@@ -511,6 +514,8 @@ impl Default for Slouching {
             call_group_status: "Crie um grupo MLS isolado para preparar uma chamada.".to_owned(),
             pending_call_offer: None,
             call_mic_muted: false,
+            call_room_draft: String::new(),
+            call_room_messages: Vec::new(),
             call_group_creating: false,
             call_rtc_session: None,
             call_rtc_generation: 0,
@@ -700,6 +705,10 @@ enum Message {
     CallRtcStateChanged(u64, String),
     CallScreenShareStatus(u64, String),
     CallRemoteScreenFrame(u64, Option<std::sync::Arc<call_video::DecodedVideoFrame>>),
+    RoomChatReceived(u64, String),
+    RoomChatDraftChanged(String),
+    SendRoomChat,
+    RoomChatSent(String, Result<(), String>),
     PrepareMlsKeyPackage,
     MlsKeyPackagePrepared(Result<storage::PreparedMlsKeyPackage, String>),
     AdmitMlsMember,
@@ -997,6 +1006,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             };
             state.remote_screen_frame = None;
             state.screen_sharing_active = false;
+            state.call_room_messages.clear();
             if state.call_rtc_session.is_some() {
                 state.call_group_status =
                     "A sessão WebRTC já foi iniciada; aguarde a negociação ou encerre-a.".into();
@@ -1056,6 +1066,39 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.screen_share_status = "Parando compartilhamento…".into();
             return stop.unwrap_or_else(Task::none);
         }
+        Message::RoomChatDraftChanged(value) => {
+            let mut value = value;
+            while value.len() > 4096 {
+                value.pop();
+            }
+            state.call_room_draft = value;
+        }
+        Message::SendRoomChat => {
+            let Some(session) = state.call_rtc_session.as_ref().cloned() else {
+                state.call_group_status = "Conecte a chamada antes de enviar uma mensagem.".into();
+                return Task::none();
+            };
+            let text = state.call_room_draft.trim().to_owned();
+            if text.is_empty() {
+                return Task::none();
+            }
+            return Task::perform(
+                async move {
+                    let result = session.send_call_chat(&text).await;
+                    (text, result)
+                },
+                |(text, result)| Message::RoomChatSent(text, result),
+            );
+        }
+        Message::RoomChatSent(text, result) => match result {
+            Ok(()) => {
+                state.call_room_draft.clear();
+                append_call_room_message(state, call_chat::RoomMessage { local: true, text });
+            }
+            Err(error) => {
+                state.call_group_status = format!("Mensagem da chamada não enviada: {error}");
+            }
+        },
         Message::ScreenShareStarted(result) => match result {
             Ok(()) => {
                 state.screen_sharing_active = true;
@@ -1094,6 +1137,8 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             let generation = state.call_rtc_generation.saturating_add(1);
             let signal = pending.signal.clone();
             state.screen = Screen::Call;
+            state.call_room_messages.clear();
+            state.call_room_draft.clear();
             state.call_group_status =
                 "Oferta aceita; validando grupo MLS antes de abrir o áudio…".into();
             return Task::perform(
@@ -1135,6 +1180,8 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.call_mic_muted = false;
             state.screen_sharing_active = false;
             state.remote_screen_frame = None;
+            state.call_room_messages.clear();
+            state.call_room_draft.clear();
             state.screen = Screen::Home;
             if let Some(session) = state.call_rtc_session.take() {
                 let commands = state.peer_session_commands.clone();
@@ -1300,6 +1347,8 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     state.call_mic_muted = false;
                     state.screen_sharing_active = false;
                     state.remote_screen_frame = None;
+                    state.call_room_messages.clear();
+                    state.call_room_draft.clear();
                 }
             }
         }
@@ -1321,6 +1370,11 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         frame.rgba.clone(),
                     )
                 });
+            }
+        }
+        Message::RoomChatReceived(generation, text) => {
+            if generation == state.call_rtc_generation && state.call_rtc_session.is_some() {
+                append_call_room_message(state, call_chat::RoomMessage { local: false, text });
             }
         }
         Message::InviteChanged(value) => state.invite = value,
@@ -5476,6 +5530,14 @@ async fn process_call_signal_task(
     }
 }
 
+fn append_call_room_message(state: &mut Slouching, message: call_chat::RoomMessage) {
+    const MAX_VISIBLE_CALL_MESSAGES: usize = 100;
+    if state.call_room_messages.len() == MAX_VISIBLE_CALL_MESSAGES {
+        state.call_room_messages.remove(0);
+    }
+    state.call_room_messages.push(message);
+}
+
 fn watch_call_rtc_state(
     generation: u64,
     rtc: std::sync::Arc<call_rtc::CallRtcSession>,
@@ -5485,6 +5547,7 @@ fn watch_call_rtc_state(
         let mut audio_status = rtc.audio_status();
         let mut screen_share_status = rtc.screen_share_status();
         let mut remote_screen_frame = rtc.remote_screen_frame();
+        let mut call_chat_messages = rtc.subscribe_call_chat();
         let mut mic_started = false;
         let initial_screen_share_status = screen_share_status.borrow().clone();
         yield Message::CallRtcStateChanged(generation, format!("WebRTC: {} · áudio protegido aguardando conexão.", *state.borrow()));
@@ -5531,6 +5594,13 @@ fn watch_call_rtc_state(
                     let frame = remote_screen_frame.borrow().clone();
                     yield Message::CallRemoteScreenFrame(generation, frame);
                 }
+                incoming = call_chat_messages.recv() => {
+                    match incoming {
+                        Ok(text) => yield Message::RoomChatReceived(generation, text),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
             }
         }
     };
@@ -5554,6 +5624,8 @@ fn stop_call_media_for_mls_group(
     // Stop outgoing audio synchronously before the asynchronous peer cleanup.
     session.set_microphone_muted(true);
     state.call_mic_muted = true;
+    state.call_room_messages.clear();
+    state.call_room_draft.clear();
     state.call_rtc_generation = state.call_rtc_generation.saturating_add(1);
     state.call_group_status = format!("Chamada pausada: {reason}.");
     Task::perform(async move { session.close().await }, move |result| {

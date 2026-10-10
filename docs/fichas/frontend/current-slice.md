@@ -132,9 +132,13 @@ a WebRTC DataChannel. The receiving peer authenticates and decodes complete
 frames before rendering them; a stop signal clears the remote image. Local
 tests cover codec replay rejection, bounded fragmentation, protected frame
 delivery, remote decoding, and stop signaling. Physical-device capture,
-permissions, and VPN delivery still need validation. Window and camera capture
-remain unavailable. Contact discovery, automatic pairing, and guaranteed
-offline delivery are also not implemented. The older web UI under
+permissions, and VPN delivery still need validation. The call's room chat sends
+SFrame-protected text over the reliable DataChannel. Its 4 KiB message limit
+and 100-entry UI cap are enforced, and the transcript stays in memory only; it
+is cleared when the call ends. Local loopback verifies messages in both
+directions. Window and camera capture remain unavailable. Contact discovery,
+automatic pairing, and guaranteed offline delivery are also not implemented.
+The older web UI under
 `prototypes/web/` is a design benchmark, not the product runtime.
 
 See [direct peer transport v10](../transport/lan-peer-v10.md) for the direct session

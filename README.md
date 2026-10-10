@@ -166,7 +166,11 @@ MLS group**.
    refuse. The app opens the microphone only after acceptance and WebRTC
    connects. **Silenciar microfone** stops outgoing voice frames; **Leave** ends
    the call.
-4. To share a monitor during the call, open **Escolher tela**, select a screen,
+4. Use **Chat temporário** in the call panel for text that is protected with the
+   call-group SFrame key and sent over the reliable call DataChannel. The client
+   keeps at most 100 displayed messages in memory and clears them when the call
+   ends. There is no delivery/read receipt or history sync.
+5. To share a monitor during the call, open **Escolher tela**, select a screen,
    and click **Compartilhar tela na chamada**. The remote call stage displays
    authenticated frames after H.264 decoding. Click **Parar compartilhamento**
    to stop capture and clear the remote image. Window and camera sharing are
@@ -383,7 +387,12 @@ RTP, and verifies decoded samples reach the remote sink. This validates the
 local media path, not audio-device behavior between physical computers. Calls
 require both devices to be members of the same dedicated call MLS group, and
 each must select a microphone and output in Settings. The call screen's
-microphone control silences outgoing frames locally. The screen chooser
+microphone control silences outgoing frames locally. **Chat temporário** sends
+SFrame-protected text over the reliable call DataChannel, accepts messages up to
+4 KiB, and keeps at most 100 displayed entries in memory. It is not saved or
+synced to late joiners and clears when the call ends; the transport does not
+provide a delivery/read receipt. Loopback tests verify text in both directions.
+The screen chooser
 enumerates real monitors, captures a still preview on demand, and can share the
 selected monitor during an active call. The capture loop encodes bounded H.264
 frames, protects them with the call-group SFrame key, and sends bounded

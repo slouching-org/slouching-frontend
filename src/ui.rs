@@ -1,5 +1,4 @@
-//! Native widgets composed from the supplied design board. Call media and room
-//! chat remain previews; call-group creation and MLS invitations use live state.
+//! Native widgets composed from the supplied design board and current app state.
 use crate::{
     BackendConnection, Message, Screen, Slouching, TransportState,
     file_transfer::FileAttachmentOffer, peer, storage,
@@ -1170,15 +1169,51 @@ fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
         person(l, "wizard", "You", "prévia")
     ]
     .spacing(l.px(13.0));
-    let samples = column![
-        container(l.picture("mushroom-scene", 145.0, 94.0)).width(Fill),
-        l.label("Pim  21:05", 11.0, VIOLET),
-        l.label("mic is dead, here's the proof", 12.0, PAPER),
-        container(l.picture("frog-scene", 145.0, 94.0)).width(Fill),
-        l.label("You  21:06", 11.0, GOLD),
-        l.label("saving both to the tape", 12.0, PAPER)
+    let room_messages: Element<'_, Message> = if state.call_room_messages.is_empty() {
+        column![l.label(
+            "As mensagens desta chamada ficam só na memória e desaparecem ao sair.",
+            10.0,
+            MUTED
+        )]
+        .into()
+    } else {
+        let entries = state
+            .call_room_messages
+            .iter()
+            .map(|message| -> Element<'_, Message> {
+                let author = if message.local { "Você" } else { "Peer" };
+                let color = if message.local { GOLD } else { VIOLET };
+                let bubble = container(
+                    column![
+                        l.label(author, 9.0, color),
+                        l.label(message.text.clone(), 11.0, PAPER)
+                    ]
+                    .spacing(l.px(3.0)),
+                )
+                .padding(l.px(8.0))
+                .style(panel_style);
+                if message.local {
+                    row![space().width(Fill), bubble].into()
+                } else {
+                    row![bubble, space().width(Fill)].into()
+                }
+            });
+        column(entries).spacing(l.px(6.0)).into()
+    };
+    let call_chat_composer = row![
+        l.input(
+            "Mensagem temporária",
+            &state.call_room_draft,
+            Message::RoomChatDraftChanged
+        ),
+        l.control(
+            "arrow",
+            "Enviar",
+            Some(Message::SendRoomChat),
+            state.call_rtc_session.is_none() || state.call_room_draft.trim().is_empty()
+        )
     ]
-    .spacing(l.px(12.0));
+    .spacing(l.px(6.0));
     let identity_ready = matches!(state.identity_status, crate::IdentityStatus::Ready(_));
     let call_group_controls: Element<'_, Message> = if state.call_group_id.is_empty() {
         column![
@@ -1242,7 +1277,7 @@ fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
         l.label(&state.call_group_status, 10.0, MUTED),
         l.label(
             if state.call_rtc_session.is_some() {
-                "WEBRTC · Opus/SFrame; vídeo ainda indisponível"
+                "WEBRTC · voz, chat temporário e tela protegida"
             } else {
                 "ÁUDIO · Opus/SFrame · grupo MLS dedicado"
             },
@@ -1250,8 +1285,9 @@ fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
             VIOLET
         ),
         rule(LINE, 1.0),
-        l.label("PRÉVIA VISUAL", 10.0, MUTED),
-        scrollable(samples).height(Fill)
+        l.label("CHAT TEMPORÁRIO · SÓ ESTA CHAMADA", 10.0, MUTED),
+        scrollable(room_messages).height(l.px(155.0)),
+        call_chat_composer
     ]
     .spacing(l.px(8.0));
     stack![
