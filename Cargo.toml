@@ -33,6 +33,7 @@ openmls_sqlite_storage = "=0.3.0"
 rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
 zeroize = "=1.9.1"
 cpal = "=0.18.2"
+sframe = "=2.0.0"
 qrcodegen = "=1.8.0"
 rqrr = "=0.10.1"
 

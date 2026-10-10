@@ -5,6 +5,7 @@ pub mod audio;
 pub mod blob_store;
 pub mod file_transfer;
 pub mod identity;
+pub mod media;
 mod peer;
 mod peer_invite;
 pub mod storage;

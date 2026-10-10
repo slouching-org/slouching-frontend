@@ -329,8 +329,12 @@ outputs, and lets the user choose a device for the current app session. The
 explicit **Testar microfone localmente** action opens the selected input and
 shows an RMS level meter; samples stay in the audio callback and are neither
 saved nor sent. The test stops when the user leaves the audio tab or screen.
-Device choices are not persisted or used by calls yet. Camera and screen
-capture are also inactive. **Rede & P2P** in Settings retains
+The client now has an isolated SFrame frame-protection module with per-member,
+epoch-bound key IDs, a fresh random session context, bounded frames, and replay
+rejection. It requires key material supplied by a call MLS exporter, which is
+not connected yet; no call uses this module today. Device choices are not
+persisted or used by calls yet.
+Camera and screen capture are also inactive. **Rede & P2P** in Settings retains
 the Elixir HTTP/WebSocket diagnostics and manual refresh. On Linux, this uses
 Secret Service, so a desktop password vault must
 be installed and available in the user session.
