@@ -25,7 +25,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 18;
+const PROFILE_SCHEMA_VERSION: u32 = 19;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 const MAX_DELEGATED_COPY_BYTES: usize = 32 * 1024;
@@ -411,7 +411,7 @@ fn list_pending_mls_proposals_in(
 ) -> Result<Vec<StoredMlsProposal>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT p.proposal_id, p.epoch, p.author_device
+            "SELECT p.proposal_id, p.epoch, p.author_device, p.decision
              FROM local_mls_proposals p
              JOIN local_mls_groups g ON g.group_id = p.group_id
              WHERE p.group_id = ?1 AND p.epoch = g.epoch
@@ -424,19 +424,59 @@ fn list_pending_mls_proposals_in(
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         })
         .map_err(|error| format!("could not query pending MLS proposals: {error}"))?;
     rows.map(|row| {
-        let (proposal_id, epoch, author_device) =
+        let (proposal_id, epoch, author_device, decision) =
             row.map_err(|error| format!("could not read pending MLS proposal: {error}"))?;
         Ok(StoredMlsProposal {
             proposal_id: fixed_bytes(proposal_id, "MLS proposal ID")?,
             epoch: u64::try_from(epoch).map_err(|_| "MLS proposal has invalid epoch".to_owned())?,
             author_device: fixed_bytes(author_device, "MLS proposal author device")?,
+            approved: decision == 1,
+            rejected: decision == 2,
         })
     })
     .collect()
+}
+
+/// Records the committer's explicit decision for one authenticated proposal.
+pub fn set_mls_proposal_approval(
+    group_id: &[u8],
+    proposal_id: [u8; 16],
+    approved: bool,
+) -> Result<(), String> {
+    if group_id.len() != 16 {
+        return Err("MLS group ID must be 16 bytes".to_owned());
+    }
+    let connection = open_local_database()?;
+    set_mls_proposal_approval_in(&connection, group_id, proposal_id, approved)
+}
+
+fn set_mls_proposal_approval_in(
+    connection: &Connection,
+    group_id: &[u8],
+    proposal_id: [u8; 16],
+    approved: bool,
+) -> Result<(), String> {
+    let changed = connection
+        .execute(
+            "UPDATE local_mls_proposals SET decision = ?1
+             WHERE group_id = ?2 AND proposal_id = ?3
+               AND epoch = (SELECT epoch FROM local_mls_groups WHERE group_id = ?2)",
+            params![
+                if approved { 1 } else { 2 },
+                group_id,
+                proposal_id.as_slice()
+            ],
+        )
+        .map_err(|error| format!("could not save MLS proposal decision: {error}"))?;
+    if changed != 1 {
+        return Err("proposal is no longer pending in the current group epoch".to_owned());
+    }
+    Ok(())
 }
 
 fn list_mls_groups_in(connection: &Connection) -> Result<Vec<StoredMlsGroup>, String> {
@@ -849,6 +889,8 @@ pub struct StoredMlsProposal {
     pub proposal_id: [u8; 16],
     pub epoch: u64,
     pub author_device: [u8; 32],
+    pub approved: bool,
+    pub rejected: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1774,7 +1816,9 @@ fn process_mls_self_update_proposal_with_author_in(
     expected_author: Option<[u8; 32]>,
     expected_epoch: Option<u64>,
 ) -> Result<ProcessedMlsProposal, String> {
-    use openmls::prelude::tls_codec::Deserialize as TlsCodecDeserialize;
+    use openmls::prelude::tls_codec::{
+        Deserialize as TlsCodecDeserialize, Serialize as TlsCodecSerialize,
+    };
 
     if group_id.len() != 16 || proposal_bytes.is_empty() || proposal_bytes.len() > 64 * 1024 {
         return Err("MLS update proposal has an invalid group ID or size".to_owned());
@@ -1829,7 +1873,7 @@ fn process_mls_self_update_proposal_with_author_in(
         if epoch != indexed_epoch as u64 {
             return Err("MLS proposal is not for the current group epoch".to_owned());
         }
-        let (accepted_epoch, author_device) = {
+        let (accepted_epoch, author_device, proposal_ref) = {
             let provider = LocalOpenMlsProvider::new(connection);
             let group_identifier = GroupId::from_slice(group_id);
             let mut group = MlsGroup::load(provider.storage(), &group_identifier)
@@ -1883,23 +1927,33 @@ fn process_mls_self_update_proposal_with_author_in(
             if !matches!(queued.proposal(), Proposal::Update(_)) {
                 return Err("only a member self-update proposal is accepted here".to_owned());
             }
+            let proposal_ref = queued
+                .proposal_reference_ref()
+                .tls_serialize_detached()
+                .map_err(|error| format!("could not serialize MLS proposal reference: {error}"))?;
             group
                 .store_pending_proposal(provider.storage(), *queued)
                 .map_err(|error| format!("could not persist MLS pending proposal: {error}"))?;
-            (group.epoch().as_u64(), sender_binding.device_public_key)
+            (
+                group.epoch().as_u64(),
+                sender_binding.device_public_key,
+                proposal_ref,
+            )
         };
         connection
             .execute(
                 "INSERT INTO local_mls_proposals
-                    (proposal_id, group_id, epoch, author_device, proposal_hash, proposal_bytes)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    (proposal_id, group_id, epoch, author_device, proposal_hash, proposal_bytes,
+                     proposal_ref, decision)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
                 params![
                     proposal_id.as_slice(),
                     group_id,
                     epoch as i64,
                     author_device.as_slice(),
                     digest.as_slice(),
-                    proposal_bytes
+                    proposal_bytes,
+                    proposal_ref
                 ],
             )
             .map_err(|error| format!("could not journal accepted MLS proposal: {error}"))?;
@@ -3759,24 +3813,41 @@ fn add_mls_group_member_with_peer_in(
 /// Commits the authenticated proposal queue on the designated committer and
 /// atomically records the new OpenMLS epoch and per-member delivery ledger.
 pub fn commit_pending_mls_proposals(group_id: &[u8]) -> Result<StoredMlsCommit, String> {
+    let proposals = list_pending_mls_proposals(group_id)?;
+    let approved = proposals
+        .into_iter()
+        .filter(|proposal| proposal.approved)
+        .map(|proposal| proposal.proposal_id)
+        .collect::<Vec<_>>();
+    commit_approved_mls_proposals(group_id, &approved)
+}
+
+pub fn commit_approved_mls_proposals(
+    group_id: &[u8],
+    proposal_ids: &[[u8; 16]],
+) -> Result<StoredMlsCommit, String> {
     let entry = identity_key_entry()?;
     let secret = entry
         .get_secret()
         .map_err(|error| format!("could not load the device identity key: {error}"))?;
     let device_identity = signing_key_from_secret(secret)?;
     let mut connection = open_local_database()?;
-    commit_pending_mls_proposals_in(&mut connection, group_id, &device_identity)
+    commit_pending_mls_proposals_in(&mut connection, group_id, proposal_ids, &device_identity)
 }
 
 fn commit_pending_mls_proposals_in(
     connection: &mut Connection,
     group_id: &[u8],
+    proposal_ids: &[[u8; 16]],
     device_identity: &SigningKey,
 ) -> Result<StoredMlsCommit, String> {
     use openmls::prelude::tls_codec::Serialize as TlsCodecSerialize;
 
     if group_id.len() != 16 {
         return Err("MLS group ID must be 16 bytes".to_owned());
+    }
+    if proposal_ids.is_empty() {
+        return Err("select at least one approved MLS proposal to commit".to_owned());
     }
     let device_public_key = device_identity.verifying_key().to_bytes();
     let (indexed_epoch, designated_committer): (i64, Vec<u8>) = connection
@@ -3796,6 +3867,21 @@ fn commit_pending_mls_proposals_in(
         ensure_mls_group_not_quarantined(connection, group_id)?;
         let predecessor_epoch = u64::try_from(indexed_epoch)
             .map_err(|_| "MLS group has an invalid indexed epoch".to_owned())?;
+        let mut approved_refs = Vec::with_capacity(proposal_ids.len());
+        for proposal_id in proposal_ids {
+            let proposal_ref: Vec<u8> = connection
+                .query_row(
+                    "SELECT proposal_ref FROM local_mls_proposals
+                     WHERE group_id = ?1 AND epoch = ?2 AND proposal_id = ?3 AND decision = 1",
+                    params![group_id, predecessor_epoch as i64, proposal_id.as_slice()],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("approved MLS proposal is unavailable: {error}"))?;
+            if proposal_ref.is_empty() {
+                return Err("approved proposal predates individual review; receive it again before committing".to_owned());
+            }
+            approved_refs.push(proposal_ref);
+        }
         capture_mls_epoch_snapshot_in(connection, group_id, predecessor_epoch)?;
         let (stored, recipients) = {
             let provider = LocalOpenMlsProvider::new(connection);
@@ -3851,9 +3937,21 @@ fn commit_pending_mls_proposals_in(
                     recipients.push(binding.device_public_key);
                 }
             }
-            let (commit, _, _) = group
-                .commit_to_pending_proposals(&provider, &signer)
+            let builder = group
+                .commit_builder()
+                .consume_proposal_store(true)
+                .load_psks(provider.storage())
+                .map_err(|error| format!("could not load MLS Commit PSKs: {error:?}"))?
+                .build(provider.rand(), provider.crypto(), &signer, |queued| {
+                    approved_refs
+                        .iter()
+                        .any(|reference| queued.proposal_reference_ref().as_slice() == reference)
+                })
                 .map_err(|error| format!("could not create proposal Commit: {error:?}"))?;
+            let bundle = builder
+                .stage_commit(&provider)
+                .map_err(|error| format!("could not stage proposal Commit: {error:?}"))?;
+            let (commit, _, _) = bundle.into_contents();
             let commit_bytes = commit
                 .tls_serialize_detached()
                 .map_err(|error| format!("could not serialize proposal Commit: {error}"))?;
@@ -5050,6 +5148,18 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
                 format!("could not add relay routes to the encrypted route book: {error}")
             })?;
     }
+    if version < 19 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE local_mls_proposals
+                     ADD COLUMN proposal_ref BLOB NOT NULL DEFAULT X'';
+                 ALTER TABLE local_mls_proposals
+                     ADD COLUMN decision INTEGER NOT NULL DEFAULT 0 CHECK (decision IN (0, 1, 2));
+                 UPDATE local_mls_proposals SET decision = 2;
+                 PRAGMA user_version = 19;",
+            )
+            .map_err(|error| format!("could not add MLS proposal review decisions: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -5668,6 +5778,15 @@ mod tests {
             pending[0].author_device,
             member_identity.verifying_key().to_bytes()
         );
+        assert!(!pending[0].approved);
+        set_mls_proposal_approval_in(&creator, &group.group_id, pending[0].proposal_id, false)
+            .expect("committer should be able to reject an authenticated proposal");
+        assert!(
+            commit_pending_mls_proposals_in(&mut creator, &group.group_id, &[], &creator_identity,)
+                .is_err()
+        );
+        set_mls_proposal_approval_in(&creator, &group.group_id, pending[0].proposal_id, true)
+            .expect("committer should be able to approve an authenticated proposal");
         creator
             .execute_batch(
                 "CREATE TRIGGER force_proposal_commit_outbox_failure
@@ -5676,8 +5795,13 @@ mod tests {
             )
             .expect("test should install a proposal Commit outbox failure");
         assert!(
-            commit_pending_mls_proposals_in(&mut creator, &group.group_id, &creator_identity,)
-                .is_err()
+            commit_pending_mls_proposals_in(
+                &mut creator,
+                &group.group_id,
+                &[pending[0].proposal_id],
+                &creator_identity,
+            )
+            .is_err()
         );
         {
             let provider = LocalOpenMlsProvider::new(&mut creator);
@@ -5690,9 +5814,13 @@ mod tests {
         creator
             .execute_batch("DROP TRIGGER force_proposal_commit_outbox_failure;")
             .expect("test should remove its proposal Commit failure trigger");
-        let commit =
-            commit_pending_mls_proposals_in(&mut creator, &group.group_id, &creator_identity)
-                .expect("designated committer should atomically commit accepted proposals");
+        let commit = commit_pending_mls_proposals_in(
+            &mut creator,
+            &group.group_id,
+            &[pending[0].proposal_id],
+            &creator_identity,
+        )
+        .expect("designated committer should atomically commit accepted proposals");
         assert_eq!(commit.predecessor_epoch, 1);
         assert_eq!(commit.epoch, 2);
         assert!(!commit.commit.is_empty());

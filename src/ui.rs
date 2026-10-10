@@ -1376,50 +1376,6 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             Some(Message::ApplyMlsUpdateProposal),
             state.mls_quarantine_reason.is_none()
         ),
-        l.control(
-            "users",
-            "Criar Commit com todas as propostas",
-            Some(Message::CommitMlsProposals),
-            state.mls_quarantine_reason.is_none() && !state.mls_pending_proposals.is_empty()
-        ),
-        l.label(
-            format!(
-                "PROPOSTAS AUTENTICADAS NESTE EPOCH · {}",
-                state.mls_pending_proposals.len()
-            ),
-            9.0,
-            GOLD,
-        ),
-        if state.mls_pending_proposals.is_empty() {
-            let empty: Element<'_, Message> = l
-                .label("Nenhuma proposta aguarda inclusão em Commit.", 9.0, MUTED)
-                .into();
-            empty
-        } else {
-            column(
-                state
-                    .mls_pending_proposals
-                    .iter()
-                    .map(|proposal| {
-                        let id = crate::hex_encode_bytes(&proposal.proposal_id);
-                        let author = crate::hex_encode_bytes(&proposal.author_device);
-                        l.label(
-                            format!(
-                                "Update · epoch {} · membro {}… · proposta {}…",
-                                proposal.epoch,
-                                &author[..12],
-                                &id[..12]
-                            ),
-                            9.0,
-                            PAPER,
-                        )
-                        .into()
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .spacing(l.px(3.0))
-            .into()
-        },
         rule(LINE, 1.0),
         l.label("KEYPACKAGE RECEBIDO DO CONVIDADO", 10.0, GOLD),
         l.input(
@@ -1707,8 +1663,22 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
         std::iter::once(
             l.label(
                 format!(
-                    "REVISÃO DE PROPOSTAS · {} autenticada(s) aguardando Commit neste epoch",
-                    state.mls_pending_proposals.len()
+                    "REVISÃO DE PROPOSTAS · {} pendente(s) · {} aprovada(s) · {} rejeitada(s)",
+                    state
+                        .mls_pending_proposals
+                        .iter()
+                        .filter(|proposal| !proposal.approved && !proposal.rejected)
+                        .count(),
+                    state
+                        .mls_pending_proposals
+                        .iter()
+                        .filter(|proposal| proposal.approved)
+                        .count(),
+                    state
+                        .mls_pending_proposals
+                        .iter()
+                        .filter(|proposal| proposal.rejected)
+                        .count()
                 ),
                 10.0,
                 GOLD,
@@ -1718,17 +1688,68 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
         .chain(state.mls_pending_proposals.iter().take(3).map(|proposal| {
             let author = crate::hex_encode_bytes(&proposal.author_device);
             let id = crate::hex_encode_bytes(&proposal.proposal_id);
-            l.label(
-                format!(
-                    "Update · membro {}… · proposta {}…",
-                    &author[..12],
-                    &id[..12]
+            let review_actions: Element<'_, Message> = if proposal.approved || proposal.rejected {
+                space().width(l.px(180.0)).into()
+            } else {
+                row![
+                    button(
+                        row![l.icon("check", PAPER, 11.0), l.label("Aprovar", 9.0, PAPER)]
+                            .spacing(l.px(4.0))
+                            .align_y(iced::Center)
+                    )
+                    .on_press_maybe(state.mls_quarantine_reason.is_none().then_some(
+                        Message::SetMlsProposalApproval(proposal.proposal_id, true),
+                    ))
+                    .padding([l.px(4.0), l.px(7.0)])
+                    .style(|_, status| button_style(status, false, false)),
+                    button(
+                        row![l.icon("close", PAPER, 11.0), l.label("Rejeitar", 9.0, PAPER)]
+                            .spacing(l.px(4.0))
+                            .align_y(iced::Center)
+                    )
+                    .on_press_maybe(state.mls_quarantine_reason.is_none().then_some(
+                        Message::SetMlsProposalApproval(proposal.proposal_id, false),
+                    ))
+                    .padding([l.px(4.0), l.px(7.0)])
+                    .style(|_, status| button_style(status, false, false)),
+                ]
+                .spacing(l.px(5.0))
+                .into()
+            };
+            row![
+                l.label(
+                    format!(
+                        "Update · membro {}… · proposta {}… · {}",
+                        &author[..12],
+                        &id[..12],
+                        if proposal.approved {
+                            "aprovada"
+                        } else if proposal.rejected {
+                            "rejeitada"
+                        } else {
+                            "pendente"
+                        }
+                    ),
+                    9.0,
+                    PAPER,
                 ),
-                9.0,
-                PAPER,
-            )
+                review_actions,
+            ]
+            .spacing(l.px(5.0))
             .into()
         }))
+        .chain(std::iter::once(
+            l.control(
+                "users",
+                "Criar Commit com propostas aprovadas",
+                Some(Message::CommitMlsProposals),
+                state.mls_quarantine_reason.is_none()
+                    && state
+                        .mls_pending_proposals
+                        .iter()
+                        .any(|proposal| proposal.approved),
+            ),
+        ))
         .collect::<Vec<Element<'_, Message>>>(),
     )
     .spacing(l.px(3.0));

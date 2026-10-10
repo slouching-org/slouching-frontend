@@ -508,6 +508,7 @@ enum Message {
     ApplyMlsUpdateProposal,
     MlsUpdateProposalProcessed(Result<storage::ProcessedMlsProposal, String>),
     CommitMlsProposals,
+    SetMlsProposalApproval([u8; 16], bool),
     MlsProposalCommitCreated(Result<storage::StoredMlsCommit, String>),
     ApplyMlsCommit,
     MlsCommitProcessed(Result<storage::ProcessedMlsCommit, String>),
@@ -556,6 +557,7 @@ enum Message {
         Result<Vec<storage::MlsCommitRecipientStatus>, String>,
     ),
     MlsPendingProposalsLoaded(Vec<u8>, Result<Vec<storage::StoredMlsProposal>, String>),
+    MlsProposalApprovalSaved([u8; 16], bool, Result<(), String>),
     SendMlsKeyPackage,
     MlsKeyPackageCommandSent(u64, Result<(), String>),
     JoinMlsGroupFromPeer(u64, Result<storage::JoinedMlsGroup, String>),
@@ -2447,9 +2449,14 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 state.mls_status = "Grupo em quarentena; geração de Commit bloqueada.".into();
                 return Task::none();
             }
-            if state.mls_pending_proposals.is_empty() {
-                state.mls_status =
-                    "Nenhuma proposta autenticada aguarda Commit neste epoch.".into();
+            let approved = state
+                .mls_pending_proposals
+                .iter()
+                .filter(|proposal| proposal.approved)
+                .map(|proposal| proposal.proposal_id)
+                .collect::<Vec<_>>();
+            if approved.is_empty() {
+                state.mls_status = "Aprove ao menos uma proposta antes de criar o Commit.".into();
                 return Task::none();
             }
             let group_id = match hex_decode_bytes(&state.mls_group_id) {
@@ -2460,12 +2467,51 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     return Task::none();
                 }
             };
-            state.mls_status = "Commitando propostas MLS autenticadas…".into();
+            state.mls_status = format!(
+                "Criando Commit com {} proposta(s) aprovada(s)…",
+                approved.len()
+            );
             return Task::perform(
-                commit_mls_proposals_task(group_id),
+                commit_mls_proposals_task(group_id, approved),
                 Message::MlsProposalCommitCreated,
             );
         }
+        Message::SetMlsProposalApproval(proposal_id, approved) => {
+            let group_id = match hex_decode_bytes(&state.mls_group_id) {
+                Ok(group_id) if group_id.len() == 16 => group_id,
+                _ => return Task::none(),
+            };
+            state.mls_status = if approved {
+                "Aprovando proposta MLS…"
+            } else {
+                "Rejeitando proposta MLS…"
+            }
+            .into();
+            return Task::perform(
+                set_mls_proposal_approval_task(group_id, proposal_id, approved),
+                move |result| Message::MlsProposalApprovalSaved(proposal_id, approved, result),
+            );
+        }
+        Message::MlsProposalApprovalSaved(proposal_id, approved, result) => match result {
+            Ok(()) => {
+                if let Some(proposal) = state
+                    .mls_pending_proposals
+                    .iter_mut()
+                    .find(|proposal| proposal.proposal_id == proposal_id)
+                {
+                    proposal.approved = approved;
+                }
+                state.mls_status = if approved {
+                    "Proposta aprovada para o próximo Commit."
+                } else {
+                    "Proposta rejeitada e excluída do próximo Commit."
+                }
+                .into();
+            }
+            Err(error) => {
+                state.mls_status = format!("Falha ao salvar decisão da proposta: {error}")
+            }
+        },
         Message::MlsProposalCommitCreated(result) => match result {
             Ok(commit) => {
                 state.mls_commit = hex_encode_bytes(&commit.commit);
@@ -3487,6 +3533,34 @@ fn boot() -> (Slouching, Task<Message>) {
             addresses,
         };
     }
+    if args.iter().any(|arg| arg == "--capture-mls-review") {
+        state.screen = Screen::Mls;
+        state.mls_group_id = "5f8d4d2a7c314e6a9b0f123456789abc".to_owned();
+        state.mls_history_group = hex_decode_bytes(&state.mls_group_id).ok();
+        state.mls_pending_proposals = vec![
+            storage::StoredMlsProposal {
+                proposal_id: [0x4a; 16],
+                epoch: 12,
+                author_device: [0x72; 32],
+                approved: false,
+                rejected: false,
+            },
+            storage::StoredMlsProposal {
+                proposal_id: [0x9c; 16],
+                epoch: 12,
+                author_device: [0x31; 32],
+                approved: true,
+                rejected: false,
+            },
+            storage::StoredMlsProposal {
+                proposal_id: [0xe1; 16],
+                epoch: 12,
+                author_device: [0xb4; 32],
+                approved: false,
+                rejected: true,
+            },
+        ];
+    }
     if let Some(pos) = args.iter().position(|s| s == "--capture-dir")
         && let Some(path) = args.get(pos + 1)
     {
@@ -3821,10 +3895,27 @@ async fn process_mls_proposal_from_peer_task(
     .map_err(|error| format!("MLS peer proposal task failed: {error}"))?
 }
 
-async fn commit_mls_proposals_task(group_id: Vec<u8>) -> Result<storage::StoredMlsCommit, String> {
-    tokio::task::spawn_blocking(move || storage::commit_pending_mls_proposals(&group_id))
-        .await
-        .map_err(|error| format!("MLS proposal Commit task failed: {error}"))?
+async fn commit_mls_proposals_task(
+    group_id: Vec<u8>,
+    proposal_ids: Vec<[u8; 16]>,
+) -> Result<storage::StoredMlsCommit, String> {
+    tokio::task::spawn_blocking(move || {
+        storage::commit_approved_mls_proposals(&group_id, &proposal_ids)
+    })
+    .await
+    .map_err(|error| format!("MLS proposal Commit task failed: {error}"))?
+}
+
+async fn set_mls_proposal_approval_task(
+    group_id: Vec<u8>,
+    proposal_id: [u8; 16],
+    approved: bool,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        storage::set_mls_proposal_approval(&group_id, proposal_id, approved)
+    })
+    .await
+    .map_err(|error| format!("MLS proposal decision task failed: {error}"))?
 }
 
 async fn join_mls_group_task(

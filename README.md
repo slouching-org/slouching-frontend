@@ -223,13 +223,16 @@ author is the same device as the pinned transport peer, authenticates the
 member's device-bound MLS credential, stores the proposal in the encrypted
 OpenMLS state, and deduplicates exact redelivery. The sender receives an ACK
 only after the proposal is stored. Only the designated committer can turn
-accepted proposals into a Commit. That operation saves the new epoch, Commit
+individually approved proposals into a Commit. Each proposal starts pending;
+the committer can explicitly approve or reject it, and the selection is stored
+in the encrypted profile. The OpenMLS Commit builder includes only approved
+proposal references and consumes the epoch's remaining proposal queue when the
+Commit advances the group. Rejected proposals are not included. That operation saves the new epoch, Commit
 outbox, and predecessor-member recipient ledger atomically; the existing
 direct-session Commit delivery flow distributes it. This proposal path accepts
 self-updates only. Before Commit creation, the committer screen lists each
-authenticated proposal's epoch, member key prefix, and proposal ID prefix. The
-button commits every proposal shown for the current epoch; individual approval
-and rejection controls and other proposal types are not implemented.
+authenticated proposal's epoch, member key prefix, proposal ID prefix, and
+review state. Other proposal types are not implemented.
 
 For this flow, both members join the same group. The member opens it, clicks
 **Criar proposta para atualizar minha chave**, connects directly to the
@@ -272,7 +275,7 @@ be installed and available in the user session.
 
 ![Actual native Iced group-call preview; media and sample messages are illustrative](docs/design/runtime/native-vhs/10-call.png)
 
-![Actual 1884 × 1000 native Iced MLS group screen; this capture has no Secret Service, so no local identity or group is available](docs/design/runtime/native-vhs/11-mls.png)
+![Actual 934 × 1000 native Iced MLS screen showing pending, approved, and rejected self-update proposal review controls; proposal rows are capture fixtures](docs/design/runtime/native-vhs/11-mls.png)
 
 ![Actual native Iced Network and P2P settings with delegated MLS copy consent and helper-listener guidance; Secret Service is unavailable in this capture, so the local policy cannot load](docs/design/runtime/native-vhs/02-settings.png)
 
@@ -311,6 +314,7 @@ cargo run -- --screen 09-home
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures
 SLOUCHING_WINDOW_SIZE=960x640 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 01-familiar
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 06-chat --capture-peer-addresses
+SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 11-mls --capture-mls-review
 ```
 
 The capture command renders all twelve screens, saves screenshots through
@@ -322,6 +326,8 @@ needed. `--capture-peer-addresses` supplies illustrative LAN and VPN socket
 addresses for the direct-chat capture; they are fixtures, not live interfaces.
 `SLOUCHING_WINDOW_SIZE` only requests an initial size. The normal
 default is a compact 1100 × 720 window.
+`--capture-mls-review` adds sample pending, approved, and rejected proposals to
+illustrate the review controls; they are fixtures, not live MLS state.
 
 Assets and font license/provenance notes are in [assets/README.md](assets/README.md).
 

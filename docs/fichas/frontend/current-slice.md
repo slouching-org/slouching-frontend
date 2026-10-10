@@ -45,6 +45,14 @@ route to the helper for each connection. A configured participant Iroh Relay
 can carry that route, but the helper flow has not been separately tested over
 a remote relay. This does not provide address discovery or hole-punching.
 
+The designated committer now reviews each authenticated self-update proposal
+individually. Decisions persist in the encrypted profile; only approved
+proposal references enter a Commit, while rejected and still-pending proposals
+are consumed from the old epoch's OpenMLS queue when a Commit advances it.
+Existing proposals from profiles migrated to schema 19 start rejected because
+their saved OpenMLS proposal references predate this review ledger. Other MLS
+proposal types remain unsupported.
+
 Before applying a next-epoch Commit, the client stores the prior OpenMLS group
 state in the encrypted profile database. If a different Commit later arrives
 for an already accepted predecessor epoch, the client restores that snapshot
