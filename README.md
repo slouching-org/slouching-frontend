@@ -148,6 +148,33 @@ been tested between physical machines. The automated
 multiple messages in both directions over one connection, checks wrong-pin
 rejection, and verifies a pending send is reported as unknown on disconnect.
 
+## Direct voice call with another device
+
+Voice calls are ready for the first physical-device trial, but have only been
+verified with two local WebRTC peers so far. Both devices need an active,
+manually pinned direct peer session and membership in the **same dedicated call
+MLS group**.
+
+1. On one device, open **Chamada**, create a protected call group, then use
+   **Convidar participantes** to admit the other device through the MLS flow.
+   Complete the Welcome on the other device and confirm both screens show the
+   same call group.
+2. On each device, open **Configurações → Áudio & vídeo**. Choose a microphone
+   and speaker, then use **Testar microfone localmente** to confirm capture.
+3. On the caller, return to **Chamada** and click **Negociar WebRTC**. The other
+   device shows **Chamada de voz recebida**; accept to connect or decline to
+   refuse. The app opens the microphone only after acceptance and WebRTC
+   connects. **Silenciar microfone** stops outgoing voice frames; **Leave** ends
+   the call.
+
+Voice uses direct WebRTC host candidates over UDP. The manually selected UDP
+port in **Texto direto** carries QUIC signaling; WebRTC also chooses its own
+UDP port dynamically. Allow the app's UDP traffic through both device firewalls
+and the VPN, and make sure the VPN routes between the peers. No STUN/TURN or
+NAT traversal is configured, so this will fail if the VPN or firewall blocks
+the advertised route. Video, calls over a deployed relay, and calls between
+physical devices have not yet been validated.
+
 Before trusting a peer's identity, open **Conferir identidade do peer** from
 the shield button, exchange the complete 64-character device keys through a
 separate channel and compare every character, or import a signed QR shown
