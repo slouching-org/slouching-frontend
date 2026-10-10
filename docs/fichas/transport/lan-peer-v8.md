@@ -109,14 +109,17 @@ until the recipient itself ACKs. A holder only promises the copies it retains
 within its local quota and retention window, so this remains best-effort
 delivery rather than an availability guarantee.
 
-## Using the Iced app on a LAN
+## Using the Iced app on a reachable route
 
 Create an identity on each device and exchange the displayed public keys out
 of band. Linux needs Secret Service available in the user session. Start both
 apps and pin the other device's key. One device chooses a UDP port and clicks
-**Aguardar peer**; share its announced LAN address and port. The other enters
-that address and connects. Either side can then send pairwise text in the
-**Texto direto · LAN** view.
+**Aguardar peer**; choose and copy the announced interface address that the
+other device can reach. It may be a LAN or VPN address; allow UDP on the
+selected port. The other enters that address and connects. Either side can
+then send pairwise text in the **Texto direto · LAN/VPN** view. A VPN can
+provide the route when it carries UDP, but this has not been validated between
+machines yet.
 
 To use MLS, create a group on one device. Generate a KeyPackage on the other,
 select the same group ID, and connect directly to the designated committer.
@@ -127,8 +130,8 @@ sends the Welcome plus ratchet tree through the same pinned session. The new
 member clicks **Validar Welcome e entrar**; it saves the group before ACKing the
 Welcome. The copy/paste fields remain available if the direct Welcome delivery
 is unknown. Both devices open **Grupo MLS**
-and select the same group ID. Establish the pinned direct LAN session in
-**Texto direto · LAN**, then return to the group screen to send or retry
+and select the same group ID. Establish the pinned direct session in
+**Texto direto · LAN/VPN**, then return to the group screen to send or retry
 messages. Messages are retained in each device's local SQLCipher database.
 When adding later members, the MLS screen can send the pending Commit over the
 active pinned session to one device in the predecessor-epoch member snapshot.
@@ -174,8 +177,9 @@ data. Codec tests cover the proposal envelope and bounds.
 
 ## Limits
 
-This is direct-LAN-only. It has no relay, address discovery, NAT traversal,
-offline delivery, group event distribution service, automatic multi-member
+The current client supports manually addressed direct UDP routes. It has no
+relay, address discovery, NAT traversal, offline delivery, group event
+distribution service, automatic multi-member
 Commit fan-out, or cross-device history sync. Group creation and admission
 require explicit user actions. Welcome and ratchet-tree transfer use the
 direct pinned session after admission, with copy/paste retained as a fallback.

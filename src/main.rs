@@ -141,7 +141,7 @@ impl Screen {
             Self::Lobby => "Lobby",
             Self::Connecting => "Conectando & fallback",
             Self::Share => "Escolher tela",
-            Self::Chat => "Texto direto · LAN",
+            Self::Chat => "Texto direto · LAN/VPN",
             Self::Mls => "Grupo MLS · local",
             Self::Incoming => "Chamada recebida",
             Self::Verify => "Verificar selo",
@@ -1670,7 +1670,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             let address = match state.peer_address.parse::<std::net::SocketAddr>() {
                 Ok(address) if !address.ip().is_unspecified() && address.port() != 0 => address,
                 _ => {
-                    state.peer_send_status = PeerSendStatus::Failed("Informe o IP LAN e a porta UDP do outro dispositivo, por exemplo 192.168.1.20:45873.".to_owned());
+                    state.peer_send_status = PeerSendStatus::Failed("Informe um IP alcançável e a porta UDP do outro dispositivo, por exemplo 192.168.1.20:45873.".to_owned());
                     return Task::none();
                 }
             };
@@ -3320,6 +3320,20 @@ fn boot() -> (Slouching, Task<Message>) {
     {
         state.settings_tab = value.min(7);
     }
+    if args.iter().any(|arg| arg == "--capture-peer-addresses") {
+        state.screen = Screen::Chat;
+        let addresses = ["192.168.1.20:45873", "100.64.0.20:45873"]
+            .into_iter()
+            .map(|address| address.parse().expect("valid capture address"))
+            .collect::<Vec<std::net::SocketAddr>>();
+        state.peer_listen_port = "45873".to_owned();
+        state.peer_listener_port = Some(45873);
+        state.peer_listener_addresses = addresses.clone();
+        state.peer_listen_status = PeerListenStatus::Listening {
+            port: 45873,
+            addresses,
+        };
+    }
     if let Some(pos) = args.iter().position(|s| s == "--capture-dir")
         && let Some(path) = args.get(pos + 1)
     {
@@ -4804,7 +4818,7 @@ fn main() -> iced::Result {
         .is_some_and(|arg| arg == "--lan-listen" || arg == "--lan-send")
     {
         if let Err(error) = run_lan_command(&args) {
-            eprintln!("LAN peer error: {error}");
+            eprintln!("direct peer error: {error}");
             std::process::exit(1);
         }
         return Ok(());
@@ -4854,7 +4868,7 @@ fn run_lan_command(args: &[String]) -> Result<(), String> {
                 expected_peer,
             ))?;
             println!("Device identity: {}", hex_encode_key(listener.id().as_bytes()));
-            println!("Listening on 0.0.0.0:{port} (direct LAN only)");
+            println!("Listening on 0.0.0.0:{port} (direct UDP peer transport)");
             for address in listener
                 .direct_addresses()
                 .into_iter()

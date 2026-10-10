@@ -1040,8 +1040,8 @@ pub async fn connect_peer(
     let remote = EndpointAddr::new(expected_peer).with_ip_addr(peer_address);
     let connection = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(remote, PEER_ALPN))
         .await
-        .map_err(|_| "timed out connecting to direct LAN peer".to_owned())?
-        .map_err(|error| format!("could not connect to pinned LAN peer: {error}"))?;
+        .map_err(|_| "timed out connecting to direct peer".to_owned())?
+        .map_err(|error| format!("could not connect to pinned peer: {error}"))?;
     if connection.remote_id() != expected_peer {
         connection.close(1_u32.into(), b"unexpected device identity");
         endpoint.close().await;

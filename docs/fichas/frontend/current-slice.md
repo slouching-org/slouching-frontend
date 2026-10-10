@@ -64,7 +64,7 @@ prepares and admits device-bound KeyPackages, processes Welcome and ratchet
 tree data, loads a bounded local transcript, sends application messages, and
 retries queued outbox events for the selected group unless it is quarantined. Group invitations require a separately trusted device-key pin and an explicit
 committer admission. Both devices must have joined the same
-group, select its ID, and establish a direct LAN session to exchange messages.
+group, select its ID, and establish a direct session over a reachable route.
 Groups saved on this device appear with their current epoch and quarantine
 status; selecting one reloads its local transcript and security state.
 Members can send signed self-update proposals to the designated committer over
@@ -76,9 +76,10 @@ prefix and proposal ID before enabling Commit creation. The button commits all
 proposals shown in the review list; selecting or rejecting proposals
 individually and handling other proposal types are not implemented.
 
-The direct-LAN text screen manually pins the peer's Ed25519 device key. One
-side listens and shares its announced LAN address; the other connects to that
-address. Both can send multiple messages. The receiver stores inbound text
+The direct-text screen manually pins the peer's Ed25519 device key. One side
+listens and shares a reachable interface address; the other connects to that
+address. A VPN may provide a direct route if it carries UDP, but that path is
+not yet verified between machines. Both can send multiple messages. The receiver stores inbound text
 before ACK; the sender stores sent text after ACK. It reloads the newest 200
 messages for the peer and supports confirmed history deletion. This pairwise
 text path is separate from MLS. Neither path provides relay, address discovery,

@@ -39,10 +39,10 @@ not establish a peer session. The UI shows connection and protocol errors
 separately. **Refresh backend** repeats both
 the HTTP diagnostic and WebSocket handshake.
 
-## Direct LAN messages
+## Direct peer messages
 
 The **chat** button in the Iced app opens a persistent direct-text screen. This
-path sends real text over Iroh/QUIC between devices on a reachable LAN; it is
+path sends real text over Iroh/QUIC between devices on a reachable UDP route; it is
 separate from the Elixir diagnostics and has no hosted service in the data
 path.
 
@@ -53,12 +53,10 @@ path.
 2. On both devices, paste the other device's public key into **Chave pública do
    peer · pin manual**. This manually pins the peer for both sending and receiving.
 3. On the receiving device, choose a UDP port (for example `45873`) and click
-   **Aguardar peer**. Use **Copiar endereço LAN** to copy the announced socket
-   address and share it with the sender. If the app lists several addresses,
-   the button prefers a private IPv4 address. Wildcard addresses such as
-   `0.0.0.0` cannot be shared; if no LAN address is announced, check the
-   device's network interfaces.
-4. On the sending device, enter the receiver's LAN address and port, type a
+   **Aguardar peer**. Each announced socket address has its own **Copiar este
+   endereço** button. Pick the address reachable from the sender's network;
+   wildcard addresses such as `0.0.0.0` cannot be shared.
+4. On the sending device, enter the receiver's address and port, type a
    message, and click **Conectar e enviar**. After connection, either device
    can send multiple messages over the same session. Sent text appears only
    after an ACK; received text appears live after the pinned identity check.
@@ -77,7 +75,10 @@ synchronized. **Apagar histórico local deste peer** removes only that peer's
 rows after an explicit confirmation. This is pairwise QUIC channel encryption
 and pinned device identity, not MLS messaging or contact verification. There
 is no address discovery, relay, cross-NAT support, retry/offline delivery, or
-media. Allow the chosen UDP port through each device's local firewall. The automated
+media. If both devices use the same VPN, choose the receiver's VPN address and
+allow UDP through the VPN and local firewalls; this uses the VPN as the route,
+not Slouching NAT traversal. VPN connectivity has not yet been tested between
+machines. Allow the chosen UDP port through each device's local firewall. The automated
 `cargo test --test peer_process` launches separate OS processes, exchanges
 multiple messages in both directions over one connection, checks wrong-pin
 rejection, and verifies a pending send is reported as unknown on disconnect.
@@ -111,8 +112,8 @@ transaction, so a retry after a lost ACK safely returns the existing group.
 After an unknown delivery or app restart, reconnect to the pinned invitee to
 retry the queued bundle. Copy/paste fields remain available if direct delivery
 is unavailable. After both devices join, open
-**Texto direto · LAN** and connect them using the usual
-pinned-key and LAN-address flow. In **Grupo MLS**, select the same group ID on
+**Texto direto · LAN/VPN** and connect them using the usual
+pinned-key and reachable-address flow. In **Grupo MLS**, select the same group ID on
 both devices; MLS messages are encrypted and sent over that active direct
 Iroh/QUIC session. The receiver validates the MLS event and stores its
 ciphertext, ratchet update, and plaintext transcript in SQLCipher before
@@ -234,7 +235,7 @@ screen can also explicitly create and retain an Ed25519 device signing key in
 the system credential store. It displays the public key as unverified; no
 fingerprint format or contact pairing is implemented. OpenMLS credentials
 include a versioned binding signed by the durable device key. One-use
-KeyPackages and private MLS state are stored in SQLCipher. The direct-LAN
+KeyPackages and private MLS state are stored in SQLCipher. The direct-chat
 screen separately pins device public keys. Character scenes and call views
 remain visual previews. No camera, microphone, or screen is captured. **Rede &
 P2P** in Settings retains the Elixir HTTP/WebSocket diagnostics and manual
@@ -243,7 +244,7 @@ be installed and available in the user session.
 
 ![Actual refreshed 1280 × 800 native Iced familiar screen from this transport milestone; Secret Service is unavailable in this capture](docs/design/runtime/native-vhs/01-familiar.png)
 
-![Actual 1884 × 1000 native Iced chat showing the pinned-route area; Secret Service is unavailable in this capture, so identity-gated controls are disabled.](docs/design/runtime/native-vhs/06-chat.png)
+![Native Iced direct chat with separate copy controls for sample LAN and VPN socket addresses; the capture addresses are illustrative and Secret Service is unavailable.](docs/design/runtime/native-vhs/06-chat.png)
 
 ![Actual native Iced home with open scenery and icon-based feature strip, without the frog mage or gnome cutouts](docs/design/runtime/native-vhs/09-home.png)
 
@@ -287,6 +288,7 @@ the prior compatibility contract.
 cargo run -- --screen 09-home
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures
 SLOUCHING_WINDOW_SIZE=960x640 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 01-familiar
+SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 06-chat --capture-peer-addresses
 ```
 
 The capture command renders all twelve screens, saves screenshots through
@@ -294,7 +296,9 @@ Iced's window screenshot API, and exits. Add `--capture-screen <slug>` to
 capture one view, such as the familiar screen, instead of the full gallery. A tiling compositor may override
 the requested window size; float/resize that window before the capture delay.
 Set `SLOUCHING_CAPTURE_DELAY_MS` to extend the default six-second delay when
-needed. `SLOUCHING_WINDOW_SIZE` only requests an initial size. The normal
+needed. `--capture-peer-addresses` supplies illustrative LAN and VPN socket
+addresses for the direct-chat capture; they are fixtures, not live interfaces.
+`SLOUCHING_WINDOW_SIZE` only requests an initial size. The normal
 default is a compact 1100 × 720 window.
 
 Assets and font license/provenance notes are in [assets/README.md](assets/README.md).

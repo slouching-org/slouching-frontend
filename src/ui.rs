@@ -356,7 +356,7 @@ fn header(state: &Slouching, l: Layout) -> Element<'_, Message> {
         .spacing(l.px(18.0))
         .align_y(iced::Center);
     let mode = if state.screen == Screen::Chat {
-        "P2P · LAN"
+        "P2P · LAN/VPN"
     } else {
         "PRÉVIA VISUAL"
     };
@@ -441,7 +441,7 @@ fn home(state: &Slouching, l: Layout) -> Element<'_, Message> {
     ]
     .spacing(l.px(14.0));
     let features = row![
-        feature(l, "arrow", "P2P", "Texto LAN · experimental"),
+        feature(l, "arrow", "P2P", "Texto direto · experimental"),
         feature(l, "shield", "Private", "MLS · planejado"),
         feature(l, "users", "For your crew", "Voice, video, screen"),
         feature(l, "headphones", "Just vibes", "Always")
@@ -788,7 +788,7 @@ fn settings(state: &Slouching, l: Layout) -> Element<'_, Message> {
                     false
                 ),
                 l.label(
-                    "Mensagens de texto entre peers na mesma LAN usam o transporte Rust/Iroh, sem backend.",
+                    "Mensagens diretas usam Rust/Iroh; LAN ou VPN precisa permitir tráfego UDP.",
                     12.0,
                     PAPER
                 ),
@@ -1837,37 +1837,42 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
             if direct.is_empty() {
                 l.label(
                     format!(
-                        "Aguardando sessão · UDP {port}. Nenhum IP LAN foi anunciado; consulte as interfaces de rede. Não compartilhe 0.0.0.0: é um endereço curinga."
+                        "Aguardando sessão · UDP {port}. Nenhum endereço de rede foi anunciado; consulte as interfaces de rede. Não compartilhe 0.0.0.0: é um endereço curinga."
                     ),
                     11.0,
                     GREEN,
                 )
                 .into()
             } else {
-                let lan_address = direct
-                    .iter()
-                    .find(|address| {
-                        matches!(address.ip(), std::net::IpAddr::V4(ip) if ip.is_private())
-                    })
-                    .copied()
-                    .unwrap_or(direct[0]);
                 let addresses = direct
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join("  ou  ");
+                let mut copy_buttons = column![];
+                for address in &direct {
+                    copy_buttons = copy_buttons.push(
+                        column![
+                            l.label(address.to_string(), 11.0, GREEN),
+                            l.control(
+                                "key",
+                                "Copiar este endereço",
+                                Some(Message::CopyPeerListenAddress(address.to_string())),
+                                false,
+                            )
+                        ]
+                        .spacing(l.px(4.0)),
+                    );
+                }
                 column![
                     l.label(
-                        format!("Aguardando sessão · compartilhe: {addresses}"),
+                        format!(
+                            "Aguardando sessão · escolha um endereço para compartilhar: {addresses}"
+                        ),
                         11.0,
                         GREEN
                     ),
-                    l.control(
-                        "key",
-                        "Copiar endereço LAN",
-                        Some(Message::CopyPeerListenAddress(lan_address.to_string())),
-                        false,
-                    )
+                    copy_buttons.spacing(l.px(8.0))
                 ]
                 .spacing(l.px(6.0))
                 .into()
@@ -1941,7 +1946,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
     };
     let send_address = row![
         column![
-            l.label("ENDEREÇO LAN DO PEER", 10.0, GOLD),
+            l.label("ENDEREÇO DIRETO DO PEER", 10.0, GOLD),
             l.input(
                 "192.168.1.20:45873",
                 &state.peer_address,
@@ -1979,7 +1984,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 if session_connected {
                     "Sessão ativa · envie várias mensagens pela mesma conexão."
                 } else {
-                    "Envio direto · conecte ao peer na mesma LAN para iniciar a sessão."
+                    "Envio direto · use o IP anunciado que seja alcançável nesta rede ou VPN."
                 },
                 11.0,
                 MUTED,
@@ -2133,7 +2138,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
         row![
             column![
                 l.title("Texto direto", 28.0),
-                l.label("Iroh/QUIC · mesma LAN · sem MLS", 11.0, MUTED)
+                l.label("Iroh/QUIC · LAN ou VPN · sem MLS", 11.0, MUTED)
             ]
             .spacing(l.px(5.0)),
             space().width(Fill),
