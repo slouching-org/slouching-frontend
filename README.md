@@ -109,10 +109,11 @@ The helper contract and limits are in
 
 The local development WebSocket gateway proves possession of the same device
 key with a fresh Ed25519 challenge. The Rust client also has an experimental
-two-device SFU signaling mode. Set `SLOUCHING_SFU_WS_URL` on both clients to
-the same helper URL (for example `wss://helper.example/ws`), load the same
-two-member call MLS group, and each participant starts the call from the
-**Chamada** panel. The helper checks device-signed roster consistency but
+two-device SFU signaling mode. On both clients, open **Configurações → Rede &
+P2P → Chamadas por SFU**, enter the same helper URL (for example
+`wss://helper.example/ws`), enable it, and save. Load the same two-member call
+MLS group; each participant can then enter from the **Chamada** panel without
+an active direct P2P connection. The helper checks device-signed roster consistency but
 cannot verify MLS membership independently. A smoke test covers two software
 clients and protected audio forwarded by a local helper; physical audio
 devices and different networks have not been tested.
@@ -122,7 +123,8 @@ service when its public address is behind one-to-one NAT. Open and forward
 that UDP range to the helper. SFU media has no TURN/TCP fallback, so both
 client networks must permit outbound UDP. The clients can join the SFU without
 an active direct P2P connection once they share the call MLS group.
-From the project root, `./scripts/smoke-gateway-auth-e2e.sh` starts an isolated
+`SLOUCHING_SFU_WS_URL` remains available as a development override. From the
+project root, `./scripts/smoke-gateway-auth-e2e.sh` starts an isolated
 SQLite-backed Elixir helper and verifies device authentication, Ping/Pong,
 signed roster admission, SDP negotiation, ICE/DTLS, and protected audio
 forwarding between two Rust software clients. The fixed test keys are used
@@ -690,6 +692,10 @@ The SFU entry action was added to the call view, but its screenshot could not
 be captured in this checkout because neither `WAYLAND_DISPLAY` nor `DISPLAY`
 is available; run the `--capture-call-sfu` command above in a graphical
 session to refresh it.
+The **Rede & P2P** settings view now includes the saved SFU URL and opt-in
+controls. Refresh `02-settings.png` with the `--capture-delivery-mailbox`
+capture command above in a graphical session; this headless checkout cannot
+open an Iced window to save the updated PNG.
 `SLOUCHING_WINDOW_SIZE` only requests an initial size. The normal
 default is a compact 1100 × 720 window.
 `--capture-mls-review` adds sample pending, approved, and rejected proposals to

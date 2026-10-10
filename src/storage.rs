@@ -30,7 +30,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 27;
+const PROFILE_SCHEMA_VERSION: u32 = 28;
 type AttachmentTransfer = ([u8; 16], [u8; 32]);
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
@@ -1880,6 +1880,12 @@ pub struct DeliveryMailboxConfig {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallHelperConfig {
+    pub websocket_url: String,
+    pub enabled: bool,
+}
+
 /// Signs a recipient mailbox request with the existing device identity key.
 pub fn sign_delivery_http_request(
     method: &str,
@@ -2068,6 +2074,50 @@ fn load_delivery_mailbox_config_in(
 
 pub fn save_delivery_mailbox_config(config: &DeliveryMailboxConfig) -> Result<(), String> {
     save_delivery_mailbox_config_in(&open_local_database()?, config)
+}
+
+pub fn load_call_helper_config() -> Result<CallHelperConfig, String> {
+    load_call_helper_config_in(&open_local_database()?)
+}
+
+fn load_call_helper_config_in(connection: &Connection) -> Result<CallHelperConfig, String> {
+    connection
+        .query_row(
+            "SELECT websocket_url, enabled FROM local_call_helper_config WHERE id = 1",
+            [],
+            |row| {
+                Ok(CallHelperConfig {
+                    websocket_url: row.get(0)?,
+                    enabled: row.get::<_, i64>(1)? != 0,
+                })
+            },
+        )
+        .optional()
+        .map(|config| config.unwrap_or_default())
+        .map_err(|error| format!("could not load SFU call helper settings: {error}"))
+}
+
+pub fn save_call_helper_config(config: &CallHelperConfig) -> Result<(), String> {
+    save_call_helper_config_in(&open_local_database()?, config)
+}
+
+fn save_call_helper_config_in(
+    connection: &Connection,
+    config: &CallHelperConfig,
+) -> Result<(), String> {
+    if config.websocket_url.trim().len() > 2048 {
+        return Err("SFU WebSocket URL exceeds 2048 bytes".to_owned());
+    }
+    connection
+        .execute(
+            "INSERT INTO local_call_helper_config (id, websocket_url, enabled)
+             VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET websocket_url = excluded.websocket_url,
+                 enabled = excluded.enabled",
+            params![config.websocket_url.trim(), i64::from(config.enabled)],
+        )
+        .map_err(|error| format!("could not save SFU call helper settings: {error}"))?;
+    Ok(())
 }
 
 fn save_delivery_mailbox_config_in(
@@ -6417,6 +6467,20 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
                 .map_err(|error| format!("could not backfill attachment event link: {error}"))?;
         }
     }
+    if version < 28 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS local_call_helper_config (
+                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                     websocket_url TEXT NOT NULL CHECK (length(websocket_url) <= 2048),
+                     enabled INTEGER NOT NULL CHECK (enabled IN (0, 1))
+                 );
+                 INSERT OR IGNORE INTO local_call_helper_config (id, websocket_url, enabled)
+                     VALUES (1, '', 0);
+                 PRAGMA user_version = 28;",
+            )
+            .map_err(|error| format!("could not create SFU call helper settings: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -9022,6 +9086,46 @@ mod tests {
         );
         drop(reopened);
         fs::remove_dir_all(directory).expect("temporary delivery database should be removed");
+    }
+
+    #[test]
+    fn sfu_call_helper_settings_persist_in_the_encrypted_profile() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-call-helper-config-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary helper database directory should exist");
+        let path = directory.join("profile.sqlite3");
+        let key = [0x38; PROFILE_DB_KEY_LEN];
+        let config = CallHelperConfig {
+            websocket_url: "wss://helper.crew.example/ws".to_owned(),
+            enabled: true,
+        };
+
+        let connection = open_database(&path, &key).expect("encrypted schema should migrate");
+        assert_eq!(
+            load_call_helper_config_in(&connection).expect("default config should load"),
+            CallHelperConfig::default()
+        );
+        save_call_helper_config_in(&connection, &config)
+            .expect("SFU helper settings should be stored");
+        assert_eq!(
+            load_call_helper_config_in(&connection).expect("SFU helper settings should reload"),
+            config
+        );
+        drop(connection);
+
+        let reopened = open_database(&path, &key).expect("encrypted profile should reopen");
+        assert_eq!(
+            load_call_helper_config_in(&reopened).expect("SFU helper settings should persist"),
+            config
+        );
+        drop(reopened);
+        fs::remove_dir_all(directory).expect("temporary helper database should be removed");
     }
 
     #[test]

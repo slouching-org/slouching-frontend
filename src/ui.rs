@@ -968,7 +968,7 @@ fn settings(state: &Slouching, l: Layout) -> Element<'_, Message> {
             .spacing(l.px(24.0)))
         }
         2 => l.panel(
-            column![
+            scrollable(column![
                 l.title("Rede & P2P", 34.0),
                 l.label(
                     "O diagnóstico HTTP/WebSocket abaixo verifica apenas o backend local.",
@@ -1034,6 +1034,35 @@ fn settings(state: &Slouching, l: Layout) -> Element<'_, Message> {
                     l.label("A fila expira em até 30 dias e é apagada após a confirmação do destinatário.", 11.0, MUTED)
                 },
                 rule(LINE, l.px(8.0)),
+                l.label("CHAMADAS POR SFU · OPCIONAL", 11.0, GOLD),
+                l.label(
+                    "Use um helper Elixir para chamadas de duas pessoas quando a conexão direta não funcionar. Os dois dispositivos precisam entrar no mesmo grupo MLS e usar o mesmo helper.",
+                    11.0,
+                    PAPER
+                ),
+                l.input_maybe(
+                    "wss://helper.example.org/ws",
+                    &state.call_helper_config.websocket_url,
+                    Some(Message::CallHelperUrlChanged as fn(String) -> Message)
+                ),
+                row![
+                    l.control(
+                        "headphones",
+                        if state.call_helper_config.enabled { "Desativar SFU remoto" } else { "Ativar SFU remoto" },
+                        Some(Message::ToggleCallHelper(!state.call_helper_config.enabled)),
+                        true
+                    ),
+                    l.control("check", "Salvar", Some(Message::SaveCallHelperConfig), false),
+                    l.control("close", "Descartar", Some(Message::DiscardCallHelperConfig), false)
+                ]
+                .spacing(l.px(6.0)),
+                l.label(state.call_helper_status.clone(), 10.0, MUTED),
+                if let Some(error) = &state.call_helper_config_error {
+                    l.label(error.clone(), 10.0, RED)
+                } else {
+                    l.label("Remoto exige WSS. Configure também o IP público e a faixa UDP no servidor; não há fallback TURN.", 10.0, MUTED)
+                },
+                rule(LINE, l.px(8.0)),
                 l.label("MAILBOX ELIXIR · OPCIONAL", 11.0, GOLD),
                 l.label(
                     "Quando uma rota direta falhar, o app pode guardar uma cópia MLS cifrada neste helper. O ACK do helper não significa que o destinatário recebeu a mensagem.",
@@ -1071,7 +1100,8 @@ fn settings(state: &Slouching, l: Layout) -> Element<'_, Message> {
                     l.label("A chave do dispositivo assina listagem e ACK; endpoints remotos exigem HTTPS.", 10.0, MUTED)
                 }
             ]
-            .spacing(l.px(24.0)),
+            .spacing(l.px(24.0)))
+            .height(Fill),
         ),
         3 => l.panel(
             column![
@@ -1370,8 +1400,9 @@ fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
     ]
     .spacing(l.px(6.0));
     let identity_ready = matches!(state.identity_status, crate::IdentityStatus::Ready(_));
-    let sfu_configured =
-        std::env::var("SLOUCHING_SFU_WS_URL").is_ok_and(|url| !url.trim().is_empty());
+    let sfu_configured = (state.call_helper_config.enabled
+        && !state.call_helper_config.websocket_url.trim().is_empty())
+        || std::env::var("SLOUCHING_SFU_WS_URL").is_ok_and(|url| !url.trim().is_empty());
     let can_start_call = state.active_peer_device.is_some() || sfu_configured;
     let call_group_controls: Element<'_, Message> = if state.call_group_id.is_empty() {
         column![

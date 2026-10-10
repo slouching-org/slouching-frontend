@@ -282,6 +282,9 @@ struct Slouching {
     delivery_mailbox_config: storage::DeliveryMailboxConfig,
     delivery_mailbox_config_error: Option<String>,
     delivery_mailbox_status: String,
+    call_helper_config: storage::CallHelperConfig,
+    call_helper_config_error: Option<String>,
+    call_helper_status: String,
     peer_public_key: String,
     peer_invite_addresses: Vec<String>,
     peer_verification_loaded_for: Option<String>,
@@ -507,6 +510,9 @@ impl Default for Slouching {
             delivery_mailbox_config: storage::DeliveryMailboxConfig::default(),
             delivery_mailbox_config_error: None,
             delivery_mailbox_status: "Mailbox remoto desativado.".to_owned(),
+            call_helper_config: storage::CallHelperConfig::default(),
+            call_helper_config_error: None,
+            call_helper_status: "SFU remoto desativado.".to_owned(),
             peer_public_key: String::new(),
             peer_invite_addresses: Vec::new(),
             peer_verification_loaded_for: None,
@@ -704,6 +710,12 @@ enum Message {
     DeliveryMailboxConfigSaved(storage::DeliveryMailboxConfig, Result<(), String>),
     FetchDeliveryMailbox,
     DeliveryMailboxFetched(Result<(usize, usize), String>),
+    CallHelperConfigLoaded(Result<storage::CallHelperConfig, String>),
+    CallHelperUrlChanged(String),
+    ToggleCallHelper(bool),
+    SaveCallHelperConfig,
+    DiscardCallHelperConfig,
+    CallHelperConfigSaved(storage::CallHelperConfig, Result<(), String>),
     DelegatedCopyStored(
         u64,
         [u8; 16],
@@ -1076,6 +1088,63 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 "Busca no mailbox falhou; cópias não confirmadas permanecem disponíveis.".into();
             state.delivery_mailbox_config_error = Some(error);
         }
+        Message::CallHelperConfigLoaded(Ok(config)) => {
+            state.call_helper_config = config;
+            state.call_helper_config_error = None;
+            state.call_helper_status = if state.call_helper_config.enabled {
+                "SFU remoto configurado para chamadas de duas pessoas.".into()
+            } else {
+                "SFU remoto desativado.".into()
+            };
+        }
+        Message::CallHelperConfigLoaded(Err(error)) => {
+            state.call_helper_config_error = Some(error);
+            state.call_helper_status = "Não foi possível carregar a configuração do SFU.".into();
+        }
+        Message::CallHelperUrlChanged(url) => {
+            state.call_helper_config.websocket_url = url;
+            state.call_helper_config_error = None;
+        }
+        Message::ToggleCallHelper(enabled) => {
+            state.call_helper_config.enabled = enabled;
+            state.call_helper_config_error = None;
+        }
+        Message::SaveCallHelperConfig => {
+            if state.call_helper_config.enabled {
+                match sfu_call::normalize_ws_url(&state.call_helper_config.websocket_url) {
+                    Ok(url) => state.call_helper_config.websocket_url = url,
+                    Err(error) => {
+                        state.call_helper_config_error = Some(error);
+                        return Task::none();
+                    }
+                }
+            }
+            let config = state.call_helper_config.clone();
+            state.call_helper_status = "Salvando configuração local cifrada…".into();
+            return Task::perform(
+                save_call_helper_config_task(config.clone()),
+                move |result| Message::CallHelperConfigSaved(config, result),
+            );
+        }
+        Message::DiscardCallHelperConfig => {
+            return Task::perform(
+                load_call_helper_config_task(),
+                Message::CallHelperConfigLoaded,
+            );
+        }
+        Message::CallHelperConfigSaved(config, Ok(())) => {
+            state.call_helper_config = config;
+            state.call_helper_config_error = None;
+            state.call_helper_status = if state.call_helper_config.enabled {
+                "SFU remoto salvo; os dois membros entram pelo mesmo helper.".into()
+            } else {
+                "SFU remoto desativado.".into()
+            };
+        }
+        Message::CallHelperConfigSaved(_, Err(error)) => {
+            state.call_helper_status = "Falha ao salvar a configuração do SFU.".into();
+            state.call_helper_config_error = Some(error);
+        }
         Message::DelegatedCopyStored(sequence, event_id, result) => match result {
             Ok(_) => {
                 if let Some(commands) = state.peer_session_commands.as_ref() {
@@ -1291,8 +1360,11 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.call_group_status = "Crie ou selecione um grupo MLS de chamada primeiro.".into();
         }
         Message::StartCall => {
-            let sfu_configured =
-                std::env::var("SLOUCHING_SFU_WS_URL").is_ok_and(|value| !value.trim().is_empty());
+            let sfu_url = configured_sfu_url(
+                &state.call_helper_config,
+                std::env::var("SLOUCHING_SFU_WS_URL").ok(),
+            );
+            let sfu_configured = sfu_url.is_some();
             let peer_device = state
                 .active_peer_device
                 .filter(|_| active_peer_is_pinned(state));
@@ -1331,7 +1403,13 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 "Validando grupo MLS e reunindo candidatos WebRTC…".into()
             };
             return Task::perform(
-                prepare_call_offer_task(group_id, peer_device, input_device, output_device),
+                prepare_call_offer_task(
+                    group_id,
+                    peer_device,
+                    input_device,
+                    output_device,
+                    sfu_url,
+                ),
                 Message::CallOfferCreated,
             );
         }
@@ -6059,6 +6137,7 @@ fn boot() -> (Slouching, Task<Message>) {
     let args: Vec<String> = std::env::args().collect();
     let capture_share_camera = args.iter().any(|arg| arg == "--capture-share-camera");
     let capture_share_window = args.iter().any(|arg| arg == "--capture-share-window");
+    let capture_call_sfu = args.iter().any(|arg| arg == "--capture-call-sfu");
     let capture_peer_verification = args.iter().any(|arg| arg == "--capture-peer-verification");
     let capture_contact_pairing = args.iter().any(|arg| arg == "--capture-contact-pairing");
     let capture_lan_discovery = args.iter().any(|arg| arg == "--capture-lan-discovery");
@@ -6113,6 +6192,12 @@ fn boot() -> (Slouching, Task<Message>) {
         };
         state.delivery_mailbox_status =
             "Helper remoto ativo · upload somente após falha direta.".to_owned();
+        state.call_helper_config = storage::CallHelperConfig {
+            websocket_url: "wss://helper.example.org/ws".to_owned(),
+            enabled: true,
+        };
+        state.call_helper_status =
+            "SFU remoto salvo; os dois membros entram pelo mesmo helper.".to_owned();
     }
     if args.iter().any(|arg| arg == "--capture-peer-addresses") {
         state.screen = Screen::Chat;
@@ -6245,6 +6330,10 @@ fn boot() -> (Slouching, Task<Message>) {
         state.identity_status = IdentityStatus::Ready([0x11; 32]);
         state.active_peer_device = None;
         state.peer_public_key.clear();
+        state.call_helper_config = storage::CallHelperConfig {
+            websocket_url: "ws://127.0.0.1:3707/ws".to_owned(),
+            enabled: true,
+        };
         state.call_group_id = "5f8d4d2a7c314e6a9b0f123456789abc".to_owned();
         state.call_group_status =
             "Pronto para entrar pelo SFU · ambos os membros iniciam pelo mesmo helper.".to_owned();
@@ -6396,6 +6485,14 @@ fn boot() -> (Slouching, Task<Message>) {
                 Task::perform(
                     load_delivery_mailbox_config_task(),
                     Message::DeliveryMailboxConfigLoaded,
+                )
+            },
+            if capture_call_sfu || capture_delivery_mailbox {
+                Task::none()
+            } else {
+                Task::perform(
+                    load_call_helper_config_task(),
+                    Message::CallHelperConfigLoaded,
                 )
             },
             load_mls_groups(),
@@ -6601,6 +6698,18 @@ async fn save_delivery_mailbox_config_task(
     tokio::task::spawn_blocking(move || storage::save_delivery_mailbox_config(&config))
         .await
         .map_err(|error| format!("delivery mailbox settings save failed: {error}"))?
+}
+
+async fn load_call_helper_config_task() -> Result<storage::CallHelperConfig, String> {
+    tokio::task::spawn_blocking(storage::load_call_helper_config)
+        .await
+        .map_err(|error| format!("SFU helper settings load failed: {error}"))?
+}
+
+async fn save_call_helper_config_task(config: storage::CallHelperConfig) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || storage::save_call_helper_config(&config))
+        .await
+        .map_err(|error| format!("SFU helper settings save failed: {error}"))?
 }
 
 async fn fetch_delivery_mailbox_task(
@@ -6885,15 +6994,12 @@ async fn prepare_call_offer_task(
     peer_device: Option<[u8; 32]>,
     input_device: String,
     output_device: String,
+    sfu_url: Option<String>,
 ) -> Result<CallOfferReady, String> {
     let context = tokio::task::spawn_blocking(move || storage::load_call_media_context(&group_id))
         .await
         .map_err(|error| format!("call MLS context task failed: {error}"))??;
     let epoch = context.epoch;
-    let sfu_url = std::env::var("SLOUCHING_SFU_WS_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-
     if let Some(ws_url) = sfu_url {
         if context.members.len() != 2 {
             return Err(
@@ -6976,6 +7082,19 @@ async fn prepare_call_offer_task(
         offer,
         sfu_transport: None,
     })
+}
+
+fn configured_sfu_url(
+    config: &storage::CallHelperConfig,
+    environment_override: Option<String>,
+) -> Option<String> {
+    if config.enabled {
+        let url = config.websocket_url.trim();
+        return (!url.is_empty()).then(|| url.to_owned());
+    }
+    environment_override
+        .map(|url| url.trim().to_owned())
+        .filter(|url| !url.is_empty())
 }
 
 async fn process_call_signal_task(
@@ -9060,6 +9179,25 @@ fn hex_encode_key(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_sfu_helper_is_used_and_environment_remains_a_fallback() {
+        let saved = storage::CallHelperConfig {
+            websocket_url: "wss://saved.example/ws".to_owned(),
+            enabled: true,
+        };
+        assert_eq!(
+            configured_sfu_url(&saved, Some("wss://override.example/ws".to_owned())),
+            Some("wss://saved.example/ws".to_owned())
+        );
+
+        let disabled = storage::CallHelperConfig::default();
+        assert_eq!(
+            configured_sfu_url(&disabled, Some(" wss://override.example/ws ".to_owned())),
+            Some("wss://override.example/ws".to_owned())
+        );
+        assert_eq!(configured_sfu_url(&disabled, None), None);
+    }
 
     #[test]
     fn connection_screen_opens_network_settings_tab() {

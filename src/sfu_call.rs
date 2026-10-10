@@ -265,7 +265,7 @@ fn validate_roster(roster: &[[u8; 32]]) -> Result<(), String> {
     Ok(())
 }
 
-fn normalize_ws_url(value: &str) -> Result<String, String> {
+pub fn normalize_ws_url(value: &str) -> Result<String, String> {
     let mut url =
         url::Url::parse(value).map_err(|error| format!("invalid SFU WebSocket URL: {error}"))?;
     if !matches!(url.scheme(), "ws" | "wss")
