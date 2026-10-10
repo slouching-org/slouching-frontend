@@ -1,3 +1,4 @@
+use crate::file_transfer::FileOffer;
 use crate::identity::MlsSigningKeyBinding;
 use directories::ProjectDirs;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -25,7 +26,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 20;
+const PROFILE_SCHEMA_VERSION: u32 = 21;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 const MAX_DELEGATED_COPY_BYTES: usize = 32 * 1024;
@@ -52,6 +53,7 @@ type StoredInboundEnvelope = (
     Vec<u8>,
 );
 type StoredPriorMlsCommit = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+type StoredPriorFileAttachment = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 type StoredDelegatedCopyEnvelope = (
     Vec<u8>,
     Vec<u8>,
@@ -307,6 +309,151 @@ pub struct StoredMlsGroup {
     pub group_id: [u8; 16],
     pub epoch: u64,
     pub quarantined: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct StoredFileAttachment {
+    pub group_id: [u8; 16],
+    pub author_device: [u8; 32],
+    pub ciphertext_hash: [u8; 32],
+    pub created_at_unix: i64,
+    pub offer: FileOffer,
+}
+
+/// Saves an attachment offer and its content key inside the encrypted profile.
+/// The key-bearing offer is never written to the blob store or plaintext files.
+pub fn save_file_attachment(
+    group_id: [u8; 16],
+    author_device: [u8; 32],
+    ciphertext_hash: [u8; 32],
+    offer: &FileOffer,
+) -> Result<(), String> {
+    let mut connection = open_local_database()?;
+    save_file_attachment_in(
+        &mut connection,
+        group_id,
+        author_device,
+        ciphertext_hash,
+        offer,
+    )
+}
+
+pub fn list_file_attachments(group_id: [u8; 16]) -> Result<Vec<StoredFileAttachment>, String> {
+    let connection = open_local_database()?;
+    list_file_attachments_in(&connection, group_id)
+}
+
+pub fn delete_file_attachment(transfer_id: [u8; 16]) -> Result<bool, String> {
+    let connection = open_local_database()?;
+    connection
+        .execute(
+            "DELETE FROM local_file_attachments WHERE transfer_id = ?1",
+            params![transfer_id.as_slice()],
+        )
+        .map(|deleted| deleted == 1)
+        .map_err(|error| format!("could not remove local file attachment: {error}"))
+}
+
+fn save_file_attachment_in(
+    connection: &mut Connection,
+    group_id: [u8; 16],
+    author_device: [u8; 32],
+    ciphertext_hash: [u8; 32],
+    offer: &FileOffer,
+) -> Result<(), String> {
+    let encoded_offer = offer.encode()?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("could not begin file attachment save: {error}"))?;
+    let group_state: Option<i64> = transaction
+        .query_row(
+            "SELECT quarantined FROM local_mls_groups WHERE group_id = ?1",
+            params![group_id.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("could not validate attachment group: {error}"))?;
+    match group_state {
+        Some(0) => {}
+        Some(_) => return Err("cannot attach a file to a quarantined group".to_owned()),
+        None => return Err("cannot attach a file to an unknown local group".to_owned()),
+    }
+    let prior: Option<StoredPriorFileAttachment> = transaction
+        .query_row(
+            "SELECT group_id, author_device, ciphertext_hash, offer FROM local_file_attachments
+             WHERE transfer_id = ?1",
+            params![offer.transfer_id.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|error| format!("could not check duplicate attachment: {error}"))?;
+    if let Some((prior_group, prior_author, prior_hash, prior_offer)) = prior {
+        if prior_group == group_id
+            && prior_author == author_device
+            && prior_hash == ciphertext_hash
+            && prior_offer == encoded_offer
+        {
+            return Ok(());
+        }
+        return Err("file transfer ID is already bound to another attachment".to_owned());
+    }
+    transaction
+        .execute(
+            "INSERT INTO local_file_attachments
+                 (transfer_id, group_id, author_device, ciphertext_hash, offer, created_at_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                offer.transfer_id.as_slice(),
+                group_id.as_slice(),
+                author_device.as_slice(),
+                ciphertext_hash.as_slice(),
+                encoded_offer,
+                unix_time_now()?
+            ],
+        )
+        .map_err(|error| format!("could not save encrypted file attachment: {error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("could not commit file attachment: {error}"))
+}
+
+fn list_file_attachments_in(
+    connection: &Connection,
+    group_id: [u8; 16],
+) -> Result<Vec<StoredFileAttachment>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT author_device, ciphertext_hash, offer, created_at_unix
+             FROM local_file_attachments WHERE group_id = ?1 ORDER BY created_at_unix, transfer_id",
+        )
+        .map_err(|error| format!("could not prepare local attachment list: {error}"))?;
+    let rows = statement
+        .query_map(params![group_id.as_slice()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|error| format!("could not query local attachments: {error}"))?;
+    let mut attachments = Vec::new();
+    for row in rows {
+        let (author, hash, encoded_offer, created_at_unix) =
+            row.map_err(|error| format!("could not read local attachment: {error}"))?;
+        attachments.push(StoredFileAttachment {
+            group_id,
+            author_device: author
+                .try_into()
+                .map_err(|_| "stored attachment author key has invalid length".to_owned())?,
+            ciphertext_hash: hash
+                .try_into()
+                .map_err(|_| "stored attachment digest has invalid length".to_owned())?,
+            created_at_unix,
+            offer: FileOffer::decode(&encoded_offer)?,
+        });
+    }
+    Ok(attachments)
 }
 
 /// Saves a delivered direct-LAN message in the per-device SQLCipher database.
@@ -5222,6 +5369,25 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
             )
             .map_err(|error| format!("could not add local verified peer storage: {error}"))?;
     }
+    if version < 21 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE local_file_attachments (
+                     transfer_id BLOB PRIMARY KEY NOT NULL CHECK (length(transfer_id) = 16),
+                     group_id BLOB NOT NULL CHECK (length(group_id) = 16),
+                     author_device BLOB NOT NULL CHECK (length(author_device) = 32),
+                     ciphertext_hash BLOB NOT NULL CHECK (length(ciphertext_hash) = 32),
+                     offer BLOB NOT NULL CHECK (length(offer) BETWEEN 69 AND 323),
+                     created_at_unix INTEGER NOT NULL CHECK (created_at_unix > 0)
+                 );
+                 CREATE INDEX local_file_attachments_by_group
+                     ON local_file_attachments (group_id, created_at_unix, transfer_id);
+                 PRAGMA user_version = 21;",
+            )
+            .map_err(|error| {
+                format!("could not create encrypted file attachment storage: {error}")
+            })?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -5279,6 +5445,7 @@ fn restrict_directory_permissions(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_transfer::{FILE_CHUNK_PLAINTEXT_BYTES, FileTransferSecrets};
     use crate::identity::BINDING_VERSION;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -5369,7 +5536,11 @@ mod tests {
         set_peer_key_verified_in(&connection, verified_key, false).unwrap();
         assert!(!peer_key_is_verified_in(&connection, verified_key).unwrap());
         connection
-            .execute_batch("DROP TABLE local_verified_peers; PRAGMA user_version = 19;")
+            .execute_batch(
+                "DROP TABLE local_verified_peers;
+                 DROP TABLE local_file_attachments;
+                 PRAGMA user_version = 19;",
+            )
             .expect("test should restore the previous schema version");
         drop(connection);
         connection = open_database(&path, &[0x76; 32])
@@ -7204,5 +7375,74 @@ mod tests {
         );
         drop(reopened);
         fs::remove_dir_all(directory).expect("temporary relay database should be removed");
+    }
+
+    #[test]
+    fn file_attachment_manifest_and_key_persist_only_in_encrypted_profile() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-file-attachments-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary attachment directory should exist");
+        let path = directory.join("profile.sqlite3");
+        let key = [0x6b; PROFILE_DB_KEY_LEN];
+        let group_id = [0x21; 16];
+        let author = [0x42; 32];
+        let digest = [0x63; 32];
+        let secrets = FileTransferSecrets::from_parts([0x84; 16], [0x95; 32]);
+        let offer = FileOffer::from_secrets(
+            &secrets,
+            FILE_CHUNK_PLAINTEXT_BYTES as u64 + 3,
+            "notes.pdf".to_owned(),
+        )
+        .expect("file offer should validate");
+
+        let mut connection = open_database(&path, &key).expect("encrypted profile should migrate");
+        connection
+            .execute(
+                "INSERT INTO local_mls_groups
+                     (group_id, ciphersuite, designated_committer_device, epoch)
+                 VALUES (?1, 1, ?2, 0)",
+                params![group_id.as_slice(), author.as_slice()],
+            )
+            .expect("test group should be indexed");
+        save_file_attachment_in(&mut connection, group_id, author, digest, &offer)
+            .expect("attachment manifest should save");
+        save_file_attachment_in(&mut connection, group_id, author, digest, &offer)
+            .expect("identical retries should be idempotent");
+        assert!(
+            save_file_attachment_in(&mut connection, group_id, author, [0x64; 32], &offer)
+                .expect_err("a transfer ID cannot be rebound to a different digest")
+                .contains("already bound")
+        );
+        let listed = list_file_attachments_in(&connection, group_id)
+            .expect("attachment should be listed from the encrypted profile");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].group_id, group_id);
+        assert_eq!(listed[0].author_device, author);
+        assert_eq!(listed[0].ciphertext_hash, digest);
+        assert_eq!(listed[0].offer.filename, "notes.pdf");
+        assert_eq!(listed[0].offer.content_key, [0x95; 32]);
+        drop(listed);
+        drop(connection);
+
+        let reopened = open_database(&path, &key).expect("encrypted profile should reopen");
+        let persisted = list_file_attachments_in(&reopened, group_id)
+            .expect("manifest and key should survive reopening");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].offer.transfer_id, [0x84; 16]);
+        assert_eq!(persisted[0].offer.content_key, [0x95; 32]);
+        assert!(
+            list_file_attachments_in(&reopened, [0x22; 16])
+                .expect("other groups should have independent manifests")
+                .is_empty()
+        );
+        drop(persisted);
+        drop(reopened);
+        fs::remove_dir_all(directory).expect("temporary attachment directory should be removed");
     }
 }
