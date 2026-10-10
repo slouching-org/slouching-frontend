@@ -1840,6 +1840,8 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
                     ),
                     if group.quarantined {
                         l.label("EM QUARENTENA", 9.0, GOLD)
+                    } else if !group.active {
+                        l.label("REMOVIDO / INATIVO NESTE DISPOSITIVO", 9.0, RED)
                     } else {
                         l.label(
                             if group.purpose == peer::MlsGroupPurpose::Call {
@@ -1879,6 +1881,11 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
     } else {
         local_group_rows
     };
+    let selected_group_active = state
+        .mls_groups
+        .iter()
+        .find(|group| Some(group.group_id.as_slice()) == state.mls_history_group.as_deref())
+        .is_some_and(|group| group.active && !group.quarantined);
     let recipient_rows = state
         .mls_commit_recipients
         .iter()
@@ -1915,6 +1922,92 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
         column(recipient_rows).spacing(l.px(3.0))
     ]
     .spacing(l.px(4.0));
+    let local_device = match state.identity_status {
+        crate::IdentityStatus::Ready(device) => Some(device),
+        _ => None,
+    };
+    let can_remove_members = local_device.is_some_and(|device| {
+        state
+            .mls_groups
+            .iter()
+            .find(|group| Some(group.group_id.as_slice()) == state.mls_history_group.as_deref())
+            .is_some_and(|group| group.designated_committer_device == device)
+    }) && state.mls_quarantine_reason.is_none()
+        && selected_group_active;
+    let member_rows = state
+        .mls_member_devices
+        .iter()
+        .map(|device| -> Element<'_, Message> {
+            let encoded = crate::hex_encode_bytes(device);
+            let is_local = local_device == Some(*device);
+            let confirming = state.mls_remove_confirmation == Some(*device);
+            let action: Element<'_, Message> = if confirming {
+                row![
+                    button(l.label("Confirmar", 9.0, NIGHT))
+                        .on_press(Message::ConfirmMlsMemberRemoval)
+                        .padding([l.px(3.0), l.px(6.0)])
+                        .style(|_, status| button_style(status, true, false)),
+                    button(l.label("Cancelar", 9.0, PAPER))
+                        .on_press(Message::CancelMlsMemberRemoval)
+                        .padding([l.px(3.0), l.px(6.0)])
+                        .style(|_, status| button_style(status, false, false)),
+                ]
+                .spacing(l.px(3.0))
+                .into()
+            } else if can_remove_members && !is_local {
+                button(l.label("Remover", 9.0, PAPER))
+                    .on_press(Message::RequestMlsMemberRemoval(*device))
+                    .padding([l.px(3.0), l.px(6.0)])
+                    .style(|_, status| button_style(status, false, false))
+                    .into()
+            } else {
+                space().width(l.px(100.0)).into()
+            };
+            row![
+                button(l.label(
+                    format!(
+                        "{}…{}",
+                        &encoded[..12],
+                        if is_local { " · este dispositivo" } else { "" }
+                    ),
+                    9.0,
+                    PAPER
+                ))
+                .on_press(Message::CopyMlsValue(encoded))
+                .padding([l.px(2.0), l.px(4.0)])
+                .style(|_, status| button_style(status, false, false)),
+                space().width(Fill),
+                action,
+            ]
+            .align_y(iced::Center)
+            .spacing(l.px(4.0))
+            .into()
+        })
+        .collect::<Vec<_>>();
+    let member_rows = if member_rows.is_empty() {
+        vec![
+            l.label("Selecione um grupo para ver os dispositivos.", 9.0, MUTED)
+                .into(),
+        ]
+    } else {
+        member_rows
+    };
+    let member_note: Element<'_, Message> = if can_remove_members {
+        l.label(
+            "Remover cria um Commit MLS e revoga o acesso após os membros aplicarem a nova época.",
+            8.0,
+            MUTED,
+        )
+        .into()
+    } else {
+        space().height(l.px(0.0)).into()
+    };
+    let member_management = column![
+        l.label("MEMBROS · CHAVES DE DISPOSITIVO", 9.0, GOLD),
+        scrollable(column(member_rows).spacing(l.px(2.0))).height(l.px(66.0)),
+        member_note,
+    ]
+    .spacing(l.px(3.0));
     let inviter = column![
         l.title("1 · Criar e convidar", 21.0),
         l.label("O criador do grupo é o committer designado.", 11.0, MUTED),
@@ -1946,6 +2039,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
         ]
         .align_y(iced::Center),
         column(local_groups).spacing(l.px(4.0)),
+        member_management,
         rule(LINE, 1.0),
         l.label("PROPOSTA DE UPDATE RECEBIDA DO MEMBRO", 10.0, GOLD),
         l.input(
@@ -1957,7 +2051,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             "check",
             "Autenticar e guardar proposta",
             Some(Message::ApplyMlsUpdateProposal),
-            state.mls_quarantine_reason.is_none()
+            state.mls_quarantine_reason.is_none() && selected_group_active
         ),
         rule(LINE, 1.0),
         l.label("KEYPACKAGE RECEBIDO DO CONVIDADO", 10.0, GOLD),
@@ -1970,7 +2064,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             "users",
             "Validar e admitir membro",
             Some(Message::AdmitMlsMember),
-            state.mls_quarantine_reason.is_none()
+            state.mls_quarantine_reason.is_none() && selected_group_active
         ),
         l.label("COMMIT PÚBLICO · DISTRIBUA AOS MEMBROS ATUAIS", 10.0, GOLD),
         l.input(
@@ -1988,7 +2082,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             "arrow",
             "Enviar Commits pendentes ao membro conectado",
             Some(Message::DistributeMlsCommit),
-            state.mls_quarantine_reason.is_none()
+            state.mls_quarantine_reason.is_none() && selected_group_active
         ),
         l.control(
             "users",
@@ -1998,7 +2092,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 "Distribuir a todos os peers salvos"
             },
             Some(Message::DistributeMlsCommitsToAll),
-            state.mls_quarantine_reason.is_none()
+            state.mls_quarantine_reason.is_none() && selected_group_active
                 && !state.mls_fanout_running
                 && !state.mls_event_fanout_running
                 && state.peer_listener_handle.is_none()
@@ -2016,7 +2110,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 "Distribuir mensagens MLS aos peers salvos"
             },
             Some(Message::DistributeMlsEventsToAll),
-            state.mls_quarantine_reason.is_none()
+            state.mls_quarantine_reason.is_none() && selected_group_active
                 && !state.mls_fanout_running
                 && !state.mls_event_fanout_running
                 && state.peer_listener_handle.is_none()
@@ -2063,7 +2157,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             "check",
             "Autenticar e aplicar Commit",
             Some(Message::ApplyMlsCommit),
-            state.mls_quarantine_reason.is_none()
+            state.mls_quarantine_reason.is_none() && selected_group_active
         )
     ]
     .spacing(l.px(9.0));
@@ -2104,7 +2198,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             "key",
             "Criar proposta para atualizar minha chave",
             Some(Message::CreateMlsUpdateProposal),
-            state.mls_quarantine_reason.is_none()
+            state.mls_quarantine_reason.is_none() && selected_group_active
         ),
         l.input(
             "Proposta assinada hexadecimal",
@@ -2115,7 +2209,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             "arrow",
             "Enviar proposta ao committer conectado",
             (!state.mls_update_proposal.is_empty()).then_some(Message::SendMlsUpdateProposal),
-            state.mls_quarantine_reason.is_none()
+            state.mls_quarantine_reason.is_none() && selected_group_active
         ),
         l.control(
             "key",
@@ -2232,14 +2326,16 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
     let can_send = matches!(state.peer_listen_status, crate::PeerListenStatus::Connected)
         && !state.mls_message_draft.trim().is_empty()
         && state.mls_history_group.is_some()
-        && state.mls_quarantine_reason.is_none();
+        && state.mls_quarantine_reason.is_none()
+        && selected_group_active;
     let send = button(l.label("Enviar MLS", 14.0, NIGHT))
         .on_press_maybe(can_send.then_some(Message::SendMlsApplication))
         .padding([l.px(13.0), l.px(20.0)])
         .style(|_, status| button_style(status, true, false));
     let can_attach = matches!(state.peer_listen_status, crate::PeerListenStatus::Connected)
         && state.mls_history_group.is_some()
-        && state.mls_quarantine_reason.is_none();
+        && state.mls_quarantine_reason.is_none()
+        && selected_group_active;
     let attach = button(l.label("Anexar arquivo", 12.0, PAPER))
         .on_press_maybe(can_attach.then_some(Message::PickMlsAttachment))
         .padding([l.px(10.0), l.px(14.0)])
@@ -2248,8 +2344,9 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
         .on_press_maybe(
             (matches!(state.peer_listen_status, crate::PeerListenStatus::Connected)
                 && state.mls_history_group.is_some()
-                && state.mls_quarantine_reason.is_none())
-            .then_some(Message::RetryQueuedMlsEvents),
+                && state.mls_quarantine_reason.is_none()
+                && selected_group_active)
+                .then_some(Message::RetryQueuedMlsEvents),
         )
         .padding([l.px(12.0), l.px(16.0)])
         .style(|_, status| button_style(status, false, false));
@@ -2260,8 +2357,9 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
     ))
     .on_press_maybe(
         (!state.mls_attachment_transfers.is_empty()
-            && matches!(state.peer_listen_status, crate::PeerListenStatus::Connected))
-        .then_some(Message::RetryMlsAttachmentBlob),
+            && matches!(state.peer_listen_status, crate::PeerListenStatus::Connected)
+            && selected_group_active)
+            .then_some(Message::RetryMlsAttachmentBlob),
     )
     .padding([l.px(12.0), l.px(16.0)])
     .style(|_, status| button_style(status, false, false));
@@ -2327,27 +2425,38 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 space().width(l.px(180.0)).into()
             } else {
                 row![
-                    button(
-                        row![l.icon("check", PAPER, 11.0), l.label("Aprovar", 9.0, PAPER)]
+                        button(
+                            row![l.icon("check", PAPER, 11.0), l.label("Aprovar", 9.0, PAPER)]
+                                .spacing(l.px(4.0))
+                                .align_y(iced::Center)
+                        )
+                        .on_press_maybe(
+                            (state.mls_quarantine_reason.is_none() && selected_group_active)
+                                .then_some(Message::SetMlsProposalApproval(
+                                    proposal.proposal_id,
+                                    true
+                                ),)
+                        )
+                        .padding([l.px(4.0), l.px(7.0)])
+                        .style(|_, status| button_style(status, false, false)),
+                        button(
+                            row![
+                                l.icon("close", PAPER, 11.0),
+                                l.label("Rejeitar", 9.0, PAPER)
+                            ]
                             .spacing(l.px(4.0))
                             .align_y(iced::Center)
-                    )
-                    .on_press_maybe(state.mls_quarantine_reason.is_none().then_some(
-                        Message::SetMlsProposalApproval(proposal.proposal_id, true),
-                    ))
-                    .padding([l.px(4.0), l.px(7.0)])
-                    .style(|_, status| button_style(status, false, false)),
-                    button(
-                        row![l.icon("close", PAPER, 11.0), l.label("Rejeitar", 9.0, PAPER)]
-                            .spacing(l.px(4.0))
-                            .align_y(iced::Center)
-                    )
-                    .on_press_maybe(state.mls_quarantine_reason.is_none().then_some(
-                        Message::SetMlsProposalApproval(proposal.proposal_id, false),
-                    ))
-                    .padding([l.px(4.0), l.px(7.0)])
-                    .style(|_, status| button_style(status, false, false)),
-                ]
+                        )
+                        .on_press_maybe(
+                            (state.mls_quarantine_reason.is_none() && selected_group_active)
+                                .then_some(Message::SetMlsProposalApproval(
+                                    proposal.proposal_id,
+                                    false
+                                ),)
+                        )
+                        .padding([l.px(4.0), l.px(7.0)])
+                        .style(|_, status| button_style(status, false, false)),
+                    ]
                 .spacing(l.px(5.0))
                 .into()
             };
@@ -2379,6 +2488,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 "Criar Commit com propostas aprovadas",
                 Some(Message::CommitMlsProposals),
                 state.mls_quarantine_reason.is_none()
+                    && selected_group_active
                     && state
                         .mls_pending_proposals
                         .iter()

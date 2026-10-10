@@ -375,6 +375,15 @@ self-updates only. Before Commit creation, the committer screen lists each
 authenticated proposal's epoch, member key prefix, proposal ID prefix, and
 review state. Other proposal types are not implemented.
 
+The selected group's member devices also appear in the committer panel by the
+prefix of their device keys. The designated committer can choose **Remover**
+and then confirm. Slouching writes the MLS removal Commit, next epoch, and
+predecessor-device delivery snapshot atomically. The removed device can
+authenticate and apply that Commit; OpenMLS then marks its local group inactive,
+excludes it from membership, and refuses further group messages. Its transcript
+stays visible while MLS sending and attachments are disabled for that group.
+The Commit stays in the normal per-device delivery queue until it is ACKed.
+
 For this flow, both members join the same group. The member opens it, clicks
 **Criar proposta para atualizar minha chave**, connects directly to the
 designated committer, and clicks **Enviar proposta ao committer conectado**.
@@ -520,6 +529,7 @@ SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-capture
 SLOUCHING_WINDOW_SIZE=960x640 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 01-familiar
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 06-chat --capture-peer-addresses
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 11-mls --capture-mls-review
+SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 11-mls --capture-mls-member-removal
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 11-mls --capture-mls-attachment
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 02-settings --settings-tab 1
 SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-captures --capture-screen 08-verify --capture-peer-verification
@@ -542,6 +552,11 @@ addresses for the direct-chat capture; they are fixtures, not live interfaces.
 default is a compact 1100 × 720 window.
 `--capture-mls-review` adds sample pending, approved, and rejected proposals to
 illustrate the review controls; they are fixtures, not live MLS state.
+`--capture-mls-member-removal` shows sample device keys and the explicit
+confirmation state for member removal; they are fixtures, not live group data.
+Refresh the MLS screenshots from a graphical Wayland or X11 session. This
+checkout environment has no display server, so this update could not produce a
+fresh rendered screenshot.
 `--capture-mls-attachment` adds a sample attachment card and connected state;
 they are fixtures, not a transferred file or live peer session.
 The audio-settings capture uses real device enumeration from the current

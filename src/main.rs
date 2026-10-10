@@ -325,6 +325,8 @@ struct Slouching {
     mls_history_group: Option<Vec<u8>>,
     mls_pending_commits: Vec<storage::StoredMlsCommit>,
     mls_pending_proposals: Vec<storage::StoredMlsProposal>,
+    mls_member_devices: Vec<[u8; 32]>,
+    mls_remove_confirmation: Option<[u8; 32]>,
     mls_pending_peer_key_package: Option<PendingPeerKeyPackage>,
     mls_pending_peer_welcome: Option<PendingPeerWelcome>,
     mls_commit_recipients: Vec<storage::MlsCommitRecipientStatus>,
@@ -529,6 +531,8 @@ impl Default for Slouching {
             mls_history_group: None,
             mls_pending_commits: Vec::new(),
             mls_pending_proposals: Vec::new(),
+            mls_member_devices: Vec::new(),
+            mls_remove_confirmation: None,
             mls_pending_peer_key_package: None,
             mls_pending_peer_welcome: None,
             mls_commit_recipients: Vec::new(),
@@ -772,6 +776,11 @@ enum Message {
         Result<Vec<storage::MlsCommitRecipientStatus>, String>,
     ),
     MlsPendingProposalsLoaded(Vec<u8>, Result<Vec<storage::StoredMlsProposal>, String>),
+    MlsMemberDevicesLoaded(Vec<u8>, Result<Vec<[u8; 32]>, String>),
+    RequestMlsMemberRemoval([u8; 32]),
+    CancelMlsMemberRemoval,
+    ConfirmMlsMemberRemoval,
+    MlsMemberRemoved(Result<storage::StoredMlsCommit, String>),
     MlsProposalApprovalSaved([u8; 16], bool, Result<(), String>),
     SendMlsKeyPackage,
     MlsKeyPackageCommandSent(u64, Result<(), String>),
@@ -3298,6 +3307,8 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.mls_group_id = value;
             state.mls_history.clear();
             state.mls_history_group = None;
+            state.mls_member_devices.clear();
+            state.mls_remove_confirmation = None;
             state.mls_commit.clear();
             state.mls_pending_commits.clear();
             if let Ok(group_id) = hex_decode_bytes(&state.mls_group_id)
@@ -3325,6 +3336,8 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.mls_commit.clear();
             state.mls_pending_commits.clear();
             state.mls_pending_proposals.clear();
+            state.mls_member_devices.clear();
+            state.mls_remove_confirmation = None;
             return load_mls_history(state, group_id);
         }
         Message::RefreshMlsGroups => return load_mls_groups(),
@@ -3334,6 +3347,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     && let Some(group) = groups
                         .iter()
                         .find(|group| group.purpose == peer::MlsGroupPurpose::Call)
+                        .filter(|group| group.active && !group.quarantined)
                 {
                     state.call_group_id = hex_encode_bytes(&group.group_id);
                     state.call_group_status =
@@ -3355,6 +3369,89 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     }
                 }
             }
+        }
+        Message::MlsMemberDevicesLoaded(group_id, result) => {
+            if state.mls_history_group.as_deref() == Some(group_id.as_slice()) {
+                match result {
+                    Ok(devices) => state.mls_member_devices = devices,
+                    Err(error) if error.contains("inactive on this device") => {
+                        state.mls_member_devices.clear();
+                        state.mls_status = "Este dispositivo foi removido do grupo. O histórico local foi preservado; mensagens e anexos MLS estão bloqueados.".to_owned();
+                    }
+                    Err(error) => {
+                        state.mls_member_devices.clear();
+                        state.mls_status =
+                            format!("Não foi possível carregar membros do grupo: {error}");
+                    }
+                }
+            }
+        }
+        Message::RequestMlsMemberRemoval(device) => {
+            if state.mls_quarantine_reason.is_some() {
+                state.mls_status = "Grupo em quarentena; remoção de membros está bloqueada.".into();
+                return Task::none();
+            }
+            let local_device = match state.identity_status {
+                IdentityStatus::Ready(key) => key,
+                _ => {
+                    state.mls_status = "Carregue a identidade deste dispositivo primeiro.".into();
+                    return Task::none();
+                }
+            };
+            let designated_committer = hex_decode_bytes(&state.mls_group_id)
+                .ok()
+                .and_then(|id| <[u8; 16]>::try_from(id.as_slice()).ok())
+                .and_then(|id| state.mls_groups.iter().find(|group| group.group_id == id))
+                .is_some_and(|group| {
+                    group.active
+                        && !group.quarantined
+                        && group.designated_committer_device == local_device
+                });
+            if !designated_committer
+                || device == local_device
+                || !state.mls_member_devices.contains(&device)
+            {
+                state.mls_status =
+                    "Esta remoção não é permitida para a identidade ou o grupo selecionado.".into();
+                return Task::none();
+            }
+            state.mls_remove_confirmation = Some(device);
+        }
+        Message::CancelMlsMemberRemoval => state.mls_remove_confirmation = None,
+        Message::ConfirmMlsMemberRemoval => {
+            let Some(device) = state.mls_remove_confirmation.take() else {
+                return Task::none();
+            };
+            let group_id = match hex_decode_bytes(&state.mls_group_id) {
+                Ok(id) if id.len() == 16 => id,
+                _ => {
+                    state.mls_status =
+                        "Selecione um grupo MLS válido antes de remover um membro.".into();
+                    return Task::none();
+                }
+            };
+            state.mls_status = "Criando Commit para remover o dispositivo do grupo…".into();
+            return Task::perform(
+                remove_mls_group_member_task(group_id, device),
+                Message::MlsMemberRemoved,
+            );
+        }
+        Message::MlsMemberRemoved(Ok(commit)) => {
+            state.mls_commit = hex_encode_bytes(&commit.commit);
+            state.mls_status = format!(
+                "Membro removido no epoch {}. Commit enfileirado para os dispositivos do epoch anterior.",
+                commit.epoch
+            );
+            let stop_call = stop_call_media_for_mls_group(
+                state,
+                &commit.group_id,
+                "a composição do grupo MLS mudou",
+            );
+            let groups = load_mls_groups();
+            return Task::batch([load_mls_history(state, commit.group_id), groups, stop_call]);
+        }
+        Message::MlsMemberRemoved(Err(error)) => {
+            state.mls_status = format!("Falha ao remover membro do grupo: {error}");
         }
         Message::MlsKeyPackageChanged(value) => state.mls_key_package = value,
         Message::MlsInviteKeyPackageChanged(value) => state.mls_invite_key_package = value,
@@ -5338,6 +5435,31 @@ fn boot() -> (Slouching, Task<Message>) {
             },
         ];
     }
+    if args.iter().any(|arg| arg == "--capture-mls-member-removal") {
+        state.screen = Screen::Mls;
+        let group_id: [u8; 16] = hex_decode_bytes("5f8d4d2a7c314e6a9b0f123456789abc")
+            .expect("capture group ID should be hexadecimal")
+            .try_into()
+            .expect("capture group ID should contain 16 bytes");
+        let local_device = [0x11; 32];
+        let target_device = [0x72; 32];
+        state.identity_status = IdentityStatus::Ready(local_device);
+        state.mls_group_id = hex_encode_bytes(&group_id);
+        state.mls_history_group = Some(group_id.to_vec());
+        state.mls_groups = vec![storage::StoredMlsGroup {
+            group_id,
+            epoch: 12,
+            active: true,
+            quarantined: false,
+            purpose: peer::MlsGroupPurpose::Conversation,
+            designated_committer_device: local_device,
+        }];
+        state.mls_member_devices = vec![local_device, target_device, [0x31; 32]];
+        state.mls_remove_confirmation = Some(target_device);
+        state.mls_status =
+            "Remover este dispositivo do grupo? O acesso termina quando a nova época chegar."
+                .to_owned();
+    }
     if args.iter().any(|arg| arg == "--capture-mls-attachment") {
         state.screen = Screen::Mls;
         state.mls_group_id = "5f8d4d2a7c314e6a9b0f123456789abc".to_owned();
@@ -6205,6 +6327,8 @@ fn load_mls_history(state: &mut Slouching, group_id: Vec<u8>) -> Task<Message> {
     let proposals_group_id = group_id.clone();
     let recipients_group_id = group_id.clone();
     let recipients_message_group_id = recipients_group_id.clone();
+    let members_group_id = group_id.clone();
+    let members_message_group_id = group_id.clone();
     Task::batch([
         Task::perform(load_mls_history_task(group_id.clone()), move |result| {
             Message::MlsHistoryLoaded(history_group_id, result)
@@ -6224,7 +6348,32 @@ fn load_mls_history(state: &mut Slouching, group_id: Vec<u8>) -> Task<Message> {
             load_pending_mls_proposals_task(proposals_group_id),
             move |result| Message::MlsPendingProposalsLoaded(group_id, result),
         ),
+        Task::perform(
+            load_mls_member_devices_task(members_group_id),
+            move |result| Message::MlsMemberDevicesLoaded(members_message_group_id, result),
+        ),
     ])
+}
+
+async fn load_mls_member_devices_task(group_id: Vec<u8>) -> Result<Vec<[u8; 32]>, String> {
+    tokio::task::spawn_blocking(move || {
+        let group_id: [u8; 16] = group_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| "MLS group ID must contain 16 bytes".to_owned())?;
+        storage::list_mls_group_member_devices(group_id)
+    })
+    .await
+    .map_err(|error| format!("MLS member-list task failed: {error}"))?
+}
+
+async fn remove_mls_group_member_task(
+    group_id: Vec<u8>,
+    target_device: [u8; 32],
+) -> Result<storage::StoredMlsCommit, String> {
+    tokio::task::spawn_blocking(move || storage::remove_mls_group_member(&group_id, target_device))
+        .await
+        .map_err(|error| format!("MLS member-removal task failed: {error}"))?
 }
 
 async fn load_mls_quarantine_task(group_id: Vec<u8>) -> Result<Option<String>, String> {

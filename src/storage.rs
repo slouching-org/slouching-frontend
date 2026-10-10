@@ -312,8 +312,10 @@ pub struct StoredMlsMessage {
 pub struct StoredMlsGroup {
     pub group_id: [u8; 16],
     pub epoch: u64,
+    pub active: bool,
     pub quarantined: bool,
     pub purpose: MlsGroupPurpose,
+    pub designated_committer_device: [u8; 32],
 }
 
 pub(crate) struct CallMediaMemberIndex {
@@ -656,8 +658,8 @@ pub fn list_mls_messages(group_id: &[u8], limit: usize) -> Result<Vec<StoredMlsM
 }
 
 pub fn list_mls_groups() -> Result<Vec<StoredMlsGroup>, String> {
-    let connection = open_local_database()?;
-    list_mls_groups_in(&connection)
+    let mut connection = open_local_database()?;
+    list_mls_groups_in(&mut connection)
 }
 
 /// Loads device keys from the active, non-quarantined MLS group after verifying
@@ -804,9 +806,9 @@ fn set_mls_proposal_approval_in(
     Ok(())
 }
 
-fn list_mls_groups_in(connection: &Connection) -> Result<Vec<StoredMlsGroup>, String> {
+fn list_mls_groups_in(connection: &mut Connection) -> Result<Vec<StoredMlsGroup>, String> {
     let mut statement = connection
-        .prepare("SELECT group_id, epoch, quarantined, purpose FROM local_mls_groups ORDER BY rowid DESC")
+        .prepare("SELECT group_id, epoch, quarantined, purpose, designated_committer_device, ciphersuite FROM local_mls_groups ORDER BY rowid DESC")
         .map_err(|error| format!("could not prepare local MLS group list: {error}"))?;
     let rows = statement
         .query_map([], |row| {
@@ -815,20 +817,48 @@ fn list_mls_groups_in(connection: &Connection) -> Result<Vec<StoredMlsGroup>, St
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, i64>(5)?,
             ))
         })
         .map_err(|error| format!("could not query local MLS groups: {error}"))?;
-    rows.map(|row| {
-        let (group_id, epoch, quarantined, purpose) =
-            row.map_err(|error| format!("could not read local MLS group: {error}"))?;
-        Ok(StoredMlsGroup {
-            group_id: fixed_bytes(group_id, "MLS group ID")?,
-            epoch: u64::try_from(epoch).map_err(|_| "MLS group has invalid epoch".to_owned())?,
-            quarantined: quarantined != 0,
-            purpose: MlsGroupPurpose::try_from(u8::try_from(purpose).unwrap_or(u8::MAX))?,
-        })
-    })
-    .collect()
+    let rows = rows
+        .map(|row| row.map_err(|error| format!("could not read local MLS group: {error}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    rows.into_iter()
+        .map(
+            |(group_id, epoch, quarantined, purpose, designated_committer_device, ciphersuite)| {
+                let group_id = fixed_bytes(group_id, "MLS group ID")?;
+                let epoch =
+                    u64::try_from(epoch).map_err(|_| "MLS group has invalid epoch".to_owned())?;
+                let purpose = MlsGroupPurpose::try_from(u8::try_from(purpose).unwrap_or(u8::MAX))?;
+                let designated_committer_device = fixed_bytes(
+                    designated_committer_device,
+                    "MLS designated committer device key",
+                )?;
+                let provider = LocalOpenMlsProvider::new(connection);
+                let group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&group_id))
+                    .map_err(|error| format!("could not verify local MLS group state: {error}"))?
+                    .ok_or_else(|| "local MLS group state is missing".to_owned())?;
+                if group.epoch().as_u64() != epoch
+                    || u16::try_from(ciphersuite).ok() != Some(group.ciphersuite() as u16)
+                {
+                    return Err(
+                        "local MLS group index does not match its authenticated state".to_owned(),
+                    );
+                }
+                Ok(StoredMlsGroup {
+                    group_id,
+                    epoch,
+                    active: group.is_active(),
+                    quarantined: quarantined != 0,
+                    purpose,
+                    designated_committer_device,
+                })
+            },
+        )
+        .collect()
 }
 
 pub fn load_mls_group_quarantine(group_id: &[u8]) -> Result<Option<String>, String> {
@@ -4106,6 +4136,187 @@ pub fn add_mls_group_member_from_peer(
     )
 }
 
+/// Removes one device from a group as its designated committer. The removal
+/// Commit is persisted atomically with the new epoch and a delivery snapshot
+/// that includes the removed device, so it can learn the authenticated removal.
+pub fn remove_mls_group_member(
+    group_id: &[u8],
+    target_device: [u8; 32],
+) -> Result<StoredMlsCommit, String> {
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let device_identity = signing_key_from_secret(secret)?;
+    let mut connection = open_local_database()?;
+    remove_mls_group_member_in(&mut connection, group_id, target_device, &device_identity)
+}
+
+fn remove_mls_group_member_in(
+    connection: &mut Connection,
+    group_id: &[u8],
+    target_device: [u8; 32],
+    device_identity: &SigningKey,
+) -> Result<StoredMlsCommit, String> {
+    if group_id.len() != 16 {
+        return Err("MLS group ID must contain 16 bytes".to_owned());
+    }
+    let group_id = GroupId::from_slice(group_id);
+    let device_public_key = device_identity.verifying_key().to_bytes();
+    let designated_committer: Vec<u8> = connection
+        .query_row(
+            "SELECT designated_committer_device FROM local_mls_groups WHERE group_id = ?1",
+            [group_id.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("could not load local MLS group policy: {error}"))?;
+    if designated_committer.as_slice() != device_public_key {
+        return Err("this device is not the designated MLS committer".to_owned());
+    }
+    let ciphersuite = {
+        let provider = LocalOpenMlsProvider::new(connection);
+        let group = MlsGroup::load(provider.storage(), &group_id)
+            .map_err(|error| format!("could not load MLS group: {error}"))?
+            .ok_or_else(|| "MLS group state is missing".to_owned())?;
+        if !group.is_active() {
+            return Err("MLS group is inactive on this device".to_owned());
+        }
+        group.ciphersuite()
+    };
+    let binding =
+        create_or_load_mls_signing_key_binding_in(connection, ciphersuite, device_identity)?;
+
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| format!("could not begin MLS member-removal transaction: {error}"))?;
+    let result = (|| {
+        ensure_mls_group_not_quarantined(connection, group_id.as_slice())?;
+        let predecessor_epoch: i64 = connection
+            .query_row(
+                "SELECT epoch FROM local_mls_groups WHERE group_id = ?1",
+                [group_id.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("could not load MLS group epoch: {error}"))?;
+        capture_mls_epoch_snapshot_in(connection, group_id.as_slice(), predecessor_epoch as u64)?;
+
+        let (stored, recipients) = {
+            let provider = LocalOpenMlsProvider::new(connection);
+            let mut group = MlsGroup::load(provider.storage(), &group_id)
+                .map_err(|error| format!("could not load MLS group: {error}"))?
+                .ok_or_else(|| "MLS group state is missing".to_owned())?;
+            if !group.is_active() || group.epoch().as_u64() != predecessor_epoch as u64 {
+                return Err("MLS group state changed during member removal".to_owned());
+            }
+            let signer = SignatureKeyPair::read(
+                provider.storage(),
+                &binding.mls_signing_public_key,
+                ciphersuite.signature_algorithm(),
+            )
+            .ok_or_else(|| "designated committer signing key is missing".to_owned())?;
+
+            let mut target_index = None;
+            let mut recipients = Vec::new();
+            let mut seen_devices = std::collections::HashSet::new();
+            for member in group.members() {
+                let member_binding =
+                    MlsSigningKeyBinding::from_bytes(member.credential.serialized_content())
+                        .ok_or_else(|| "MLS member has no device identity binding".to_owned())?;
+                if !member_binding.verifies_mls_credential(
+                    &member_binding.device_public_key,
+                    ciphersuite.signature_algorithm() as u16,
+                    member.signature_key.as_slice(),
+                ) {
+                    return Err("MLS member has an invalid device binding".to_owned());
+                }
+                if !seen_devices.insert(member_binding.device_public_key) {
+                    return Err("MLS group contains duplicate device identities".to_owned());
+                }
+                if member_binding.device_public_key == target_device {
+                    target_index = Some(member.index);
+                }
+                if member_binding.device_public_key != device_public_key {
+                    recipients.push(member_binding.device_public_key);
+                }
+            }
+            if target_device == device_public_key {
+                return Err("the designated committer cannot remove its own device".to_owned());
+            }
+            let target_index = target_index
+                .ok_or_else(|| "selected device is not a member of this MLS group".to_owned())?;
+            let (commit, _, _) = group
+                .remove_members(&provider, &signer, &[target_index])
+                .map_err(|error| format!("could not remove MLS group member: {error:?}"))?;
+            let commit_bytes = commit
+                .tls_serialize_detached()
+                .map_err(|error| format!("could not serialize MLS removal Commit: {error}"))?;
+            group
+                .merge_pending_commit(&provider)
+                .map_err(|error| format!("could not persist MLS removal Commit: {error:?}"))?;
+            let commit_hash = *blake3::hash(&commit_bytes).as_bytes();
+            let mut event_id = [0; 16];
+            event_id.copy_from_slice(&commit_hash[..16]);
+            (
+                StoredMlsCommit {
+                    event_id,
+                    group_id: group.group_id().to_vec(),
+                    predecessor_epoch: predecessor_epoch as u64,
+                    epoch: group.epoch().as_u64(),
+                    author_device: device_public_key,
+                    commit_hash,
+                    commit: commit_bytes,
+                },
+                recipients,
+            )
+        };
+        if stored.epoch != stored.predecessor_epoch.saturating_add(1) {
+            return Err("MLS removal Commit did not advance exactly one epoch".to_owned());
+        }
+        connection
+            .execute(
+                "INSERT INTO local_mls_commits
+                    (event_id, group_id, predecessor_epoch, epoch, author_device,
+                     commit_hash, commit_bytes, delivery_state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued')",
+                params![
+                    stored.event_id.as_slice(),
+                    stored.group_id,
+                    stored.predecessor_epoch as i64,
+                    stored.epoch as i64,
+                    stored.author_device.as_slice(),
+                    stored.commit_hash.as_slice(),
+                    stored.commit
+                ],
+            )
+            .map_err(|error| format!("could not persist MLS removal Commit outbox: {error}"))?;
+        for recipient in recipients {
+            connection
+                .execute(
+                    "INSERT INTO local_mls_commit_recipients
+                        (commit_event_id, device_public_key, delivery_state)
+                     VALUES (?1, ?2, 'queued')",
+                    params![stored.event_id.as_slice(), recipient.as_slice()],
+                )
+                .map_err(|error| format!("could not persist MLS removal recipient: {error}"))?;
+        }
+        let updated = connection
+            .execute(
+                "UPDATE local_mls_groups SET epoch = ?1 WHERE group_id = ?2 AND epoch = ?3",
+                params![
+                    stored.epoch as i64,
+                    group_id.as_slice(),
+                    stored.predecessor_epoch as i64
+                ],
+            )
+            .map_err(|error| format!("could not update MLS removal epoch: {error}"))?;
+        if updated != 1 {
+            return Err("MLS group epoch changed while removing a member".to_owned());
+        }
+        Ok(stored)
+    })();
+    finish_sql_transaction(connection, result, "MLS member removal")
+}
+
 #[cfg(test)]
 fn add_mls_group_member_in(
     connection: &mut Connection,
@@ -6395,7 +6606,7 @@ mod tests {
         assert_eq!(created.epoch, 0);
         assert_eq!(created.designated_committer_device, device_public_key);
         assert_eq!(created.group_id.len(), 16);
-        let listed = list_mls_groups_in(&connection)
+        let listed = list_mls_groups_in(&mut connection)
             .expect("local group picker should list persisted groups");
         assert_eq!(
             listed,
@@ -6406,8 +6617,10 @@ mod tests {
                     .try_into()
                     .expect("created group ID should be 16 bytes"),
                 epoch: 0,
+                active: true,
                 quarantined: false,
                 purpose: MlsGroupPurpose::Conversation,
+                designated_committer_device: device_public_key,
             }]
         );
 
@@ -6489,7 +6702,7 @@ mod tests {
         assert_eq!(same_epoch, epoch);
         assert_eq!(first_key.len(), 16);
         assert_eq!(first_key.as_slice(), second_key.as_slice());
-        let groups = list_mls_groups_in(&connection).expect("group purposes should persist");
+        let groups = list_mls_groups_in(&mut connection).expect("group purposes should persist");
         assert_eq!(groups[0].purpose, MlsGroupPurpose::Call);
         assert_eq!(groups[1].purpose, MlsGroupPurpose::Conversation);
 
@@ -6811,6 +7024,198 @@ mod tests {
         drop(member);
         drop(creator);
         fs::remove_dir_all(directory).expect("temporary proposal databases should be removed");
+    }
+
+    #[test]
+    fn designated_committer_removes_member_and_queues_authenticated_commit() {
+        use openmls::prelude::Ciphersuite;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "slouching-mls-removal-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("temporary database directory should be created");
+        let creator_identity = SigningKey::from_bytes(&[0x55; 32]);
+        let member_identity = SigningKey::from_bytes(&[0x56; 32]);
+        let creator_device = creator_identity.verifying_key().to_bytes();
+        let member_device = member_identity.verifying_key().to_bytes();
+        let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+        let mut creator = open_database(
+            &directory.join("creator.sqlite3"),
+            &[0x57; PROFILE_DB_KEY_LEN],
+        )
+        .expect("committer database should initialize");
+        let group = create_mls_group_in(&mut creator, ciphersuite, &creator_identity)
+            .expect("committer should create a group");
+        let mut member = open_database(
+            &directory.join("member.sqlite3"),
+            &[0x58; PROFILE_DB_KEY_LEN],
+        )
+        .expect("member database should initialize");
+        let package = create_mls_key_package_in(&mut member, ciphersuite, &member_identity)
+            .expect("member should create a bound KeyPackage");
+        let admission = add_mls_group_member_in(
+            &mut creator,
+            &group.group_id,
+            &package.public_bytes,
+            &creator_identity,
+        )
+        .expect("committer should admit the member");
+        join_mls_group_from_welcome_in(
+            &mut member,
+            &admission.welcome,
+            &admission.ratchet_tree,
+            &member_identity,
+            None,
+            None,
+            None,
+        )
+        .expect("member should join the group");
+        let group_id: [u8; 16] = group
+            .group_id
+            .as_slice()
+            .try_into()
+            .expect("group ID should be 16 bytes");
+
+        assert!(
+            remove_mls_group_member_in(
+                &mut creator,
+                &group.group_id,
+                creator_device,
+                &creator_identity,
+            )
+            .is_err(),
+            "the designated committer must not remove itself"
+        );
+        assert!(
+            remove_mls_group_member_in(
+                &mut creator,
+                &group.group_id,
+                [0x99; 32],
+                &creator_identity,
+            )
+            .is_err(),
+            "a non-member device must not be removable"
+        );
+        assert!(
+            remove_mls_group_member_in(
+                &mut member,
+                &group.group_id,
+                creator_device,
+                &member_identity,
+            )
+            .is_err(),
+            "a non-committer member must not create removal Commits"
+        );
+
+        creator
+            .execute_batch(
+                "CREATE TRIGGER force_mls_removal_outbox_failure
+                 BEFORE INSERT ON local_mls_commits
+                 BEGIN SELECT RAISE(ABORT, 'simulated removal outbox failure'); END;",
+            )
+            .expect("test should install a removal outbox failure");
+        assert!(
+            remove_mls_group_member_in(
+                &mut creator,
+                &group.group_id,
+                member_device,
+                &creator_identity,
+            )
+            .is_err(),
+            "failed outbox persistence must roll back member removal"
+        );
+        creator
+            .execute_batch("DROP TRIGGER force_mls_removal_outbox_failure;")
+            .expect("test should remove the simulated outbox failure");
+        let active_groups = list_mls_groups_in(&mut creator)
+            .expect("failed removal should leave the current group loadable");
+        assert!(active_groups[0].active);
+        assert_eq!(active_groups[0].epoch, 1);
+        let preserved_devices = list_mls_group_member_devices_in(&mut creator, &group_id)
+            .expect("failed removal should preserve membership");
+        assert_eq!(preserved_devices.len(), 2);
+        assert!(preserved_devices.contains(&creator_device));
+        assert!(preserved_devices.contains(&member_device));
+
+        let commit = remove_mls_group_member_in(
+            &mut creator,
+            &group.group_id,
+            member_device,
+            &creator_identity,
+        )
+        .expect("designated committer should create a removal Commit");
+        assert_eq!(commit.predecessor_epoch, 1);
+        assert_eq!(commit.epoch, 2);
+        assert_eq!(
+            list_mls_group_member_devices_in(&mut creator, &group_id)
+                .expect("remaining member devices should load"),
+            vec![creator_device]
+        );
+        let delivery_state: String = creator
+            .query_row(
+                "SELECT delivery_state FROM local_mls_commit_recipients
+                 WHERE commit_event_id = ?1 AND device_public_key = ?2",
+                params![commit.event_id.as_slice(), member_device.as_slice()],
+                |row| row.get(0),
+            )
+            .expect("removed member should remain in the Commit delivery snapshot");
+        assert_eq!(delivery_state, "queued");
+        assert_eq!(
+            process_inbound_mls_commit_in(
+                &mut member,
+                &group.group_id,
+                &commit.commit,
+                &member_identity,
+            )
+            .expect("removed member should authenticate the removal Commit"),
+            ProcessedMlsCommit::Applied { epoch: 2 }
+        );
+        {
+            let provider = LocalOpenMlsProvider::new(&mut member);
+            let removed_group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&group_id))
+                .expect("removed member's group state should load")
+                .expect("removed member's group state should persist");
+            assert!(
+                !removed_group.is_active(),
+                "OpenMLS must mark a removed member's group inactive"
+            );
+        }
+        assert!(
+            !list_mls_groups_in(&mut member)
+                .expect("local group list should preserve removed state")
+                .into_iter()
+                .find(|listed| listed.group_id == group_id)
+                .expect("removed group should remain visible for its local history")
+                .active
+        );
+        assert!(
+            create_mls_application_event_in(
+                &mut member,
+                &group.group_id,
+                b"removed device cannot send",
+                1,
+                &member_identity,
+            )
+            .is_err(),
+            "a removed device must not create group messages"
+        );
+        let member_epoch: i64 = creator
+            .query_row(
+                "SELECT epoch FROM local_mls_groups WHERE group_id = ?1",
+                [&group.group_id],
+                |row| row.get(0),
+            )
+            .expect("new group epoch should persist");
+        assert_eq!(member_epoch, 2);
+        drop(member);
+        drop(creator);
+        fs::remove_dir_all(directory)
+            .expect("temporary member-removal databases should be removed");
     }
 
     #[test]
@@ -7474,7 +7879,7 @@ mod tests {
                 .contains("quarantined")
         );
         drop(invitee);
-        let invitee = open_database(&invitee_path, &invitee_key)
+        let mut invitee = open_database(&invitee_path, &invitee_key)
             .expect("quarantined group database should reopen");
         let (persisted_reason, persisted_epoch): (Option<String>, i64) = invitee
             .query_row(
@@ -7487,7 +7892,7 @@ mod tests {
         assert!(persisted_reason.is_some());
         assert_eq!(persisted_epoch, 2);
         assert_eq!(
-            list_mls_groups_in(&invitee).expect("local group picker should reload quarantine"),
+            list_mls_groups_in(&mut invitee).expect("local group picker should reload quarantine"),
             vec![StoredMlsGroup {
                 group_id: group
                     .group_id
@@ -7495,8 +7900,10 @@ mod tests {
                     .try_into()
                     .expect("group ID should be 16 bytes"),
                 epoch: 2,
+                active: true,
                 quarantined: true,
                 purpose: MlsGroupPurpose::Conversation,
+                designated_committer_device: creator_identity.verifying_key().to_bytes(),
             }]
         );
 
