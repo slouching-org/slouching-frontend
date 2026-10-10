@@ -152,7 +152,7 @@ impl Screen {
 }
 
 type PendingPeerKeyPackage = (u64, [u8; 32], Vec<u8>, Vec<u8>);
-type PendingPeerWelcome = (u64, [u8; 32], Vec<u8>, Vec<u8>, Vec<u8>);
+type PendingPeerWelcome = (u64, [u8; 32], [u8; 16], Vec<u8>, Vec<u8>, Vec<u8>);
 
 #[derive(Debug, Clone)]
 struct MlsCommitFanoutReport {
@@ -235,7 +235,7 @@ struct Slouching {
     mls_sending_commits: std::collections::HashMap<u64, [u8; 16]>,
     mls_sending_proposals: std::collections::HashSet<u64>,
     mls_sending_key_packages: std::collections::HashSet<u64>,
-    mls_sending_welcomes: std::collections::HashSet<u64>,
+    mls_sending_welcomes: std::collections::HashMap<u64, [u8; 16]>,
     mls_next_request_id: u64,
 }
 
@@ -377,7 +377,7 @@ impl Default for Slouching {
             mls_sending_commits: std::collections::HashMap::new(),
             mls_sending_proposals: std::collections::HashSet::new(),
             mls_sending_key_packages: std::collections::HashSet::new(),
-            mls_sending_welcomes: std::collections::HashSet::new(),
+            mls_sending_welcomes: std::collections::HashMap::new(),
             mls_next_request_id: 1,
         }
     }
@@ -463,6 +463,13 @@ enum Message {
     MlsCommitsReadyToSend(Vec<u8>, Result<Vec<storage::StoredMlsCommit>, String>),
     MlsCommitPeerCommandSent(u64, Result<(), String>),
     MlsCommitDelivered(u64, Result<(), String>),
+    MlsWelcomesReadyToSend(
+        Vec<u8>,
+        [u8; 32],
+        Result<Vec<storage::StoredMlsWelcome>, String>,
+    ),
+    MlsWelcomePeerCommandSent(u64, Result<(), String>),
+    MlsWelcomeDelivered(u64, Result<(), String>),
     MlsCommitRequestedReady(
         Vec<u8>,
         u64,
@@ -908,7 +915,14 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         load_mls_commits_for_peer_task(group_id.clone(), peer_device),
                         move |result| Message::MlsCommitsReadyToSend(group_id, result),
                     );
-                    return Task::batch([route_task, commits_task]);
+                    let welcome_group_id = state.mls_history_group.clone().unwrap_or_default();
+                    let welcome_task = Task::perform(
+                        load_mls_welcomes_for_peer_task(welcome_group_id.clone(), peer_device),
+                        move |result| {
+                            Message::MlsWelcomesReadyToSend(welcome_group_id, peer_device, result)
+                        },
+                    );
+                    return Task::batch([route_task, commits_task, welcome_task]);
                 }
                 PeerListenEvent::Session(event) => match event {
                     peer::PeerEvent::Received { sequence, text } => {
@@ -1066,6 +1080,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                             state.mls_pending_peer_welcome = Some((
                                 sequence,
                                 pinned_peer,
+                                welcome.event_id,
                                 welcome.group_id,
                                 welcome.welcome,
                                 welcome.ratchet_tree,
@@ -1164,10 +1179,14 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         );
                     }
                     peer::PeerEvent::MlsWelcomeAcknowledged { request_id } => {
-                        state.mls_sending_welcomes.remove(&request_id);
-                        state.mls_status = format!(
-                            "Welcome {request_id} confirmado: o convidado ingressou e salvou o grupo localmente."
-                        );
+                        if let Some(event_id) = state.mls_sending_welcomes.get(&request_id).copied()
+                        {
+                            return Task::perform(
+                                mark_mls_welcome_delivered_task(event_id),
+                                move |result| Message::MlsWelcomeDelivered(request_id, result),
+                            );
+                        }
+                        state.mls_status = "ACK de Welcome desconhecido; sessão encerrada.".into();
                     }
                     peer::PeerEvent::MlsWelcomeRejected { request_id, reason } => {
                         state.mls_sending_welcomes.remove(&request_id);
@@ -1564,13 +1583,10 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         if key_package_ack_error.is_none()
                             && let Some(commands) = state.peer_session_commands.as_ref()
                         {
-                            let mut digest = blake3::Hasher::new();
-                            digest.update(&(admission.welcome.len() as u32).to_be_bytes());
-                            digest.update(&admission.welcome);
-                            digest.update(&(admission.ratchet_tree.len() as u32).to_be_bytes());
-                            digest.update(&admission.ratchet_tree);
-                            let mut event_id = [0; 16];
-                            event_id.copy_from_slice(&digest.finalize().as_bytes()[..16]);
+                            let event_id = storage::mls_welcome_event_id(
+                                &admission.welcome,
+                                &admission.ratchet_tree,
+                            );
                             let request_id = state.mls_next_request_id;
                             state.mls_next_request_id = state.mls_next_request_id.saturating_add(1);
                             let envelope = peer::MlsWelcomeEnvelope {
@@ -1585,7 +1601,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                                 welcome: envelope,
                             }) {
                                 Ok(()) => {
-                                    state.mls_sending_welcomes.insert(request_id);
+                                    state.mls_sending_welcomes.insert(request_id, event_id);
                                     welcome_delivery_request = Some(request_id);
                                 }
                                 Err(error) => {
@@ -1648,8 +1664,14 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 }
             };
             state.mls_status = "Validando Welcome com a chave privada local…".into();
-            if let Some((sequence, peer_device, group_id, expected_welcome, expected_tree)) =
-                state.mls_pending_peer_welcome.as_ref()
+            if let Some((
+                sequence,
+                peer_device,
+                event_id,
+                group_id,
+                expected_welcome,
+                expected_tree,
+            )) = state.mls_pending_peer_welcome.as_ref()
             {
                 if &welcome != expected_welcome
                     || &tree != expected_tree
@@ -1665,6 +1687,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     join_mls_group_from_peer_task(
                         welcome,
                         tree,
+                        *event_id,
                         *peer_device,
                         group_id
                             .as_slice()
@@ -2140,6 +2163,83 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         Message::MlsCommitPeerCommandSent(request_id, Err(error)) => {
             state.mls_sending_commits.remove(&request_id);
             state.mls_status = format!("Commit permanece pendente localmente: {error}");
+        }
+        Message::MlsWelcomesReadyToSend(group_id, peer_device, result) => {
+            return match result {
+                Ok(welcomes) => {
+                    let Some(commands) = state.peer_session_commands.clone() else {
+                        return Task::none();
+                    };
+                    let mut tasks = Vec::new();
+                    for stored in welcomes.into_iter().take(peer::MAX_PENDING_MESSAGES) {
+                        let request_id = state.mls_next_request_id;
+                        state.mls_next_request_id = state.mls_next_request_id.saturating_add(1);
+                        state
+                            .mls_sending_welcomes
+                            .insert(request_id, stored.event_id);
+                        let envelope = peer::MlsWelcomeEnvelope {
+                            event_id: stored.event_id,
+                            invitee_device: stored.invitee_device,
+                            group_id: stored.group_id,
+                            welcome: stored.welcome,
+                            ratchet_tree: stored.ratchet_tree,
+                        };
+                        let commands = commands.clone();
+                        tasks.push(Task::perform(
+                            async move {
+                                commands
+                                    .send(peer::PeerCommand::SendMlsWelcome {
+                                        request_id,
+                                        welcome: envelope,
+                                    })
+                                    .await
+                                    .map_err(|error| error.to_string())
+                            },
+                            move |result| Message::MlsWelcomePeerCommandSent(request_id, result),
+                        ));
+                    }
+                    if tasks.is_empty() {
+                        state.mls_status = format!(
+                            "Nenhum Welcome pendente para {}…",
+                            hex_encode_bytes(&peer_device[..4])
+                        );
+                        Task::none()
+                    } else {
+                        state.mls_status = format!(
+                            "Reenviando {} Welcome(s) persistido(s) ao peer pinado…",
+                            tasks.len()
+                        );
+                        Task::batch(tasks)
+                    }
+                }
+                Err(error) => {
+                    state.mls_status = format!(
+                        "Falha ao carregar Welcome pendente para o grupo {}: {error}",
+                        hex_encode_bytes(&group_id[..group_id.len().min(4)])
+                    );
+                    Task::none()
+                }
+            };
+        }
+        Message::MlsWelcomePeerCommandSent(request_id, Ok(())) => {
+            state.mls_status = format!(
+                "Welcome {request_id} enviado; aguardando ACK após persistência do grupo pelo convidado."
+            );
+        }
+        Message::MlsWelcomePeerCommandSent(request_id, Err(error)) => {
+            state.mls_sending_welcomes.remove(&request_id);
+            state.mls_status = format!("Welcome permanece na fila local para retry: {error}");
+        }
+        Message::MlsWelcomeDelivered(request_id, Ok(())) => {
+            state.mls_sending_welcomes.remove(&request_id);
+            state.mls_status =
+                format!("Welcome {request_id} confirmado e marcado como entregue no outbox local.");
+        }
+        Message::MlsWelcomeDelivered(request_id, Err(error)) => {
+            state.mls_sending_welcomes.remove(&request_id);
+            state.mls_status = format!(
+                "Peer confirmou Welcome {request_id}, mas o ACK local não persistiu: {error}; o retry é idempotente."
+            );
         }
         Message::MlsCommitRequestedReady(_group_id, predecessor_epoch, result) => match result {
             Ok(Some(stored)) => {
@@ -2982,11 +3082,13 @@ async fn join_mls_group_task(
 async fn join_mls_group_from_peer_task(
     welcome: Vec<u8>,
     tree: Vec<u8>,
+    event_id: [u8; 16],
     expected_committer_device: [u8; 32],
     expected_group_id: [u8; 16],
 ) -> Result<storage::JoinedMlsGroup, String> {
     tokio::task::spawn_blocking(move || {
-        storage::join_mls_group_from_pinned_peer(
+        storage::join_mls_group_from_pinned_peer_event(
+            event_id,
             &welcome,
             &tree,
             expected_committer_device,
@@ -3073,6 +3175,23 @@ async fn load_mls_commit_recipient_status_task(
     tokio::task::spawn_blocking(move || storage::list_mls_commit_recipient_status(&group_id, 200))
         .await
         .map_err(|error| format!("MLS Commit recipient status task failed: {error}"))?
+}
+
+async fn load_mls_welcomes_for_peer_task(
+    group_id: Vec<u8>,
+    peer_device: [u8; 32],
+) -> Result<Vec<storage::StoredMlsWelcome>, String> {
+    tokio::task::spawn_blocking(move || {
+        storage::list_queued_mls_welcomes_for_peer(&group_id, peer_device)
+    })
+    .await
+    .map_err(|error| format!("MLS Welcome outbox task failed: {error}"))?
+}
+
+async fn mark_mls_welcome_delivered_task(event_id: [u8; 16]) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || storage::mark_mls_welcome_delivered(event_id))
+        .await
+        .map_err(|error| format!("MLS Welcome ACK persistence task failed: {error}"))?
 }
 
 async fn load_mls_commits_for_peer_task(

@@ -92,8 +92,13 @@ group on one device and share its ID. The invitee can send its public KeyPackage
 over the active pinned session, or copy it through a trusted channel. The
 committer reviews and admits the package; the receiver checks that its device
 key matches the pinned peer before saving the Commit. After admission, the committer sends the Welcome and ratchet tree through the
-same pinned session. The invitee validates them and stores the group before
-ACK; copy/paste fields remain available if delivery is unknown. After both devices join, open
+same pinned session. The committer saves the exact Welcome bundle in its
+encrypted outbox with the membership Commit. The invitee validates it and
+stores the group before ACK; the same content-bound event is recorded in that
+transaction, so a retry after a lost ACK safely returns the existing group.
+After an unknown delivery or app restart, reconnect to the pinned invitee to
+retry the queued bundle. Copy/paste fields remain available if direct delivery
+is unavailable. After both devices join, open
 **Texto direto · LAN** and connect them using the usual
 pinned-key and LAN-address flow. In **Grupo MLS**, select the same group ID on
 both devices; MLS messages are encrypted and sent over that active direct

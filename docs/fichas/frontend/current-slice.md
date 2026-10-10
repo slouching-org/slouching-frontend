@@ -6,10 +6,14 @@ sessions. Successful outbound connections save the pinned device key and
 last-seen socket address in the encrypted local route book. The MLS screen can
 use these saved routes for sequential multi-member Commit fan-out. MLS group setup can send a device-bound KeyPackage over the active
 pinned session; the committer reviews and admits it after matching the package
-identity to the transport peer. After admission, the committer sends Welcome
-and ratchet tree over the pinned session. The invitee validates the target
-device, group, local KeyPackage and pinned committer, saves the joined group,
-then ACKs. Copy/paste fields remain available when delivery is unknown. For an already joined group, MLS application
+identity to the transport peer. Admission stores the exact Welcome and ratchet
+tree in the encrypted outbox with the membership Commit. The committer sends
+the bundle over the pinned session and marks it delivered after ACK. The
+invitee validates the target device, group, local KeyPackage and pinned
+committer, saves the joined group and content-bound Welcome receipt atomically,
+then ACKs. Reconnecting retries queued Welcomes, and a duplicate after a lost
+ACK returns the already joined group. Copy/paste remains available when direct
+delivery is unavailable. For an already joined group, MLS application
 messages are encrypted with OpenMLS and sent over the active direct session.
 The receiver validates the sender binding and event metadata, advances the
 ratchet, stores ciphertext and the local transcript in SQLCipher, then ACKs.

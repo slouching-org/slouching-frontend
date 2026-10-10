@@ -25,7 +25,7 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 13;
+const PROFILE_SCHEMA_VERSION: u32 = 14;
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 type StoredEventEnvelope = (
@@ -544,6 +544,120 @@ pub struct AddedMlsMember {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredMlsWelcome {
+    pub event_id: [u8; 16],
+    pub group_id: Vec<u8>,
+    pub commit_event_id: [u8; 16],
+    pub invitee_device: [u8; 32],
+    pub welcome: Vec<u8>,
+    pub ratchet_tree: Vec<u8>,
+}
+
+pub fn mls_welcome_event_id(welcome: &[u8], ratchet_tree: &[u8]) -> [u8; 16] {
+    let mut digest = blake3::Hasher::new();
+    digest.update(&(welcome.len() as u32).to_be_bytes());
+    digest.update(welcome);
+    digest.update(&(ratchet_tree.len() as u32).to_be_bytes());
+    digest.update(ratchet_tree);
+    let mut event_id = [0; 16];
+    event_id.copy_from_slice(&digest.finalize().as_bytes()[..16]);
+    event_id
+}
+
+pub fn list_queued_mls_welcomes_for_peer(
+    group_id: &[u8],
+    invitee_device: [u8; 32],
+) -> Result<Vec<StoredMlsWelcome>, String> {
+    if group_id.len() != 16 {
+        return Err("MLS group ID must be 16 bytes".to_owned());
+    }
+    let connection = open_local_database()?;
+    list_queued_mls_welcomes_for_peer_in(&connection, group_id, invitee_device)
+}
+
+fn list_queued_mls_welcomes_for_peer_in(
+    connection: &Connection,
+    group_id: &[u8],
+    invitee_device: [u8; 32],
+) -> Result<Vec<StoredMlsWelcome>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT event_id, group_id, commit_event_id, invitee_device, welcome_bytes, ratchet_tree
+             FROM local_mls_welcome_outbox
+             WHERE group_id = ?1 AND invitee_device = ?2 AND delivery_state = 'queued'
+             ORDER BY rowid",
+        )
+        .map_err(|error| format!("could not prepare MLS Welcome outbox query: {error}"))?;
+    let rows = statement
+        .query_map(params![group_id, invitee_device.as_slice()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+            ))
+        })
+        .map_err(|error| format!("could not query MLS Welcome outbox: {error}"))?;
+    rows.map(|row| {
+        let (event_id, stored_group, commit_event_id, stored_invitee, welcome, ratchet_tree) =
+            row.map_err(|error| format!("could not read MLS Welcome outbox: {error}"))?;
+        let event_id = fixed_bytes(event_id, "MLS Welcome event ID")?;
+        if event_id != mls_welcome_event_id(&welcome, &ratchet_tree) {
+            return Err("saved MLS Welcome bundle failed its digest check".to_owned());
+        }
+        Ok(StoredMlsWelcome {
+            event_id,
+            group_id: fixed_bytes::<16>(stored_group, "MLS Welcome group ID")?.to_vec(),
+            commit_event_id: fixed_bytes(commit_event_id, "MLS Welcome Commit ID")?,
+            invitee_device: fixed_bytes(stored_invitee, "MLS Welcome invitee")?,
+            welcome,
+            ratchet_tree,
+        })
+    })
+    .collect()
+}
+
+pub fn mark_mls_welcome_delivered(event_id: [u8; 16]) -> Result<(), String> {
+    let connection = open_local_database()?;
+    mark_mls_welcome_delivered_in(&connection, event_id)
+}
+
+fn mark_mls_welcome_delivered_in(
+    connection: &Connection,
+    event_id: [u8; 16],
+) -> Result<(), String> {
+    let delivered_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock is invalid: {error}"))?
+        .as_secs() as i64;
+    let updated = connection
+        .execute(
+            "UPDATE local_mls_welcome_outbox SET delivery_state = 'delivered', delivered_at = ?1
+             WHERE event_id = ?2 AND delivery_state = 'queued'",
+            params![delivered_at, event_id.as_slice()],
+        )
+        .map_err(|error| format!("could not record MLS Welcome ACK: {error}"))?;
+    if updated == 1 {
+        return Ok(());
+    }
+    let existing: Option<String> = connection
+        .query_row(
+            "SELECT delivery_state FROM local_mls_welcome_outbox WHERE event_id = ?1",
+            [event_id.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("could not check MLS Welcome ACK: {error}"))?;
+    if existing.as_deref() == Some("delivered") {
+        Ok(())
+    } else {
+        Err("ACK does not match a queued MLS Welcome".to_owned())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredMlsCommit {
     pub event_id: [u8; 16],
     pub group_id: Vec<u8>,
@@ -575,6 +689,7 @@ pub enum ProcessedMlsProposal {
 }
 
 type StoredMlsCommitRow = (Vec<u8>, Vec<u8>, i64, i64, Vec<u8>, Vec<u8>, Vec<u8>);
+type StoredMlsWelcomeReceiptRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64);
 
 #[derive(Serialize, serde::Deserialize)]
 struct MlsEpochSnapshot {
@@ -2711,6 +2826,23 @@ fn add_mls_group_member_with_peer_in(
                 .map_err(|error| {
                     format!("could not persist MLS Commit in the local outbox: {error}")
                 })?;
+            let welcome_event_id = mls_welcome_event_id(&added.welcome, &added.ratchet_tree);
+            connection
+                .execute(
+                    "INSERT INTO local_mls_welcome_outbox
+                        (event_id, group_id, commit_event_id, invitee_device,
+                         welcome_bytes, ratchet_tree, delivery_state)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued')",
+                    params![
+                        welcome_event_id.as_slice(),
+                        added.group_id.as_slice(),
+                        added.commit_event_id.as_slice(),
+                        added.invited_device.as_slice(),
+                        added.welcome,
+                        added.ratchet_tree
+                    ],
+                )
+                .map_err(|error| format!("could not persist MLS Welcome outbox: {error}"))?;
             for existing_device in existing_devices {
                 connection
                     .execute(
@@ -2920,6 +3052,7 @@ pub fn join_mls_group_from_welcome(
         &device_identity,
         None,
         None,
+        None,
     )
 }
 
@@ -2942,6 +3075,31 @@ pub fn join_mls_group_from_pinned_peer(
         &device_identity,
         Some(expected_committer_device),
         Some(expected_group_id),
+        None,
+    )
+}
+
+pub fn join_mls_group_from_pinned_peer_event(
+    event_id: [u8; 16],
+    serialized_welcome: &[u8],
+    serialized_ratchet_tree: &[u8],
+    expected_committer_device: [u8; 32],
+    expected_group_id: [u8; 16],
+) -> Result<JoinedMlsGroup, String> {
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let device_identity = signing_key_from_secret(secret)?;
+    let mut connection = open_local_database()?;
+    join_mls_group_from_welcome_in(
+        &mut connection,
+        serialized_welcome,
+        serialized_ratchet_tree,
+        &device_identity,
+        Some(expected_committer_device),
+        Some(expected_group_id),
+        Some(event_id),
     )
 }
 
@@ -2952,6 +3110,7 @@ fn join_mls_group_from_welcome_in(
     device_identity: &SigningKey,
     expected_committer_device: Option<[u8; 32]>,
     expected_group_id: Option<[u8; 16]>,
+    expected_event_id: Option<[u8; 16]>,
 ) -> Result<JoinedMlsGroup, String> {
     use openmls::prelude::tls_codec::Deserialize as TlsCodecDeserialize;
 
@@ -2959,6 +3118,46 @@ fn join_mls_group_from_welcome_in(
         .execute_batch("BEGIN IMMEDIATE")
         .map_err(|error| format!("could not begin MLS Welcome transaction: {error}"))?;
     let result = (|| {
+        if let Some(event_id) = expected_event_id {
+            if event_id != mls_welcome_event_id(serialized_welcome, serialized_ratchet_tree) {
+                return Err("Welcome event ID does not match its payload".to_owned());
+            }
+            let receipt: Option<StoredMlsWelcomeReceiptRow> = connection
+                .query_row(
+                    "SELECT group_id, committer_device, invitee_device, epoch
+                     FROM local_mls_welcome_receipts WHERE event_id = ?1",
+                    [event_id.as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(|error| format!("could not query MLS Welcome receipt: {error}"))?;
+            if let Some((group_id, committer, invitee, epoch)) = receipt {
+                let local_device = device_identity.verifying_key().to_bytes();
+                let group_id = fixed_bytes::<16>(group_id, "MLS Welcome receipt group")?;
+                let committer = fixed_bytes::<32>(committer, "MLS Welcome receipt committer")?;
+                let invitee = fixed_bytes::<32>(invitee, "MLS Welcome receipt invitee")?;
+                if Some(group_id) != expected_group_id
+                    || Some(committer) != expected_committer_device
+                    || invitee != local_device
+                {
+                    return Err("duplicate Welcome event does not match its original pins".into());
+                }
+                let ciphersuite: u16 = connection
+                    .query_row(
+                        "SELECT ciphersuite FROM local_mls_groups WHERE group_id = ?1",
+                        [group_id.as_slice()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| format!("could not load joined MLS group: {error}"))?;
+                return Ok(JoinedMlsGroup {
+                    group_id: group_id.to_vec(),
+                    ciphersuite,
+                    epoch: u64::try_from(epoch)
+                        .map_err(|_| "MLS Welcome receipt has invalid epoch".to_owned())?,
+                    designated_committer_device: committer,
+                });
+            }
+        }
         let joined = {
             let provider = LocalOpenMlsProvider::new(connection);
             let message = MlsMessageIn::tls_deserialize_exact(serialized_welcome)
@@ -3036,6 +3235,22 @@ fn join_mls_group_from_welcome_in(
             )
             .map_err(|error| format!("could not index joined MLS group: {error}"))?;
         capture_mls_epoch_snapshot_in(connection, &joined.group_id, joined.epoch)?;
+        if let Some(event_id) = expected_event_id {
+            connection
+                .execute(
+                    "INSERT INTO local_mls_welcome_receipts
+                        (event_id, group_id, committer_device, invitee_device, epoch)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        event_id.as_slice(),
+                        joined.group_id.as_slice(),
+                        joined.designated_committer_device.as_slice(),
+                        device_identity.verifying_key().to_bytes().as_slice(),
+                        joined.epoch as i64
+                    ],
+                )
+                .map_err(|error| format!("could not persist MLS Welcome receipt: {error}"))?;
+        }
         Ok(joined)
     })();
     finish_sql_transaction(connection, result, "MLS Welcome")
@@ -3840,6 +4055,34 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
             )
             .map_err(|error| format!("could not create encrypted peer route book: {error}"))?;
     }
+    if version < 14 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE local_mls_welcome_outbox (
+                     event_id BLOB PRIMARY KEY NOT NULL CHECK (length(event_id) = 16),
+                     group_id BLOB NOT NULL CHECK (length(group_id) = 16),
+                     commit_event_id BLOB NOT NULL CHECK (length(commit_event_id) = 16),
+                     invitee_device BLOB NOT NULL CHECK (length(invitee_device) = 32),
+                     welcome_bytes BLOB NOT NULL CHECK (length(welcome_bytes) > 0),
+                     ratchet_tree BLOB NOT NULL CHECK (length(ratchet_tree) > 0),
+                     delivery_state TEXT NOT NULL DEFAULT 'queued'
+                         CHECK (delivery_state IN ('queued', 'delivered')),
+                     delivered_at INTEGER,
+                     UNIQUE(commit_event_id, invitee_device)
+                 );
+                 CREATE INDEX local_mls_welcomes_by_recipient
+                     ON local_mls_welcome_outbox(group_id, invitee_device, delivery_state);
+                 CREATE TABLE local_mls_welcome_receipts (
+                     event_id BLOB PRIMARY KEY NOT NULL CHECK (length(event_id) = 16),
+                     group_id BLOB NOT NULL CHECK (length(group_id) = 16),
+                     committer_device BLOB NOT NULL CHECK (length(committer_device) = 32),
+                     invitee_device BLOB NOT NULL CHECK (length(invitee_device) = 32),
+                     epoch INTEGER NOT NULL CHECK (epoch >= 0)
+                 );
+                 PRAGMA user_version = 14;",
+            )
+            .map_err(|error| format!("could not create durable MLS Welcome outbox: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -4380,6 +4623,7 @@ mod tests {
             &member_identity,
             None,
             None,
+            None,
         )
         .expect("member should join with its Welcome");
 
@@ -4635,6 +4879,25 @@ mod tests {
             ),
             (0, 1)
         );
+        let queued_welcomes =
+            list_queued_mls_welcomes_for_peer_in(&creator, &group.group_id, invitee_public_key)
+                .expect("admission should persist a retryable Welcome");
+        assert_eq!(queued_welcomes.len(), 1);
+        assert_eq!(queued_welcomes[0].welcome, admission.welcome);
+        assert_eq!(queued_welcomes[0].ratchet_tree, admission.ratchet_tree);
+        assert_eq!(
+            queued_welcomes[0].commit_event_id,
+            admission.commit_event_id
+        );
+        mark_mls_welcome_delivered_in(&creator, queued_welcomes[0].event_id)
+            .expect("durable Welcome ACK should clear the retry queue");
+        mark_mls_welcome_delivered_in(&creator, queued_welcomes[0].event_id)
+            .expect("duplicate Welcome ACK should be idempotent");
+        assert!(
+            list_queued_mls_welcomes_for_peer_in(&creator, &group.group_id, invitee_public_key)
+                .expect("Welcome queue should remain queryable")
+                .is_empty()
+        );
         let wrong_committer = join_mls_group_from_welcome_in(
             &mut invitee,
             &admission.welcome,
@@ -4642,6 +4905,7 @@ mod tests {
             &invitee_identity,
             Some([0xabu8; 32]),
             Some(group.group_id.as_slice().try_into().unwrap()),
+            None,
         )
         .expect_err("Welcome must match the direct session's pinned committer");
         assert!(wrong_committer.contains("pinned committer device"));
@@ -4652,11 +4916,29 @@ mod tests {
             &invitee_identity,
             Some(creator_public_key),
             Some(group.group_id.as_slice().try_into().unwrap()),
+            Some(mls_welcome_event_id(
+                &admission.welcome,
+                &admission.ratchet_tree,
+            )),
         )
         .expect("invitee should process Welcome using its stored KeyPackage bundle");
         assert_eq!(joined.group_id, group.group_id);
         assert_eq!(joined.ciphersuite, ciphersuite as u16);
         assert_eq!(joined.epoch, 1);
+        let duplicate_join = join_mls_group_from_welcome_in(
+            &mut invitee,
+            &admission.welcome,
+            &admission.ratchet_tree,
+            &invitee_identity,
+            Some(creator_public_key),
+            Some(group.group_id.as_slice().try_into().unwrap()),
+            Some(mls_welcome_event_id(
+                &admission.welcome,
+                &admission.ratchet_tree,
+            )),
+        )
+        .expect("redelivered Welcome should return the previously joined group");
+        assert_eq!(duplicate_join, joined);
         assert_eq!(joined.designated_committer_device, creator_public_key);
         assert!(
             list_queued_mls_commits_for_peer_in(
@@ -4890,6 +5172,17 @@ mod tests {
         drop(creator);
         let mut creator = open_database(&creator_path, &creator_key)
             .expect("recipient ACK ledger should survive an encrypted database reopen");
+        let retryable_welcome = list_queued_mls_welcomes_for_peer_in(
+            &creator,
+            &group.group_id,
+            second_admission.invited_device,
+        )
+        .expect("undelivered Welcome should survive an encrypted database reopen");
+        assert_eq!(retryable_welcome.len(), 1);
+        assert_eq!(
+            retryable_welcome[0].commit_event_id,
+            second_admission.commit_event_id
+        );
         let recipient_status = list_mls_commit_recipient_status_in(&creator, &group.group_id, 20)
             .expect("per-device Commit delivery state should reload");
         let invitee_status: Vec<_> = recipient_status
@@ -5191,6 +5484,7 @@ mod tests {
             &admission.welcome,
             &admission.ratchet_tree,
             &receiver_identity,
+            None,
             None,
             None,
         )
