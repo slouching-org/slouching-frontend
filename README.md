@@ -340,8 +340,10 @@ to that group's current leaf index. A two-device Welcome test checks distinct
 member indexes and encrypts/decrypts a frame with the shared MLS exporter. This
 WebRTC now carries mono 48 kHz/20 ms Opus tracks inside SFrame over RTP. The
 offer and answer use gathered host ICE candidates, and call signaling remains
-on the pinned QUIC session. The selected microphone starts after ICE/DTLS
-connects; decoded, authenticated frames go to the selected output device. The
+on the pinned QUIC session. Incoming offers now show the pinned peer and wait
+for an explicit accept or decline before WebRTC/media setup. The selected
+microphone starts after acceptance and ICE/DTLS connection; decoded,
+authenticated frames go to the selected output device. The
 test suite negotiates two local WebRTC peers, sends an Opus/SFrame frame over
 RTP, and verifies decoded samples reach the remote sink. This validates the
 local media path, not audio-device behavior between physical computers. Calls

@@ -321,7 +321,7 @@ fn screen(state: &Slouching, l: Layout) -> Element<'_, Message> {
         Screen::Share => sharing(state, l),
         Screen::Chat => chat(state, l),
         Screen::Mls => mls(state, l),
-        Screen::Incoming => incoming(l),
+        Screen::Incoming => incoming(state, l),
         Screen::Verify => verification(state, l),
     };
     layers.push(content);
@@ -812,7 +812,7 @@ fn settings(state: &Slouching, l: Layout) -> Element<'_, Message> {
             if state.audio_output_devices.is_empty() {
                 output_choices = output_choices.push(l.label("Nenhuma saída de áudio", 11.0, MUTED));
             }
-            let audio = column![
+            let mut audio = column![
                 l.label("Á U D I O", 11.0, GOLD),
                 l.label("Microfone", 13.0, PAPER),
                 container(scrollable(input_choices).height(l.px(54.0))).height(l.px(58.0)),
@@ -835,6 +835,14 @@ fn settings(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 option(l, "Push-to-talk", false)
             ]
             .spacing(l.px(7.0));
+            if state.pending_call_offer.is_some() {
+                audio = audio.push(l.control(
+                    "phone",
+                    "Voltar à chamada recebida",
+                    Some(Message::Navigate(Screen::Incoming)),
+                    true,
+                ));
+            }
             let video = column![
                 l.label("V Í D E O", 11.0, GOLD),
                 container(tile(l, "reading", "ILUSTRAÇÃO · câmera não aberta")).height(l.px(205.0)),
@@ -2552,7 +2560,77 @@ fn bubble(l: Layout, value: &str, time: &str, outgoing: bool) -> Element<'static
         container(c).align_left(Fill).into()
     }
 }
-fn incoming(l: Layout) -> Element<'static, Message> {
+fn incoming(state: &Slouching, l: Layout) -> Element<'_, Message> {
+    if let Some(pending) = state.pending_call_offer.as_ref() {
+        let peer_key = crate::hex_encode_key(&pending.peer_device);
+        let can_accept =
+            state.audio_input_selected.is_some() && state.audio_output_selected.is_some();
+        let mut actions = row![
+            l.control(
+                "close",
+                "Recusar chamada",
+                Some(Message::RejectIncomingCall),
+                true
+            ),
+            l.control(
+                "phone",
+                "Aceitar chamada de voz",
+                Some(Message::AcceptIncomingCall),
+                can_accept
+            )
+        ]
+        .spacing(l.px(12.0));
+        if !can_accept {
+            actions = actions.push(l.control(
+                "settings",
+                "Configurar áudio",
+                Some(Message::Navigate(Screen::Settings)),
+                true,
+            ));
+        }
+        return stack![
+            l.place(
+                container(l.title("Chamada de voz recebida", 42.0)).center_x(Fill),
+                170.0,
+                260.0,
+                950.0,
+                70.0
+            ),
+            l.place(
+                container(l.label(
+                    format!("Peer fixado · {}…", &peer_key[..peer_key.len().min(20)]),
+                    15.0,
+                    PAPER
+                ))
+                .center_x(Fill),
+                180.0,
+                350.0,
+                930.0,
+                42.0
+            ),
+            l.place(
+                container(l.label(
+                    if can_accept {
+                        "Seu microfone só será aberto depois de aceitar e conectar."
+                    } else {
+                        "Selecione microfone e saída em Configurações antes de aceitar."
+                    },
+                    12.0,
+                    VIOLET
+                ))
+                .center_x(Fill),
+                180.0,
+                402.0,
+                930.0,
+                36.0
+            ),
+            l.place(actions, 220.0, 475.0, 850.0, 62.0)
+        ]
+        .width(Fill)
+        .height(Fill)
+        .into();
+    }
+
     let portrait = container(
         image(assets().images["frog"].clone())
             .width(l.px(154.0))

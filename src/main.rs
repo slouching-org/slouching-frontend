@@ -185,6 +185,13 @@ struct CallOfferReady {
     offer: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+struct PendingCallOffer {
+    sequence: u64,
+    peer_device: [u8; 32],
+    signal: peer::CallSignal,
+}
+
 type ProcessedCallSignal = (
     Option<std::sync::Arc<call_rtc::CallRtcSession>>,
     Option<Vec<u8>>,
@@ -300,6 +307,7 @@ struct Slouching {
     mls_commit_recipients: Vec<storage::MlsCommitRecipientStatus>,
     call_group_id: String,
     call_group_status: String,
+    pending_call_offer: Option<PendingCallOffer>,
     call_mic_muted: bool,
     call_group_creating: bool,
     call_rtc_session: Option<std::sync::Arc<call_rtc::CallRtcSession>>,
@@ -486,6 +494,7 @@ impl Default for Slouching {
             mls_commit_recipients: Vec::new(),
             call_group_id: String::new(),
             call_group_status: "Crie um grupo MLS isolado para preparar uma chamada.".to_owned(),
+            pending_call_offer: None,
             call_mic_muted: false,
             call_group_creating: false,
             call_rtc_session: None,
@@ -654,6 +663,8 @@ enum Message {
     CallMlsGroupCreated(Result<storage::CreatedMlsGroup, String>),
     OpenCallMlsGroup,
     StartCall,
+    AcceptIncomingCall,
+    RejectIncomingCall,
     ToggleCallMic,
     EndCall,
     CallOfferCreated(Result<CallOfferReady, String>),
@@ -986,8 +997,73 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 "Microfone ativo; áudio protegido enviado ao peer.".into()
             };
         }
+        Message::AcceptIncomingCall => {
+            let Some(pending) = state.pending_call_offer.as_ref() else {
+                state.call_group_status = "Não há oferta de chamada pendente.".into();
+                return Task::none();
+            };
+            if !active_peer_is_pinned(state)
+                || state.active_peer_device != Some(pending.peer_device)
+            {
+                state.call_group_status =
+                    "O peer fixado mudou; a oferta recebida não será aceita.".into();
+                return Task::none();
+            }
+            let (Some(input_device), Some(output_device)) = (
+                state.audio_input_selected.clone(),
+                state.audio_output_selected.clone(),
+            ) else {
+                state.call_group_status =
+                    "Selecione um microfone e uma saída em Configurações antes de aceitar.".into();
+                return Task::none();
+            };
+            let pending = state
+                .pending_call_offer
+                .take()
+                .expect("pending offer checked");
+            let generation = state.call_rtc_generation.saturating_add(1);
+            let signal = pending.signal.clone();
+            state.screen = Screen::Call;
+            state.call_group_status =
+                "Oferta aceita; validando grupo MLS antes de abrir o áudio…".into();
+            return Task::perform(
+                process_call_signal_task(
+                    signal.clone(),
+                    pending.peer_device,
+                    None,
+                    input_device,
+                    output_device,
+                ),
+                move |result| {
+                    Message::CallSignalProcessed(generation, pending.sequence, signal, result)
+                },
+            );
+        }
+        Message::RejectIncomingCall => {
+            let Some(pending) = state.pending_call_offer.take() else {
+                state.call_group_status = "Não há oferta de chamada pendente.".into();
+                return Task::none();
+            };
+            let Some(commands) = state.peer_session_commands.as_ref() else {
+                state.pending_call_offer = Some(pending);
+                state.call_group_status =
+                    "A sessão P2P terminou antes de recusar a chamada.".into();
+                return Task::none();
+            };
+            if let Err(error) = commands.try_send(peer::PeerCommand::RejectInbound {
+                sequence: pending.sequence,
+                reason: "usuário recusou a chamada".to_owned(),
+            }) {
+                state.pending_call_offer = Some(pending);
+                state.call_group_status = format!("Não foi possível recusar a chamada: {error}");
+                return Task::none();
+            }
+            state.screen = Screen::Home;
+            state.call_group_status = "Chamada recusada.".into();
+        }
         Message::EndCall => {
             state.call_mic_muted = false;
+            state.screen = Screen::Home;
             if let Some(session) = state.call_rtc_session.take() {
                 let commands = state.peer_session_commands.clone();
                 let group_id = hex_decode_bytes(&state.call_group_id)
@@ -1935,6 +2011,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 }
                 PeerListenEvent::Session(event) => match event {
                     peer::PeerEvent::Disconnected { reason } if state.helper_listener_active => {
+                        discard_pending_call_offer(state, "a conexão P2P caiu antes da resposta");
                         state.active_peer_device = None;
                         state.peer_session_commands = None;
                         if let Some(port) = state.peer_listener_port {
@@ -2229,19 +2306,43 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                                 format!("Sinal de chamada recusado: {reason}.");
                             return Task::none();
                         }
-                        if signal.kind == peer::CallSignalKind::Offer
-                            && (state.audio_input_selected.is_none()
-                                || state.audio_output_selected.is_none())
+                        if signal.kind == peer::CallSignalKind::Offer {
+                            if state.call_rtc_session.is_some()
+                                || state.pending_call_offer.is_some()
+                            {
+                                let reason = "already handling a call or incoming offer";
+                                if let Some(commands) = state.peer_session_commands.as_ref() {
+                                    let _ = commands.try_send(peer::PeerCommand::RejectInbound {
+                                        sequence,
+                                        reason: reason.to_owned(),
+                                    });
+                                }
+                                state.call_group_status = format!("Oferta recusada: {reason}.");
+                                return Task::none();
+                            }
+                            state.pending_call_offer = Some(PendingCallOffer {
+                                sequence,
+                                peer_device,
+                                signal,
+                            });
+                            state.call_group_status =
+                                "Seu peer está chamando. Aceite para conectar o áudio ou recuse."
+                                    .into();
+                            state.screen = Screen::Incoming;
+                            return Task::none();
+                        }
+                        if signal.kind == peer::CallSignalKind::End
+                            && let Some(pending) = state.pending_call_offer.take()
                         {
-                            let reason = "selecione microfone e saída de áudio em Configurações para aceitar a chamada";
                             if let Some(commands) = state.peer_session_commands.as_ref() {
                                 let _ = commands.try_send(peer::PeerCommand::RejectInbound {
-                                    sequence,
-                                    reason: reason.to_owned(),
+                                    sequence: pending.sequence,
+                                    reason: "caller cancelled before acceptance".to_owned(),
                                 });
                             }
-                            state.call_group_status = format!("Oferta recusada: {reason}.");
-                            return Task::none();
+                            if state.screen == Screen::Incoming {
+                                state.screen = Screen::Home;
+                            }
                         }
                         let generation = if signal.kind == peer::CallSignalKind::Offer {
                             state.call_rtc_generation.saturating_add(1)
@@ -2465,6 +2566,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     event => apply_peer_event(state, event),
                 },
                 PeerListenEvent::Failed(error) => {
+                    discard_pending_call_offer(state, "a conexão P2P falhou antes da resposta");
                     state.peer_listener_handle = None;
                     state.peer_invite_qr = None;
                     state.peer_session_commands = None;
@@ -6527,6 +6629,7 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
             );
         }
         peer::PeerEvent::Disconnected { reason } => {
+            discard_pending_call_offer(state, "a conexão P2P terminou antes da resposta");
             state.peer_listen_status = PeerListenStatus::Disconnected(reason);
             state.peer_invite_qr = None;
             state.peer_session_commands = None;
@@ -6547,6 +6650,15 @@ fn active_peer_is_pinned(state: &Slouching) -> bool {
         return false;
     };
     state.active_peer_device == Some(*peer.as_bytes())
+}
+
+fn discard_pending_call_offer(state: &mut Slouching, reason: &str) {
+    if state.pending_call_offer.take().is_some() {
+        if state.screen == Screen::Incoming {
+            state.screen = Screen::Home;
+        }
+        state.call_group_status = format!("Oferta de chamada descartada: {reason}.");
+    }
 }
 
 async fn load_peer_secret_key_task() -> Result<iroh::SecretKey, String> {
@@ -6836,6 +6948,66 @@ mod tests {
             Message::AudioMonitorEvent(AudioMonitorEvent::Level(3, 0.9)),
         );
         assert_eq!(state.audio_monitor_level, 0.0);
+    }
+
+    #[test]
+    fn declining_incoming_call_rejects_the_pending_offer_without_opening_media() {
+        let (commands, mut received) = tokio::sync::mpsc::channel(1);
+        let peer_device = [0x42; 32];
+        let mut state = Slouching {
+            screen: Screen::Incoming,
+            peer_session_commands: Some(commands),
+            pending_call_offer: Some(PendingCallOffer {
+                sequence: 12,
+                peer_device,
+                signal: peer::CallSignal {
+                    group_id: [0x17; 16],
+                    epoch: 2,
+                    kind: peer::CallSignalKind::Offer,
+                    payload: vec![1, 2, 3],
+                },
+            }),
+            ..Slouching::default()
+        };
+
+        let _ = update(&mut state, Message::RejectIncomingCall);
+
+        assert!(state.pending_call_offer.is_none());
+        assert!(state.call_rtc_session.is_none());
+        assert_eq!(state.screen, Screen::Home);
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            peer::PeerCommand::RejectInbound { sequence: 12, .. }
+        ));
+    }
+
+    #[test]
+    fn disconnected_peer_clears_stale_incoming_call_offer() {
+        let mut state = Slouching {
+            screen: Screen::Incoming,
+            pending_call_offer: Some(PendingCallOffer {
+                sequence: 3,
+                peer_device: [0x42; 32],
+                signal: peer::CallSignal {
+                    group_id: [0x17; 16],
+                    epoch: 2,
+                    kind: peer::CallSignalKind::Offer,
+                    payload: vec![1],
+                },
+            }),
+            ..Slouching::default()
+        };
+
+        apply_peer_event(
+            &mut state,
+            peer::PeerEvent::Disconnected {
+                reason: "test disconnect".to_owned(),
+            },
+        );
+
+        assert!(state.pending_call_offer.is_none());
+        assert_eq!(state.screen, Screen::Home);
+        assert!(state.call_group_status.contains("conexão P2P terminou"));
     }
 
     #[test]
