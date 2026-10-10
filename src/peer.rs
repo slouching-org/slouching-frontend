@@ -54,7 +54,7 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub struct DirectPeerListener {
     endpoint: Endpoint,
-    expected_peer: EndpointId,
+    expected_peer: Option<EndpointId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +318,7 @@ enum PendingOutbound {
 
 pub struct DirectPeerSession {
     endpoint: Endpoint,
+    close_endpoint: bool,
     connection: Connection,
     send: iroh::endpoint::SendStream,
     receive: iroh::endpoint::RecvStream,
@@ -390,7 +391,10 @@ impl DirectPeerListener {
             .await
             .map_err(|error| PeerAcceptError::Failed(format!("QUIC accept failed: {error}")))?;
         let peer_id = connection.remote_id();
-        if peer_id != self.expected_peer {
+        if self
+            .expected_peer
+            .is_some_and(|expected| peer_id != expected)
+        {
             connection.close(1_u32.into(), b"unexpected device identity");
             return Err(PeerAcceptError::Unauthorized(peer_id));
         }
@@ -404,6 +408,7 @@ impl DirectPeerListener {
             })?;
         Ok(DirectPeerSession {
             endpoint: self.endpoint.clone(),
+            close_endpoint: false,
             connection,
             send,
             receive,
@@ -477,6 +482,7 @@ impl DirectPeerListener {
         received.ok_or_else(|| "peer session ended before receiving text".to_owned())
     }
 
+    #[allow(dead_code)]
     pub async fn close(&self) {
         self.endpoint.close().await;
     }
@@ -987,7 +993,9 @@ impl DirectPeerSession {
                 }
             }
             self.connection.close(0_u32.into(), b"Slouching session ended");
-            self.endpoint.close().await;
+            if self.close_endpoint {
+                self.endpoint.close().await;
+            }
             yield PeerEvent::Disconnected { reason: disconnect_reason };
         }
     }
@@ -1001,7 +1009,21 @@ pub async fn bind_listener(
     let endpoint = bind_endpoint(local_identity, bind_address).await?;
     Ok(DirectPeerListener {
         endpoint,
-        expected_peer,
+        expected_peer: Some(expected_peer),
+    })
+}
+
+/// Binds a helper listener that accepts any authenticated device identity.
+/// Application frames still require their own author/device binding checks;
+/// delegated copy frames require the signed grant author to match this peer.
+pub async fn bind_helper_listener(
+    local_identity: SecretKey,
+    bind_address: SocketAddr,
+) -> Result<DirectPeerListener, String> {
+    let endpoint = bind_endpoint(local_identity, bind_address).await?;
+    Ok(DirectPeerListener {
+        endpoint,
+        expected_peer: None,
     })
 }
 
@@ -1031,6 +1053,7 @@ pub async fn connect_peer(
         .map_err(|error| format!("could not open peer session stream: {error}"))?;
     Ok(DirectPeerSession {
         endpoint,
+        close_endpoint: true,
         connection,
         send,
         receive,
@@ -2461,6 +2484,180 @@ mod tests {
             }
         }
         assert!(holder_task.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn helper_listener_accepts_author_then_different_recipient() {
+        let helper_key = SecretKey::from_bytes(&[0x68; 32]);
+        let author_key = SecretKey::from_bytes(&[0x69; 32]);
+        let recipient_key = SecretKey::from_bytes(&[0x6a; 32]);
+        let author_device = *author_key.public().as_bytes();
+        let recipient_device = *recipient_key.public().as_bytes();
+        let listener = bind_helper_listener(helper_key.clone(), "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let helper_id = listener.id();
+        let address = listener
+            .direct_addresses()
+            .into_iter()
+            .find(|address| address.ip().is_loopback())
+            .unwrap();
+        let event = MlsEventEnvelope {
+            event_id: [0x6b; 16],
+            author_device,
+            group_id: [0x6c; 16].to_vec(),
+            epoch: 2,
+            checkpoint: None,
+            expires_at_unix: 1_900_000_000,
+            ciphertext: vec![0x6d; 64],
+        };
+        let grant = DelegatedMlsCopyGrant {
+            event_id: event.event_id,
+            author_device,
+            recipient_device,
+            group_id: [0x6c; 16],
+            epoch: event.epoch,
+            expires_at_unix: event.expires_at_unix,
+            checkpoint: None,
+            ciphertext_digest: *blake3::hash(&event.ciphertext).as_bytes(),
+            signature: [0x6e; 64],
+        };
+        let expected_grant = grant.clone();
+        let expected_event = event.clone();
+        let helper_task = tokio::spawn(async move {
+            let author_session = listener.accept_session().await.unwrap();
+            let (commands, receiver) = mpsc::channel(4);
+            let mut stream = Box::pin(author_session.run(receiver));
+            let mut retained = None;
+            while let Some(event) = stream.next().await {
+                match event {
+                    PeerEvent::Connected { peer_id } => {
+                        assert_eq!(*peer_id.as_bytes(), author_device)
+                    }
+                    PeerEvent::DelegatedMlsCopyReceived {
+                        sequence,
+                        peer_id,
+                        grant,
+                        event,
+                    } => {
+                        assert_eq!(*peer_id.as_bytes(), author_device);
+                        retained = Some((*grant, *event));
+                        commands
+                            .send(PeerCommand::AcceptInbound { sequence })
+                            .await
+                            .unwrap();
+                    }
+                    PeerEvent::Disconnected { .. } => break,
+                    other => panic!("unexpected author session event: {other:?}"),
+                }
+            }
+            let (retained_grant, retained_event) =
+                retained.expect("helper should retain author's copy");
+
+            let recipient_session = listener.accept_session().await.unwrap();
+            let (commands, receiver) = mpsc::channel(4);
+            let mut stream = Box::pin(recipient_session.run(receiver));
+            while let Some(event) = stream.next().await {
+                match event {
+                    PeerEvent::Connected { peer_id } => {
+                        assert_eq!(*peer_id.as_bytes(), recipient_device)
+                    }
+                    PeerEvent::DelegatedMlsCopiesRequested { peer_id } => {
+                        assert_eq!(*peer_id.as_bytes(), recipient_device);
+                        commands
+                            .send(PeerCommand::SendDelegatedMlsCopy {
+                                request_id: 91,
+                                grant: Box::new(retained_grant.clone()),
+                                event: Box::new(retained_event.clone()),
+                            })
+                            .await
+                            .unwrap();
+                    }
+                    PeerEvent::DelegatedMlsCopyAcknowledged { request_id } => {
+                        assert_eq!(request_id, 91);
+                        commands.send(PeerCommand::Disconnect).await.unwrap();
+                    }
+                    PeerEvent::Disconnected { .. } => return true,
+                    other => panic!("unexpected recipient session event: {other:?}"),
+                }
+            }
+            false
+        });
+
+        let author_session = connect_peer(author_key, helper_id, address).await.unwrap();
+        let (commands, receiver) = mpsc::channel(4);
+        let mut stream = Box::pin(author_session.run(receiver));
+        assert!(matches!(
+            stream.next().await,
+            Some(PeerEvent::Connected { .. })
+        ));
+        commands
+            .send(PeerCommand::SendDelegatedMlsCopy {
+                request_id: 90,
+                grant: Box::new(grant),
+                event: Box::new(event),
+            })
+            .await
+            .unwrap();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(8), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                PeerEvent::DelegatedMlsCopyAcknowledged { request_id: 90 } => break,
+                PeerEvent::Connected { .. } => continue,
+                other => panic!("unexpected author ACK event: {other:?}"),
+            }
+        }
+        commands.send(PeerCommand::Disconnect).await.unwrap();
+        while let Some(event) = stream.next().await {
+            if matches!(event, PeerEvent::Disconnected { .. }) {
+                break;
+            }
+        }
+
+        let recipient_session = connect_peer(recipient_key, helper_id, address)
+            .await
+            .unwrap();
+        let (commands, receiver) = mpsc::channel(4);
+        let mut stream = Box::pin(recipient_session.run(receiver));
+        assert!(matches!(
+            stream.next().await,
+            Some(PeerEvent::Connected { .. })
+        ));
+        commands
+            .send(PeerCommand::RequestDelegatedMlsCopies)
+            .await
+            .unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(8), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        match received {
+            PeerEvent::DelegatedMlsCopyReceived {
+                sequence,
+                peer_id,
+                grant,
+                event,
+            } => {
+                assert_eq!(peer_id, helper_id);
+                assert_eq!(*grant, expected_grant);
+                assert_eq!(*event, expected_event);
+                commands
+                    .send(PeerCommand::AcceptInbound { sequence })
+                    .await
+                    .unwrap();
+            }
+            other => panic!("unexpected recipient copy event: {other:?}"),
+        }
+        commands.send(PeerCommand::Disconnect).await.unwrap();
+        while let Some(event) = stream.next().await {
+            if matches!(event, PeerEvent::Disconnected { .. }) {
+                break;
+            }
+        }
+        assert!(helper_task.await.unwrap());
     }
 
     #[tokio::test]

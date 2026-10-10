@@ -82,6 +82,18 @@ media. Allow the chosen UDP port through each device's local firewall. The autom
 multiple messages in both directions over one connection, checks wrong-pin
 rejection, and verifies a pending send is reported as unknown on disconnect.
 
+### Delegated MLS copy helper
+
+The opt-in in **Settings → Rede & P2P** must be enabled before starting
+**Aguardar peer**. In this mode the listener accepts authenticated devices one
+session at a time, so an author can store a signed ciphertext copy and a
+different recipient can reconnect later to fetch it. Other application frames
+still require the manually pinned peer. This is store-and-forward only: the
+author, helper, and recipient still need a reachable route to the helper when
+each session is made. The current transport disables Iroh relay and NAT
+traversal; a VPN may provide that route, but public cross-network connectivity
+has not been implemented or verified.
+
 The native app now recreates all eleven design-board views with real Iced
 widgets, original characters and scenery, extracted outline SVG icons,
 Bricolage Grotesque and JetBrains Mono, translucent panels, scanlines, and
@@ -239,7 +251,7 @@ be installed and available in the user session.
 
 ![Actual 1884 × 1000 native Iced MLS group screen; this capture has no Secret Service, so no local identity or group is available](docs/design/runtime/native-vhs/11-mls.png)
 
-![Actual native Iced Network and P2P settings with the delegated MLS copy consent control; Secret Service is unavailable in this capture, so the local policy cannot load](docs/design/runtime/native-vhs/02-settings.png)
+![Actual native Iced Network and P2P settings with delegated MLS copy consent and helper-listener guidance; Secret Service is unavailable in this capture, so the local policy cannot load](docs/design/runtime/native-vhs/02-settings.png)
 
 The Network and P2P settings expose persisted opt-in for delegated encrypted
 MLS copies, with the local quota and expiry policy beside the control. QUIC v8

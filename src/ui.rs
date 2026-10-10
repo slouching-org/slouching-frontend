@@ -806,6 +806,15 @@ fn settings(state: &Slouching, l: Layout) -> Element<'_, Message> {
                     PAPER
                 ),
                 l.label(
+                    if state.delegated_mls_storage.is_some_and(|status| status.enabled) {
+                        "Com opt-in ativo, o listener aceita cópias assinadas de vários peers; texto e outros quadros continuam exigindo o peer fixado."
+                    } else {
+                        "Ative antes de iniciar o listener para aceitar cópias de membros sem trocar a chave fixada para o chat."
+                    },
+                    11.0,
+                    MUTED
+                ),
+                l.label(
                     match state.delegated_mls_storage {
                         Some(status) if status.enabled => "Armazenamento ativado · limite de 64 MiB",
                         Some(_) => "Armazenamento desativado · nenhuma cópia é retida",

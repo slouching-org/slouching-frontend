@@ -38,6 +38,11 @@ when a recipient route cannot be reached. Helper ACKs remain separate from
 recipient delivery; the author's outbox stays queued until the target device
 accepts the event. Fetch is limited to 16 copies per connection, and helper
 retention is best-effort rather than an availability guarantee.
+An opted-in listener accepts the author and a later recipient in distinct
+authenticated sessions, one at a time. Other application frames remain bound
+to the manually pinned peer. This store-and-forward path requires a reachable
+route to the helper for each connection; it does not implement NAT traversal
+or public relay, and VPN connectivity has not been verified.
 
 Before applying a next-epoch Commit, the client stores the prior OpenMLS group
 state in the encrypted profile database. If a different Commit later arrives

@@ -200,6 +200,10 @@ struct Slouching {
     delegated_mls_storage: Option<storage::DelegatedMlsStorageStatus>,
     delegated_mls_storage_error: Option<String>,
     peer_public_key: String,
+    active_peer_device: Option<[u8; 32]>,
+    helper_listener_active: bool,
+    peer_listener_port: Option<u16>,
+    peer_listener_addresses: Vec<std::net::SocketAddr>,
     peer_routes: Vec<storage::StoredPeerRoute>,
     peer_routes_error: Option<String>,
     peer_listen_port: String,
@@ -346,6 +350,10 @@ impl Default for Slouching {
             delegated_mls_storage: None,
             delegated_mls_storage_error: None,
             peer_public_key: String::new(),
+            active_peer_device: None,
+            helper_listener_active: false,
+            peer_listener_port: None,
+            peer_listener_addresses: Vec::new(),
             peer_routes: Vec::new(),
             peer_routes_error: None,
             peer_listen_port: "45873".to_owned(),
@@ -987,31 +995,55 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     return Task::none();
                 }
             };
-            let expected_peer = match parse_peer_id(&state.peer_public_key) {
-                Ok(peer) => peer,
-                Err(error) => {
-                    state.peer_listen_status = PeerListenStatus::Failed(error);
+            let helper_mode = state
+                .delegated_mls_storage
+                .is_some_and(|status| status.enabled);
+            let expected_peer = if helper_mode {
+                None
+            } else {
+                let peer = match parse_peer_id(&state.peer_public_key) {
+                    Ok(peer) => peer,
+                    Err(error) => {
+                        state.peer_listen_status = PeerListenStatus::Failed(error);
+                        return Task::none();
+                    }
+                };
+                if let IdentityStatus::Ready(local_public_key) = state.identity_status
+                    && peer_is_local(&peer, &local_public_key)
+                {
+                    state.peer_listen_status = PeerListenStatus::Failed(
+                        "A chave do peer é a sua própria chave. Cole a chave do outro dispositivo."
+                            .to_owned(),
+                    );
                     return Task::none();
                 }
+                Some(peer)
             };
-            if let IdentityStatus::Ready(local_public_key) = state.identity_status
-                && peer_is_local(&expected_peer, &local_public_key)
-            {
-                state.peer_listen_status = PeerListenStatus::Failed(
-                    "A chave do peer é a sua própria chave. Cole a chave do outro dispositivo."
-                        .to_owned(),
-                );
-                return Task::none();
-            }
             state.peer_listener_generation = state.peer_listener_generation.saturating_add(1);
             let generation = state.peer_listener_generation;
             state.peer_listen_status = PeerListenStatus::Starting { port };
+            state.helper_listener_active = helper_mode;
+            state.peer_listener_port = Some(port);
+            state.peer_listener_addresses.clear();
             let (task, handle) = peer_listener_task(generation, port, expected_peer);
             state.peer_listener_handle = Some(handle);
             state.peer_session_commands = None;
             return task;
         }
         Message::StopPeerListener => {
+            if state.helper_listener_active {
+                if let Some(handle) = state.peer_listener_handle.take() {
+                    handle.abort();
+                }
+                state.peer_session_commands = None;
+                state.active_peer_device = None;
+                state.helper_listener_active = false;
+                state.peer_listener_port = None;
+                state.peer_listener_addresses.clear();
+                state.peer_listener_generation = state.peer_listener_generation.saturating_add(1);
+                state.peer_listen_status = PeerListenStatus::Idle;
+                return Task::none();
+            }
             if matches!(
                 state.peer_listen_status,
                 PeerListenStatus::Connected
@@ -1041,16 +1073,22 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         _ => 0,
                     };
                     state.peer_listen_status = PeerListenStatus::Listening { port, addresses };
+                    state.peer_listener_port = Some(port);
+                    if let PeerListenStatus::Listening { addresses, .. } = &state.peer_listen_status
+                    {
+                        state.peer_listener_addresses = addresses.clone();
+                    }
                 }
                 PeerListenEvent::SessionCommands(commands) => {
                     state.peer_session_commands = Some(commands);
                 }
                 PeerListenEvent::Session(peer::PeerEvent::Connected { peer_id }) => {
+                    state.active_peer_device = Some(*peer_id.as_bytes());
                     if let Some(commands) = state.peer_session_commands.as_ref() {
                         let _ = commands.try_send(peer::PeerCommand::RequestDelegatedMlsCopies);
                     }
-                    let remember_route =
-                        matches!(state.peer_send_status, PeerSendStatus::Connecting);
+                    let remember_route = !state.helper_listener_active
+                        && matches!(state.peer_send_status, PeerSendStatus::Connecting);
                     let route_task = if remember_route {
                         Task::perform(
                             save_peer_route_task(*peer_id.as_bytes(), state.peer_address.clone()),
@@ -1063,6 +1101,9 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     let Some(group_id) = state.mls_history_group.clone() else {
                         return route_task;
                     };
+                    if state.helper_listener_active && !active_peer_is_pinned(state) {
+                        return route_task;
+                    }
                     state.mls_status = "Sessão conectada; verificando Commits pendentes autorizados para este dispositivo…".to_owned();
                     let peer_device = *peer_id.as_bytes();
                     let commits_task = Task::perform(
@@ -1079,15 +1120,35 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     return Task::batch([route_task, commits_task, welcome_task]);
                 }
                 PeerListenEvent::Session(event) => match event {
+                    peer::PeerEvent::Disconnected { reason } if state.helper_listener_active => {
+                        state.active_peer_device = None;
+                        state.peer_session_commands = None;
+                        if let Some(port) = state.peer_listener_port {
+                            state.peer_listen_status = PeerListenStatus::Listening {
+                                port,
+                                addresses: state.peer_listener_addresses.clone(),
+                            };
+                        } else {
+                            state.peer_listen_status = PeerListenStatus::Failed(reason);
+                        }
+                    }
                     peer::PeerEvent::Received { sequence, text } => {
-                        let Ok(peer_id) = parse_peer_id(&state.peer_public_key) else {
+                        if !active_peer_is_pinned(state) {
+                            if let Some(commands) = state.peer_session_commands.as_ref() {
+                                let _ = commands.try_send(peer::PeerCommand::RejectInbound {
+                                    sequence,
+                                    reason: "direct text requires the manually pinned peer".into(),
+                                });
+                            }
+                            return Task::none();
+                        }
+                        let Some(peer_device) = state.active_peer_device else {
                             state.peer_send_status = PeerSendStatus::Failed(
                                 "Chave do peer inválida; mensagem recebida sem confirmação."
                                     .to_owned(),
                             );
                             return Task::none();
                         };
-                        let peer_device = *peer_id.as_bytes();
                         return Task::perform(
                             store_direct_message_task(
                                 peer_device,
@@ -1098,7 +1159,10 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         );
                     }
                     peer::PeerEvent::Acknowledged { request_id, text } => {
-                        let Ok(peer_id) = parse_peer_id(&state.peer_public_key) else {
+                        let Some(peer_device) = state
+                            .active_peer_device
+                            .filter(|_| active_peer_is_pinned(state))
+                        else {
                             state.peer_pending_sends.remove(&request_id);
                             state.peer_send_status = PeerSendStatus::Failed(
                                 "Peer confirmou a entrega, mas a chave do peer está inválida."
@@ -1106,7 +1170,6 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                             );
                             return Task::none();
                         };
-                        let peer_device = *peer_id.as_bytes();
                         return Task::perform(
                             store_direct_message_task(
                                 peer_device,
@@ -1117,6 +1180,18 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         );
                     }
                     peer::PeerEvent::MlsEventReceived { sequence, event } => {
+                        if !active_peer_is_pinned(state)
+                            || Some(event.author_device) != state.active_peer_device
+                        {
+                            if let Some(commands) = state.peer_session_commands.as_ref() {
+                                let _ = commands.try_send(peer::PeerCommand::RejectInbound {
+                                    sequence,
+                                    reason: "MLS event author must match the pinned session peer"
+                                        .into(),
+                                });
+                            }
+                            return Task::none();
+                        }
                         let stored_event = storage::EncryptedEvent {
                             event_id: event.event_id,
                             author_device: event.author_device,
@@ -1180,6 +1255,18 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         );
                     }
                     peer::PeerEvent::MlsCommitReceived { sequence, commit } => {
+                        if !active_peer_is_pinned(state)
+                            || Some(commit.author_device) != state.active_peer_device
+                        {
+                            if let Some(commands) = state.peer_session_commands.as_ref() {
+                                let _ = commands.try_send(peer::PeerCommand::RejectInbound {
+                                    sequence,
+                                    reason: "MLS Commit author must match the pinned session peer"
+                                        .into(),
+                                });
+                            }
+                            return Task::none();
+                        }
                         return Task::perform(
                             process_mls_commit_envelope_task(commit.clone()),
                             move |result| {
@@ -1193,7 +1280,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         proposal,
                     } => {
                         let pinned_peer = *peer_id.as_bytes();
-                        if proposal.author_device != pinned_peer {
+                        if !active_peer_is_pinned(state) || proposal.author_device != pinned_peer {
                             if let Some(commands) = state.peer_session_commands.as_ref() {
                                 let _ = commands.try_send(peer::PeerCommand::RejectInbound {
                                     sequence,
@@ -1220,7 +1307,9 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     } => {
                         let pinned_peer = *peer_id.as_bytes();
                         let selected_group = hex_decode_bytes(&state.mls_group_id).ok();
-                        let rejection = if key_package.invitee_device != pinned_peer {
+                        let rejection = if !active_peer_is_pinned(state) {
+                            Some("KeyPackage requires the manually pinned peer")
+                        } else if key_package.invitee_device != pinned_peer {
                             Some("KeyPackage identity does not match the pinned peer")
                         } else if selected_group.as_deref() != Some(key_package.group_id.as_slice())
                         {
@@ -1256,11 +1345,14 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         welcome,
                     } => {
                         let pinned_peer = *peer_id.as_bytes();
-                        let rejection = if welcome.invitee_device
+                        let rejection = if !active_peer_is_pinned(state) {
+                            Some("Welcome requires the manually pinned committer")
+                        } else if welcome.invitee_device
                             != match state.identity_status {
                                 IdentityStatus::Ready(device) => device,
                                 _ => [0; 32],
-                            } {
+                            }
+                        {
                             Some("Welcome is addressed to another device")
                         } else if state.mls_pending_peer_welcome.is_some() {
                             Some("another MLS Welcome is already awaiting admission")
@@ -1295,6 +1387,13 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         group_id,
                         predecessor_epoch,
                     } => {
+                        if !active_peer_is_pinned(state)
+                            || Some(*peer_id.as_bytes()) != state.active_peer_device
+                        {
+                            state.mls_status =
+                                "Pedido de Commit recusado: peer não está fixado.".into();
+                            return Task::none();
+                        }
                         let peer_device = *peer_id.as_bytes();
                         return Task::perform(
                             load_authorized_mls_commit_task(
@@ -4450,7 +4549,7 @@ fn missing_predecessor_from_error(error: &str) -> Option<u64> {
 fn peer_listener_task(
     generation: u64,
     port: u16,
-    expected_peer: iroh::EndpointId,
+    expected_peer: Option<iroh::EndpointId>,
 ) -> (Task<Message>, Handle) {
     let events = async_stream::stream! {
         let local_identity = match load_peer_secret_key_task().await {
@@ -4460,11 +4559,13 @@ fn peer_listener_task(
                 return;
             }
         };
-        let listener = match peer::bind_listener(
-            local_identity,
-            std::net::SocketAddr::from(([0, 0, 0, 0], port)),
-            expected_peer,
-        ).await {
+        let bind_address = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        let listener_result = if let Some(expected_peer) = expected_peer {
+            peer::bind_listener(local_identity, bind_address, expected_peer).await
+        } else {
+            peer::bind_helper_listener(local_identity, bind_address).await
+        };
+        let listener = match listener_result {
             Ok(listener) => listener,
             Err(error) => {
                 yield PeerListenEvent::Failed(error);
@@ -4473,30 +4574,20 @@ fn peer_listener_task(
         };
         let addresses = listener.direct_addresses();
         yield PeerListenEvent::Bound { addresses };
-        let (commands, mut command_rx) = tokio::sync::mpsc::channel(32);
-        yield PeerListenEvent::SessionCommands(commands);
         loop {
-            let accepted = tokio::select! {
-                result = listener.accept_session() => Some(result),
-                command = command_rx.recv() => {
-                    if matches!(command, Some(peer::PeerCommand::Disconnect) | None) {
-                        listener.close().await;
-                        yield PeerListenEvent::Session(peer::PeerEvent::Disconnected { reason: "listener stopped".to_owned() });
-                        return;
-                    }
-                    None
-                }
-            };
-            let Some(accepted) = accepted else { continue; };
-            match accepted {
+            match listener.accept_session().await {
                 Ok(session) => {
+                    let (commands, command_rx) = tokio::sync::mpsc::channel(32);
+                    yield PeerListenEvent::SessionCommands(commands);
                     let mut events = Box::pin(session.run(command_rx));
                     while let Some(event) = events.next().await {
                         let disconnected = matches!(event, peer::PeerEvent::Disconnected { .. });
                         yield PeerListenEvent::Session(event);
                         if disconnected { break; }
                     }
-                    return;
+                    if expected_peer.is_some() {
+                        return;
+                    }
                 }
                 Err(peer::PeerAcceptError::Unauthorized(peer_id)) => {
                     yield PeerListenEvent::Session(peer::PeerEvent::Unauthorized { peer_id });
@@ -4645,6 +4736,7 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
             state.peer_listen_status = PeerListenStatus::Disconnected(reason);
             state.peer_session_commands = None;
             state.peer_listener_handle = None;
+            state.active_peer_device = None;
             if !state.peer_pending_sends.is_empty() {
                 state.peer_pending_sends.clear();
                 state.peer_send_status = PeerSendStatus::Failed(
@@ -4653,6 +4745,13 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
             }
         }
     }
+}
+
+fn active_peer_is_pinned(state: &Slouching) -> bool {
+    let Ok(peer) = parse_peer_id(&state.peer_public_key) else {
+        return false;
+    };
+    state.active_peer_device == Some(*peer.as_bytes())
 }
 
 async fn load_peer_secret_key_task() -> Result<iroh::SecretKey, String> {
