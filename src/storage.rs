@@ -469,6 +469,7 @@ pub struct AddedMlsMember {
     pub group_id: Vec<u8>,
     pub epoch: u64,
     pub commit_event_id: [u8; 16],
+    pub invited_device: [u8; 32],
     /// Public MLS Commit bytes to distribute alongside the Welcome.
     pub commit: Vec<u8>,
     /// Encrypted MLS Welcome bytes for the admitted member.
@@ -2385,19 +2386,59 @@ pub fn add_mls_group_member(
         .map_err(|error| format!("could not load the device identity key: {error}"))?;
     let device_identity = signing_key_from_secret(secret)?;
     let mut connection = open_local_database()?;
-    add_mls_group_member_in(
+    add_mls_group_member_with_peer_in(
         &mut connection,
         group_id,
         serialized_key_package,
         &device_identity,
+        None,
     )
 }
 
+/// Admits a KeyPackage only when its signed device binding matches the peer
+/// authenticated by the active pinned transport session.
+pub fn add_mls_group_member_from_peer(
+    group_id: &[u8],
+    serialized_key_package: &[u8],
+    pinned_peer_device: [u8; 32],
+) -> Result<AddedMlsMember, String> {
+    let entry = identity_key_entry()?;
+    let secret = entry
+        .get_secret()
+        .map_err(|error| format!("could not load the device identity key: {error}"))?;
+    let device_identity = signing_key_from_secret(secret)?;
+    let mut connection = open_local_database()?;
+    add_mls_group_member_with_peer_in(
+        &mut connection,
+        group_id,
+        serialized_key_package,
+        &device_identity,
+        Some(pinned_peer_device),
+    )
+}
+
+#[cfg(test)]
 fn add_mls_group_member_in(
     connection: &mut Connection,
     group_id: &[u8],
     serialized_key_package: &[u8],
     device_identity: &SigningKey,
+) -> Result<AddedMlsMember, String> {
+    add_mls_group_member_with_peer_in(
+        connection,
+        group_id,
+        serialized_key_package,
+        device_identity,
+        None,
+    )
+}
+
+fn add_mls_group_member_with_peer_in(
+    connection: &mut Connection,
+    group_id: &[u8],
+    serialized_key_package: &[u8],
+    device_identity: &SigningKey,
+    expected_invited_device: Option<[u8; 32]>,
 ) -> Result<AddedMlsMember, String> {
     use openmls::prelude::tls_codec::Deserialize as TlsCodecDeserialize;
 
@@ -2434,6 +2475,9 @@ fn add_mls_group_member_in(
         }
         (package, ciphersuite, binding.device_public_key)
     };
+    if expected_invited_device.is_some_and(|expected| expected != candidate_device) {
+        return Err("KeyPackage device does not match the pinned peer".to_owned());
+    }
     let committer_binding =
         create_or_load_mls_signing_key_binding_in(connection, ciphersuite, device_identity)?;
 
@@ -2510,6 +2554,7 @@ fn add_mls_group_member_in(
                 group_id: group.group_id().to_vec(),
                 epoch: group.epoch().as_u64(),
                 commit_event_id,
+                invited_device: candidate_device,
                 commit: commit_bytes.clone(),
                 welcome: welcome
                     .tls_serialize_detached()
@@ -4272,6 +4317,7 @@ mod tests {
         let creator_identity = SigningKey::from_bytes(&[0x53; 32]);
         let invitee_identity = SigningKey::from_bytes(&[0x54; 32]);
         let creator_public_key = creator_identity.verifying_key().to_bytes();
+        let invitee_public_key = invitee_identity.verifying_key().to_bytes();
         let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
         let mut creator =
@@ -4318,15 +4364,26 @@ mod tests {
         creator
             .execute_batch("DROP TRIGGER force_mls_commit_outbox_failure;")
             .expect("test should remove its failure trigger");
-        let admission = add_mls_group_member_in(
+        let mismatched_pin = add_mls_group_member_with_peer_in(
             &mut creator,
             &group.group_id,
             &package.public_bytes,
             &creator_identity,
+            Some([0xab; 32]),
+        )
+        .expect_err("KeyPackage from another device must not satisfy the pinned peer");
+        assert!(mismatched_pin.contains("does not match the pinned peer"));
+        let admission = add_mls_group_member_with_peer_in(
+            &mut creator,
+            &group.group_id,
+            &package.public_bytes,
+            &creator_identity,
+            Some(invitee_public_key),
         )
         .expect("designated committer should add the valid KeyPackage");
         assert_eq!(admission.group_id, group.group_id);
         assert_eq!(admission.epoch, 1);
+        assert_eq!(admission.invited_device, invitee_public_key);
         assert!(!admission.commit.is_empty());
         assert!(!admission.welcome.is_empty());
         let (stored_group, predecessor_epoch, stored_epoch): (Vec<u8>, i64, i64) = creator
