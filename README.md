@@ -129,8 +129,10 @@ only after the proposal is stored. Only the designated committer can turn
 accepted proposals into a Commit. That operation saves the new epoch, Commit
 outbox, and predecessor-member recipient ledger atomically; the existing
 direct-session Commit delivery flow distributes it. This proposal path accepts
-self-updates only; other proposal types and approval controls are not
-implemented.
+self-updates only. Before Commit creation, the committer screen lists each
+authenticated proposal's epoch, member key prefix, and proposal ID prefix. The
+button commits every proposal shown for the current epoch; individual approval
+and rejection controls and other proposal types are not implemented.
 
 For this flow, both members join the same group. The member opens it, clicks
 **Criar proposta para atualizar minha chave**, connects directly to the
@@ -173,7 +175,7 @@ be installed and available in the user session.
 
 ![Actual native Iced group-call preview; media and sample messages are illustrative](docs/design/runtime/native-vhs/10-call.png)
 
-![Actual 1884 × 1000 native Iced MLS screen showing the group setup, local group list, and self-update proposal controls in the right panel's scroll area](docs/design/runtime/native-vhs/11-mls.png)
+![Actual 1884 × 1000 native Iced MLS screen showing group setup and the visible proposal review summary, captured without a selected group](docs/design/runtime/native-vhs/11-mls.png)
 
 The MLS screen now detects authenticated committer equivocation. It verifies a
 conflicting historical Commit against a saved OpenMLS epoch snapshot, stores

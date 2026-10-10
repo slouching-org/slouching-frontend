@@ -37,9 +37,10 @@ Members can send signed self-update proposals to the designated committer over
 the active pinned session, or exchange their bytes through a separately
 trusted channel. The committer checks the MLS author against the pinned peer,
 authenticates and stores the proposal before ACK, and deduplicates exact
-redelivery. It then creates an atomic, retryable Commit for the existing
-member-delivery flow. Other proposal types and proposal approval controls are
-not implemented.
+redelivery. The committer UI lists each current-epoch proposal's member key
+prefix and proposal ID before enabling Commit creation. The button commits all
+proposals shown in the review list; selecting or rejecting proposals
+individually and handling other proposal types are not implemented.
 
 The direct-LAN text screen manually pins the peer's Ed25519 device key. One
 side listens and shares its announced LAN address; the other connects to that

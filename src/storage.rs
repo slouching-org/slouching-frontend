@@ -209,6 +209,49 @@ pub fn list_mls_groups() -> Result<Vec<StoredMlsGroup>, String> {
     list_mls_groups_in(&connection)
 }
 
+/// Lists authenticated proposals awaiting a Commit for the selected group epoch.
+pub fn list_pending_mls_proposals(group_id: &[u8]) -> Result<Vec<StoredMlsProposal>, String> {
+    if group_id.len() != 16 {
+        return Err("MLS group ID must be 16 bytes".to_owned());
+    }
+    let connection = open_local_database()?;
+    list_pending_mls_proposals_in(&connection, group_id)
+}
+
+fn list_pending_mls_proposals_in(
+    connection: &Connection,
+    group_id: &[u8],
+) -> Result<Vec<StoredMlsProposal>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT p.proposal_id, p.epoch, p.author_device
+             FROM local_mls_proposals p
+             JOIN local_mls_groups g ON g.group_id = p.group_id
+             WHERE p.group_id = ?1 AND p.epoch = g.epoch
+             ORDER BY p.rowid",
+        )
+        .map_err(|error| format!("could not prepare pending MLS proposal list: {error}"))?;
+    let rows = statement
+        .query_map([group_id], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })
+        .map_err(|error| format!("could not query pending MLS proposals: {error}"))?;
+    rows.map(|row| {
+        let (proposal_id, epoch, author_device) =
+            row.map_err(|error| format!("could not read pending MLS proposal: {error}"))?;
+        Ok(StoredMlsProposal {
+            proposal_id: fixed_bytes(proposal_id, "MLS proposal ID")?,
+            epoch: u64::try_from(epoch).map_err(|_| "MLS proposal has invalid epoch".to_owned())?,
+            author_device: fixed_bytes(author_device, "MLS proposal author device")?,
+        })
+    })
+    .collect()
+}
+
 fn list_mls_groups_in(connection: &Connection) -> Result<Vec<StoredMlsGroup>, String> {
     let mut statement = connection
         .prepare("SELECT group_id, epoch, quarantined FROM local_mls_groups ORDER BY rowid DESC")
@@ -450,6 +493,13 @@ pub struct PreparedMlsUpdateProposal {
     pub group_id: Vec<u8>,
     pub epoch: u64,
     pub proposal: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredMlsProposal {
+    pub proposal_id: [u8; 16],
+    pub epoch: u64,
+    pub author_device: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4128,6 +4178,14 @@ mod tests {
             )
             .expect("proposal journal should be queryable");
         assert_eq!(journal_rows, 1);
+        let pending = list_pending_mls_proposals_in(&creator, &group.group_id)
+            .expect("proposal review list should load the current epoch");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].epoch, proposal.epoch);
+        assert_eq!(
+            pending[0].author_device,
+            member_identity.verifying_key().to_bytes()
+        );
         creator
             .execute_batch(
                 "CREATE TRIGGER force_proposal_commit_outbox_failure
@@ -4156,6 +4214,11 @@ mod tests {
         assert_eq!(commit.predecessor_epoch, 1);
         assert_eq!(commit.epoch, 2);
         assert!(!commit.commit.is_empty());
+        assert!(
+            list_pending_mls_proposals_in(&creator, &group.group_id)
+                .expect("committed proposal should leave the review queue")
+                .is_empty()
+        );
         assert_eq!(
             process_mls_self_update_proposal_in(
                 &mut creator,

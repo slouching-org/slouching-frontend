@@ -208,6 +208,7 @@ struct Slouching {
     mls_history: Vec<storage::StoredMlsMessage>,
     mls_history_group: Option<Vec<u8>>,
     mls_pending_commits: Vec<storage::StoredMlsCommit>,
+    mls_pending_proposals: Vec<storage::StoredMlsProposal>,
     mls_commit_recipients: Vec<storage::MlsCommitRecipientStatus>,
     mls_pending_events: std::collections::HashMap<u64, [u8; 16]>,
     mls_sending_commits: std::collections::HashMap<u64, [u8; 16]>,
@@ -342,6 +343,7 @@ impl Default for Slouching {
             mls_history: Vec::new(),
             mls_history_group: None,
             mls_pending_commits: Vec::new(),
+            mls_pending_proposals: Vec::new(),
             mls_commit_recipients: Vec::new(),
             mls_pending_events: std::collections::HashMap::new(),
             mls_sending_commits: std::collections::HashMap::new(),
@@ -456,6 +458,7 @@ enum Message {
         Vec<u8>,
         Result<Vec<storage::MlsCommitRecipientStatus>, String>,
     ),
+    MlsPendingProposalsLoaded(Vec<u8>, Result<Vec<storage::StoredMlsProposal>, String>),
     RetryQueuedMlsEvents,
     MlsOutboxLoaded(Vec<u8>, Result<Vec<storage::StoredOutboundEvent>, String>),
     SendMlsApplication,
@@ -1186,6 +1189,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.mls_history.clear();
             state.mls_commit.clear();
             state.mls_pending_commits.clear();
+            state.mls_pending_proposals.clear();
             return load_mls_history(state, group_id);
         }
         Message::RefreshMlsGroups => return load_mls_groups(),
@@ -1196,6 +1200,18 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             }
             Err(error) => state.mls_groups_error = Some(error),
         },
+        Message::MlsPendingProposalsLoaded(group_id, result) => {
+            if state.mls_history_group.as_deref() == Some(group_id.as_slice()) {
+                match result {
+                    Ok(proposals) => state.mls_pending_proposals = proposals,
+                    Err(error) => {
+                        state.mls_status =
+                            format!("Falha ao carregar propostas pendentes: {error}");
+                        state.mls_pending_proposals.clear();
+                    }
+                }
+            }
+        }
         Message::MlsKeyPackageChanged(value) => state.mls_key_package = value,
         Message::MlsInviteKeyPackageChanged(value) => state.mls_invite_key_package = value,
         Message::MlsWelcomeChanged(value) => state.mls_welcome = value,
@@ -1469,12 +1485,22 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 state.mls_status = format!(
                     "Atualização autenticada e salva como proposta pendente no epoch {epoch}. O committer pode gerar o Commit."
                 );
+                if let Ok(group_id) = hex_decode_bytes(&state.mls_group_id)
+                    && group_id.len() == 16
+                {
+                    return load_mls_history(state, group_id);
+                }
             }
             Ok(storage::ProcessedMlsProposal::Duplicate { epoch }) => {
                 state.mls_received_update_proposal.clear();
                 state.mls_status = format!(
                     "Proposta já está salva no grupo no epoch {epoch}; redelivery não duplicou a operação."
                 );
+                if let Ok(group_id) = hex_decode_bytes(&state.mls_group_id)
+                    && group_id.len() == 16
+                {
+                    return load_mls_history(state, group_id);
+                }
             }
             Err(error) => state.mls_status = format!("Proposta MLS rejeitada: {error}"),
         },
@@ -1517,6 +1543,11 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         Message::CommitMlsProposals => {
             if state.mls_quarantine_reason.is_some() {
                 state.mls_status = "Grupo em quarentena; geração de Commit bloqueada.".into();
+                return Task::none();
+            }
+            if state.mls_pending_proposals.is_empty() {
+                state.mls_status =
+                    "Nenhuma proposta autenticada aguarda Commit neste epoch.".into();
                 return Task::none();
             }
             let group_id = match hex_decode_bytes(&state.mls_group_id) {
@@ -1854,7 +1885,13 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     )
                 }
             };
-            return load_mls_groups();
+            let groups = load_mls_groups();
+            if let Ok(group_id) = hex_decode_bytes(&state.mls_group_id)
+                && group_id.len() == 16
+            {
+                return Task::batch([load_mls_history(state, group_id), groups]);
+            }
+            return groups;
         }
         Message::MlsCommitProcessed(Err(error)) => {
             state.mls_status = format!("Commit MLS rejeitado sem avançar o grupo: {error}");
@@ -2479,6 +2516,8 @@ fn load_mls_history(state: &mut Slouching, group_id: Vec<u8>) -> Task<Message> {
     let history_group_id = group_id.clone();
     let quarantine_group_id = group_id.clone();
     let commits_group_id = group_id.clone();
+    let commits_message_group_id = group_id.clone();
+    let proposals_group_id = group_id.clone();
     let recipients_group_id = group_id.clone();
     let recipients_message_group_id = recipients_group_id.clone();
     Task::batch([
@@ -2490,11 +2529,15 @@ fn load_mls_history(state: &mut Slouching, group_id: Vec<u8>) -> Task<Message> {
             move |result| Message::MlsQuarantineLoaded(quarantine_group_id, result),
         ),
         Task::perform(load_mls_commits_task(commits_group_id), move |result| {
-            Message::MlsCommitsLoaded(group_id, result)
+            Message::MlsCommitsLoaded(commits_message_group_id, result)
         }),
         Task::perform(
             load_mls_commit_recipient_status_task(recipients_group_id),
             move |result| Message::MlsCommitRecipientsLoaded(recipients_message_group_id, result),
+        ),
+        Task::perform(
+            load_pending_mls_proposals_task(proposals_group_id),
+            move |result| Message::MlsPendingProposalsLoaded(group_id, result),
         ),
     ])
 }
@@ -2511,6 +2554,14 @@ async fn load_mls_history_task(
     tokio::task::spawn_blocking(move || storage::list_mls_messages(&group_id, 200))
         .await
         .map_err(|error| format!("MLS history task failed: {error}"))?
+}
+
+async fn load_pending_mls_proposals_task(
+    group_id: Vec<u8>,
+) -> Result<Vec<storage::StoredMlsProposal>, String> {
+    tokio::task::spawn_blocking(move || storage::list_pending_mls_proposals(&group_id))
+        .await
+        .map_err(|error| format!("MLS pending proposal query failed: {error}"))?
 }
 
 async fn load_mls_commits_task(group_id: Vec<u8>) -> Result<Vec<storage::StoredMlsCommit>, String> {

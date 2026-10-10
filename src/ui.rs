@@ -1323,10 +1323,48 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
         ),
         l.control(
             "users",
-            "Criar Commit das propostas pendentes",
+            "Criar Commit com todas as propostas",
             Some(Message::CommitMlsProposals),
-            state.mls_quarantine_reason.is_none()
+            state.mls_quarantine_reason.is_none() && !state.mls_pending_proposals.is_empty()
         ),
+        l.label(
+            format!(
+                "PROPOSTAS AUTENTICADAS NESTE EPOCH · {}",
+                state.mls_pending_proposals.len()
+            ),
+            9.0,
+            GOLD,
+        ),
+        if state.mls_pending_proposals.is_empty() {
+            let empty: Element<'_, Message> = l
+                .label("Nenhuma proposta aguarda inclusão em Commit.", 9.0, MUTED)
+                .into();
+            empty
+        } else {
+            column(
+                state
+                    .mls_pending_proposals
+                    .iter()
+                    .map(|proposal| {
+                        let id = crate::hex_encode_bytes(&proposal.proposal_id);
+                        let author = crate::hex_encode_bytes(&proposal.author_device);
+                        l.label(
+                            format!(
+                                "Update · epoch {} · membro {}… · proposta {}…",
+                                proposal.epoch,
+                                &author[..12],
+                                &id[..12]
+                            ),
+                            9.0,
+                            PAPER,
+                        )
+                        .into()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .spacing(l.px(3.0))
+            .into()
+        },
         rule(LINE, 1.0),
         l.label("KEYPACKAGE RECEBIDO DO CONVIDADO", 10.0, GOLD),
         l.input(
@@ -1567,6 +1605,35 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
         } else {
             space().height(l.px(0.0)).into()
         };
+    let proposal_review = column(
+        std::iter::once(
+            l.label(
+                format!(
+                    "REVISÃO DE PROPOSTAS · {} autenticada(s) aguardando Commit neste epoch",
+                    state.mls_pending_proposals.len()
+                ),
+                10.0,
+                GOLD,
+            )
+            .into(),
+        )
+        .chain(state.mls_pending_proposals.iter().take(3).map(|proposal| {
+            let author = crate::hex_encode_bytes(&proposal.author_device);
+            let id = crate::hex_encode_bytes(&proposal.proposal_id);
+            l.label(
+                format!(
+                    "Update · membro {}… · proposta {}…",
+                    &author[..12],
+                    &id[..12]
+                ),
+                9.0,
+                PAPER,
+            )
+            .into()
+        }))
+        .collect::<Vec<Element<'_, Message>>>(),
+    )
+    .spacing(l.px(3.0));
     let body = column![
         row![
             column![l.title("Grupo MLS", 28.0), l.label("OpenMLS · SQLCipher · Iroh/QUIC direto", 11.0, MUTED)].spacing(l.px(5.0)),
@@ -1582,6 +1649,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
         ].spacing(l.px(18.0)),
         l.label(state.mls_status.clone(), 11.0, GREEN),
         recipient_status,
+        proposal_review,
         l.label("TRANSCRIÇÃO MLS · ARMAZENADA LOCALMENTE", 10.0, GOLD),
         container(history).height(l.px(78.0)).width(Fill),
         row![

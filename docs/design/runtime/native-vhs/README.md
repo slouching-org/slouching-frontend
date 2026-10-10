@@ -33,8 +33,10 @@ designated committer over the active pinned peer session. The committer checks
 the MLS author against the transport peer, authenticates and stores the
 proposal before ACK, then creates a Commit for the existing per-member
 delivery flow. Copy/paste over a separately trusted channel remains available.
-This path currently handles self-updates only; other proposal types and
-approval controls are not implemented.
+The committer view shows authenticated proposals queued for the current epoch
+before creating a Commit that includes all of them. This path currently
+handles self-updates only; per-proposal approval or rejection and other
+proposal types are not implemented.
 
 Opening the encrypted database composes OpenMLS RustCrypto with its versioned
 SQLite storage schema through the same SQLCipher connection. The Rust core
