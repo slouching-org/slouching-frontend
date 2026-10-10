@@ -1756,7 +1756,7 @@ fn mls(state: &Slouching, l: Layout) -> Element<'_, Message> {
             retry
         ].spacing(l.px(10.0)),
         l.label(
-            "Convites e árvores ainda são trocados manualmente por canal confiável. Mensagens MLS seguem pela sessão direta ativa e só recebem ACK depois da validação e persistência no outro dispositivo.",
+            "Convites e árvores ainda são trocados manualmente por canal confiável. Mensagens MLS seguem pela sessão autenticada ativa e só recebem ACK depois da validação e persistência no outro dispositivo.",
             10.0,
             MUTED
         )
@@ -1927,7 +1927,7 @@ fn chat(state: &Slouching, l: Layout) -> Element<'_, Message> {
             }
         }
         crate::PeerListenStatus::Connected => l
-            .label("Conectado · sessão direta ativa", 11.0, GREEN)
+            .label("Conectado · sessão autenticada ativa", 11.0, GREEN)
             .into(),
         crate::PeerListenStatus::Disconnected(reason) => l
             .label(format!("Desconectado: {reason}"), 11.0, MUTED)

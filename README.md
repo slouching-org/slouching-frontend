@@ -62,6 +62,8 @@ path.
    message, and click **Conectar e enviar**. After connection, either device
    can send multiple messages over the same session. Sent text appears only
    after an ACK; received text appears live after the pinned identity check.
+   The connected status confirms an authenticated session; it does not claim
+   that the route avoided the configured relay.
 
 A successful outbound connection saves the pinned device key and socket address
 in the encrypted local route book. The chat screen lists these routes, and the
