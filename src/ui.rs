@@ -1101,11 +1101,24 @@ fn diagnostics(state: &Slouching, l: Layout) -> Element<'static, Message> {
         .into()
 }
 fn call(state: &Slouching, l: Layout) -> Element<'_, Message> {
-    let stage = tile(
-        l,
-        "orb",
-        "Bram · cena ilustrativa / nenhuma câmera conectada",
-    );
+    let stage: Element<'_, Message> = if let Some(frame) = state.remote_screen_frame.clone() {
+        container(
+            image(frame)
+                .content_fit(ContentFit::Contain)
+                .width(Fill)
+                .height(Fill),
+        )
+        .width(Fill)
+        .height(Fill)
+        .style(panel_style)
+        .into()
+    } else {
+        tile(
+            l,
+            "orb",
+            "Bram · cena ilustrativa / nenhuma câmera conectada",
+        )
+    };
     let filmstrip = row![
         boxed(tile(l, "frog-scene", "Mara · personagem")),
         boxed(tile(l, "gnome-scene", "Pim · personagem")),
@@ -1436,10 +1449,23 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
         )
         .into()
     };
+    let share_action = if state.screen_sharing_active {
+        Some(Message::StopScreenShare)
+    } else if state.call_rtc_session.is_some() && state.selected_source.is_some() {
+        Some(Message::StartScreenShare)
+    } else {
+        None
+    };
+    let share_disabled = share_action.is_none();
+    let share_label = if state.screen_sharing_active {
+        "Parar compartilhamento"
+    } else {
+        "Compartilhar tela na chamada"
+    };
     let body = column![
         l.title("O que você quer mostrar à roda?", 36.0),
         l.label(
-            "CAPTURA LOCAL · nenhuma imagem é enviada ao peer nesta versão",
+            "H.264/SFRAME · transmissão disponível durante chamada ativa",
             12.0,
             MUTED
         ),
@@ -1449,6 +1475,15 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 l.label("FONTES DISPONÍVEIS", 11.0, GOLD),
                 scrollable(source_list).height(l.px(290.0)).width(Fill),
                 l.label(state.screen_capture_status.clone(), 11.0, MUTED),
+                l.label(
+                    state.screen_share_status.clone(),
+                    11.0,
+                    if state.screen_sharing_active {
+                        GREEN
+                    } else {
+                        MUTED
+                    }
+                ),
                 row![
                     l.control(
                         "refresh",
@@ -1480,7 +1515,7 @@ fn sharing(state: &Slouching, l: Layout) -> Element<'_, Message> {
                 false
             ),
             space().width(Fill),
-            l.control("screen", "Compartilhar indisponível", None, true)
+            l.control("screen", share_label, share_action, share_disabled)
         ]
         .spacing(l.px(20.0))
     ]

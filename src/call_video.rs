@@ -12,8 +12,8 @@ use openh264::{
     formats::{RgbaSliceU8, YUVBuffer, YUVSource},
 };
 
-const MAX_WIDTH: u32 = 960;
-const MAX_HEIGHT: u32 = 540;
+const MAX_WIDTH: u32 = 640;
+const MAX_HEIGHT: u32 = 360;
 const MAX_INPUT_PIXELS: usize = 7_680 * 4_320;
 
 #[derive(Debug, Clone)]
@@ -59,6 +59,9 @@ impl CallVideoEncoder {
         let (width, height, scaled) = scale_to_limit(image);
         let source = RgbaSliceU8::new(&scaled, (width as usize, height as usize));
         let yuv = YUVBuffer::from_rgb_source(source);
+        // Every screen update is independently decodable, so a dropped or
+        // skipped access unit cannot poison the following frame's reference.
+        self.encoder.force_intra_frame();
         let encoded = self
             .encoder
             .encode(&yuv)
@@ -118,6 +121,14 @@ impl CallVideoDecoder {
             rgba,
         }))
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_encoder_decoder_pair() -> Result<(CallVideoEncoder, CallVideoDecoder), String> {
+    Ok((
+        CallVideoEncoder::new(MediaFrameSender::new(9, 1, b"0123456789abcdef")?)?,
+        CallVideoDecoder::new(MediaFrameReceiver::new(9, 1, b"0123456789abcdef")?)?,
+    ))
 }
 
 fn validate_image(width: u32, height: u32, rgba: &[u8]) -> Result<(), String> {
@@ -205,5 +216,15 @@ mod tests {
                 .unwrap();
         assert!(encoder.encode_and_protect(4, 4, vec![0; 4]).is_err());
         assert!(validate_image(20_000, 20_000, &[]).is_err());
+    }
+
+    #[test]
+    fn screen_share_access_unit_stays_within_the_sframe_frame_limit() {
+        let rgba = vec![127_u8; 640 * 360 * 4];
+        let mut encoder =
+            CallVideoEncoder::new(MediaFrameSender::new(9, 1, TEST_MLS_EXPORTER_KEY).unwrap())
+                .unwrap();
+        let protected = encoder.encode_and_protect(640, 360, rgba).unwrap();
+        assert!(protected.len() <= 64 * 1024 + 64);
     }
 }

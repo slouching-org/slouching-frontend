@@ -4,7 +4,7 @@
 //! ICE candidates into SDP for the initial offer/answer exchange and can apply
 //! later trickled candidates. Media tracks are added by the call media layer.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use media::Sample;
 use rtc::{
     media_stream::MediaStreamTrack,
@@ -22,6 +22,7 @@ use std::{
 };
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use webrtc::{
+    data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit, RTCDataChannelState},
     media_stream::{
         track_local::{TrackLocal, static_sample::TrackLocalStaticSample},
         track_remote::{TrackRemote, TrackRemoteEvent},
@@ -37,12 +38,14 @@ use webrtc::{
 const ICE_GATHERING_TIMEOUT: Duration = Duration::from_secs(10);
 const OPUS_PAYLOAD_TYPE: u8 = 111;
 const OPUS_FRAME_DURATION: Duration = Duration::from_millis(20);
+const SCREEN_DATA_CHANNEL: &str = "slouching-screen-v1";
 
 #[derive(Clone)]
 struct CallEvents {
     gathering_complete: watch::Sender<bool>,
     connection_state: watch::Sender<String>,
     incoming_tracks: mpsc::UnboundedSender<Arc<dyn TrackRemote>>,
+    incoming_data_channels: mpsc::UnboundedSender<Arc<dyn DataChannel>>,
 }
 
 #[async_trait::async_trait]
@@ -59,6 +62,10 @@ impl PeerConnectionEventHandler for CallEvents {
 
     async fn on_track(&self, track: Arc<dyn TrackRemote>) {
         let _ = self.incoming_tracks.send(track);
+    }
+
+    async fn on_data_channel(&self, channel: Arc<dyn DataChannel>) {
+        let _ = self.incoming_data_channels.send(channel);
     }
 }
 
@@ -105,6 +112,16 @@ pub struct CallRtcSession {
     connection_state: watch::Receiver<String>,
     audio_status: watch::Sender<String>,
     incoming_tracks: Mutex<Option<mpsc::UnboundedReceiver<Arc<dyn TrackRemote>>>>,
+    incoming_data_channels: Mutex<Option<mpsc::UnboundedReceiver<Arc<dyn DataChannel>>>>,
+    screen_data_channel: Arc<AsyncMutex<Option<Arc<dyn DataChannel>>>>,
+    received_screen_frames: Mutex<Option<mpsc::UnboundedReceiver<Vec<u8>>>>,
+    received_screen_frames_tx: mpsc::UnboundedSender<Vec<u8>>,
+    screen_video_encoder: AsyncMutex<Option<crate::call_video::CallVideoEncoder>>,
+    screen_video_decoder: Arc<AsyncMutex<Option<crate::call_video::CallVideoDecoder>>>,
+    screen_share_active: AtomicBool,
+    screen_share_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    remote_screen_frame: watch::Sender<Option<Arc<crate::call_video::DecodedVideoFrame>>>,
+    screen_share_status: watch::Sender<String>,
     audio: Option<Arc<CallAudioState>>,
     audio_started: AtomicBool,
     audio_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -116,11 +133,17 @@ impl CallRtcSession {
         let (gathering_tx, gathering_complete) = watch::channel(false);
         let (state_tx, connection_state) = watch::channel("New".to_owned());
         let (incoming_track_tx, incoming_tracks) = mpsc::unbounded_channel();
+        let (incoming_data_channel_tx, incoming_data_channels) = mpsc::unbounded_channel();
+        let (received_screen_frames_tx, received_screen_frames) = mpsc::unbounded_channel();
+        let (remote_screen_frame, _) = watch::channel(None);
+        let (screen_share_status, _) =
+            watch::channel("Compartilhamento de tela parado.".to_owned());
         let (audio_status, _) = watch::channel("Áudio ainda não conectado.".to_owned());
         let handler = Arc::new(CallEvents {
             gathering_complete: gathering_tx,
             connection_state: state_tx,
             incoming_tracks: incoming_track_tx,
+            incoming_data_channels: incoming_data_channel_tx,
         });
         let mut media_engine = MediaEngine::default();
         media_engine
@@ -137,21 +160,34 @@ impl CallRtcSession {
             .with_handler(handler)
             .with_runtime(runtime)
             .with_udp_addrs(vec!["0.0.0.0:0".to_owned()])
+            .with_data_channel_send_buffer_limit(128 * 1024)
             .build()
             .await
             .map_err(|error| format!("could not create WebRTC peer connection: {error}"))?;
 
-        Ok(Self {
+        let session = Self {
             peer_connection: Box::new(peer_connection),
             gathering_complete,
             connection_state,
             audio_status,
             incoming_tracks: Mutex::new(Some(incoming_tracks)),
+            incoming_data_channels: Mutex::new(Some(incoming_data_channels)),
+            screen_data_channel: Arc::new(AsyncMutex::new(None)),
+            received_screen_frames: Mutex::new(Some(received_screen_frames)),
+            received_screen_frames_tx,
+            screen_video_encoder: AsyncMutex::new(None),
+            screen_video_decoder: Arc::new(AsyncMutex::new(None)),
+            screen_share_active: AtomicBool::new(false),
+            screen_share_task: Mutex::new(None),
+            remote_screen_frame,
+            screen_share_status,
             audio: None,
             audio_started: AtomicBool::new(false),
             audio_tasks: Mutex::new(Vec::new()),
             data_channel_created: AtomicBool::new(false),
-        })
+        };
+        session.start_screen_data_receiver();
+        Ok(session)
     }
 
     /// Build an audio-capable peer connection using the current call MLS group.
@@ -162,19 +198,28 @@ impl CallRtcSession {
         input_device_id: String,
         output_device_id: String,
     ) -> Result<Self, String> {
-        let (encoder, decoder) = tokio::task::spawn_blocking(move || {
-            Ok::<_, String>((
-                crate::call_audio::CallAudioEncoder::for_call_group(&group_id)?,
-                crate::call_audio::CallAudioDecoder::for_call_group_member(
-                    &group_id,
-                    &remote_device,
-                )?,
-            ))
-        })
-        .await
-        .map_err(|error| format!("call media context task failed: {error}"))??;
+        let (encoder, decoder, video_encoder, video_decoder) =
+            tokio::task::spawn_blocking(move || {
+                Ok::<_, String>((
+                    crate::call_audio::CallAudioEncoder::for_call_group(&group_id)?,
+                    crate::call_audio::CallAudioDecoder::for_call_group_member(
+                        &group_id,
+                        &remote_device,
+                    )?,
+                    crate::call_video::CallVideoEncoder::for_call_group(&group_id)?,
+                    crate::call_video::CallVideoDecoder::for_call_group_member(
+                        &group_id,
+                        &remote_device,
+                    )?,
+                ))
+            })
+            .await
+            .map_err(|error| format!("call media context task failed: {error}"))??;
         let sink = Arc::new(crate::audio::AudioPlayback::open(&output_device_id)?);
-        Self::new_with_audio_codecs(encoder, decoder, input_device_id, sink).await
+        let session = Self::new_with_audio_codecs(encoder, decoder, input_device_id, sink).await?;
+        *session.screen_video_encoder.lock().await = Some(video_encoder);
+        *session.screen_video_decoder.lock().await = Some(video_decoder);
+        Ok(session)
     }
 
     async fn new_with_audio_codecs(
@@ -243,6 +288,22 @@ impl CallRtcSession {
                     self.data_channel_created.store(false, Ordering::Release);
                     format!("could not create WebRTC call control channel: {error}")
                 })?;
+            let screen_channel = self
+                .peer_connection
+                .create_data_channel(
+                    SCREEN_DATA_CHANNEL,
+                    Some(RTCDataChannelInit {
+                        ordered: true,
+                        max_packet_life_time: Some(250),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map_err(|error| {
+                    self.data_channel_created.store(false, Ordering::Release);
+                    format!("could not create screen-sharing data channel: {error}")
+                })?;
+            *self.screen_data_channel.lock().await = Some(screen_channel);
         }
         let offer = self
             .peer_connection
@@ -316,6 +377,264 @@ impl CallRtcSession {
 
     pub fn audio_status(&self) -> watch::Receiver<String> {
         self.audio_status.subscribe()
+    }
+
+    /// Take the single-consumer stream of complete, reassembled protected
+    /// screen access units received on this peer connection.
+    pub fn take_received_screen_frames(&self) -> Option<mpsc::UnboundedReceiver<Vec<u8>>> {
+        self.received_screen_frames
+            .lock()
+            .ok()
+            .and_then(|mut frames| frames.take())
+    }
+
+    pub fn remote_screen_frame(
+        &self,
+    ) -> watch::Receiver<Option<Arc<crate::call_video::DecodedVideoFrame>>> {
+        self.remote_screen_frame.subscribe()
+    }
+
+    pub fn screen_share_status(&self) -> watch::Receiver<String> {
+        self.screen_share_status.subscribe()
+    }
+
+    pub fn is_screen_sharing(&self) -> bool {
+        self.screen_share_active.load(Ordering::Acquire)
+    }
+
+    pub async fn start_screen_sharing(self: &Arc<Self>, monitor_id: u32) -> Result<(), String> {
+        if self.screen_video_encoder.lock().await.is_none() {
+            return Err("esta chamada não tem um codec de vídeo associado ao grupo MLS".to_owned());
+        }
+        let channel = self
+            .screen_data_channel
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| "o canal de vídeo ainda não foi negociado com o peer".to_owned())?;
+        if channel
+            .ready_state()
+            .await
+            .map_err(|error| error.to_string())?
+            != RTCDataChannelState::Open
+        {
+            return Err("aguarde a conexão WebRTC antes de compartilhar a tela".to_owned());
+        }
+        if self.screen_share_active.swap(true, Ordering::AcqRel) {
+            return Err("a tela já está sendo compartilhada nesta chamada".to_owned());
+        }
+        self.screen_share_status.send_replace(
+            "Capturando tela local a 5 quadros por segundo; vídeo protegido por SFrame.".to_owned(),
+        );
+        let session = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            let mut frame_id = 0_u32;
+            let mut interval = tokio::time::interval(Duration::from_millis(200));
+            loop {
+                interval.tick().await;
+                let captured =
+                    tokio::task::spawn_blocking(move || crate::screen_capture::capture(monitor_id))
+                        .await;
+                let captured = match captured {
+                    Ok(Ok(frame)) => frame,
+                    Ok(Err(error)) => {
+                        session
+                            .screen_share_status
+                            .send_replace(format!("Captura de tela falhou: {error}"));
+                        continue;
+                    }
+                    Err(error) => {
+                        session
+                            .screen_share_status
+                            .send_replace(format!("Tarefa de captura falhou: {error}"));
+                        continue;
+                    }
+                };
+                let protected = {
+                    let mut encoder = session.screen_video_encoder.lock().await;
+                    let Some(encoder) = encoder.as_mut() else {
+                        break;
+                    };
+                    encoder.encode_and_protect(captured.width, captured.height, captured.rgba)
+                };
+                let protected = match protected {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        session
+                            .screen_share_status
+                            .send_replace(format!("Quadro H.264/SFrame não enviado: {error}"));
+                        continue;
+                    }
+                };
+                match session
+                    .send_protected_screen_frame(frame_id, &protected)
+                    .await
+                {
+                    Ok(()) => {
+                        session.screen_share_status.send_replace(format!(
+                            "Tela compartilhada · quadro {frame_id} · H.264/SFrame."
+                        ));
+                        frame_id = frame_id.wrapping_add(1);
+                    }
+                    Err(error) if error.contains("peer is behind") => {
+                        frame_id = frame_id.wrapping_add(1);
+                    }
+                    Err(error) => {
+                        session
+                            .screen_share_status
+                            .send_replace(format!("Compartilhamento interrompido: {error}"));
+                        break;
+                    }
+                }
+            }
+            session.screen_share_active.store(false, Ordering::Release);
+        });
+        if let Ok(mut active_task) = self.screen_share_task.lock() {
+            *active_task = Some(task);
+        }
+        Ok(())
+    }
+
+    pub async fn stop_screen_sharing(&self) {
+        if let Ok(mut task) = self.screen_share_task.lock()
+            && let Some(task) = task.take()
+        {
+            task.abort();
+        }
+        if let Some(channel) = self.screen_data_channel.lock().await.clone()
+            && channel
+                .ready_state()
+                .await
+                .is_ok_and(|state| state == RTCDataChannelState::Open)
+        {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(1),
+                channel.send(BytesMut::from(
+                    crate::video_transport::stop_sharing_message(),
+                )),
+            )
+            .await;
+        }
+        self.screen_share_active.store(false, Ordering::Release);
+        self.screen_share_status
+            .send_replace("Compartilhamento de tela parado.".to_owned());
+    }
+
+    /// Send one already SFrame-protected H.264 access unit over the bounded
+    /// screen-sharing data channel.
+    pub async fn send_protected_screen_frame(
+        &self,
+        frame_id: u32,
+        protected_frame: &[u8],
+    ) -> Result<(), String> {
+        let channel = self
+            .screen_data_channel
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| "screen-sharing channel is not available on this call".to_owned())?;
+        let state = channel
+            .ready_state()
+            .await
+            .map_err(|error| format!("could not read screen-sharing channel state: {error}"))?;
+        if state != RTCDataChannelState::Open {
+            return Err(format!("screen-sharing channel is not open: {state:?}"));
+        }
+        let fragments = crate::video_transport::fragment_frame(frame_id, protected_frame)?;
+        for fragment in fragments {
+            let outstanding = channel
+                .outstanding_bytes()
+                .await
+                .map_err(|error| format!("could not read video send queue: {error}"))?;
+            if outstanding > 96 * 1024 {
+                return Err("screen-sharing frame skipped because the peer is behind".to_owned());
+            }
+            channel
+                .try_send(BytesMut::from(fragment.as_slice()))
+                .await
+                .map_err(|error| format!("could not queue protected video fragment: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn start_screen_data_receiver(&self) {
+        let receiver = self
+            .incoming_data_channels
+            .lock()
+            .ok()
+            .and_then(|mut channels| channels.take());
+        let Some(mut receiver) = receiver else {
+            return;
+        };
+        let screen_channel = Arc::clone(&self.screen_data_channel);
+        let screen_decoder = Arc::clone(&self.screen_video_decoder);
+        let remote_screen_frame = self.remote_screen_frame.clone();
+        let screen_share_status = self.screen_share_status.clone();
+        let frame_tx = self.received_screen_frames_tx.clone();
+        let task = tokio::spawn(async move {
+            while let Some(channel) = receiver.recv().await {
+                if channel
+                    .label()
+                    .await
+                    .map_or(true, |label| label != SCREEN_DATA_CHANNEL)
+                {
+                    continue;
+                }
+                *screen_channel.lock().await = Some(Arc::clone(&channel));
+                let mut reassembler = crate::video_transport::VideoFrameReassembler::default();
+                while let Some(event) = channel.poll().await {
+                    match event {
+                        DataChannelEvent::OnMessage(message) if !message.is_string => {
+                            if crate::video_transport::is_stop_sharing_message(&message.data) {
+                                reassembler.clear();
+                                remote_screen_frame.send_replace(None);
+                                continue;
+                            }
+                            match reassembler.push(&message.data) {
+                                Ok(Some(frame)) => {
+                                    let decoded = {
+                                        let mut decoder = screen_decoder.lock().await;
+                                        match decoder.as_mut() {
+                                            Some(decoder) => {
+                                                decoder.unprotect_and_decode(&frame).map(Some)
+                                            }
+                                            None => Ok(None),
+                                        }
+                                    };
+                                    match decoded {
+                                        Ok(Some(Some(frame))) => {
+                                            remote_screen_frame.send_replace(Some(Arc::new(frame)));
+                                        }
+                                        Ok(None) | Ok(Some(None)) => {
+                                            let _ = frame_tx.send(frame);
+                                        }
+                                        Err(error) => {
+                                            screen_share_status.send_replace(format!(
+                                                "Quadro remoto rejeitado: {error}"
+                                            ));
+                                        }
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(_) => {}
+                            }
+                        }
+                        DataChannelEvent::OnClose => break,
+                        _ => {}
+                    }
+                }
+                let mut active_channel = screen_channel.lock().await;
+                if active_channel
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &channel))
+                {
+                    *active_channel = None;
+                }
+            }
+        });
+        if let Ok(mut tasks) = self.audio_tasks.lock() {
+            tasks.push(task);
+        }
     }
 
     pub fn set_microphone_muted(&self, muted: bool) {
@@ -459,6 +778,7 @@ impl CallRtcSession {
     }
 
     pub async fn close(&self) -> Result<(), String> {
+        self.stop_screen_sharing().await;
         if let Ok(mut tasks) = self.audio_tasks.lock() {
             for task in tasks.drain(..) {
                 task.abort();
@@ -631,6 +951,100 @@ mod tests {
             .expect("callee audio sink should remain open");
         assert_eq!(received.len(), crate::call_audio::FRAME_SAMPLES);
         assert!(received.iter().any(|sample| sample.abs() > 0.01));
+
+        caller.close().await.unwrap();
+        callee.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn screen_data_channel_reassembles_bounded_video_fragments() {
+        let caller = Arc::new(CallRtcSession::new().await.unwrap());
+        let callee = Arc::new(CallRtcSession::new().await.unwrap());
+        let offer = caller.create_offer().await.unwrap();
+        let answer = callee.accept_offer(&offer).await.unwrap();
+        caller.accept_answer(&answer).await.unwrap();
+        let mut received = callee.take_received_screen_frames().unwrap();
+        let frame = (0..(12 * 1024 * 2 + 37))
+            .map(|index| (index % 239) as u8)
+            .collect::<Vec<_>>();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match caller.send_protected_screen_frame(7, &frame).await {
+                    Ok(()) => break,
+                    Err(error) if error.contains("not open") => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("could not send test video fragments: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("screen data channel should open after WebRTC negotiation");
+        let received = tokio::time::timeout(Duration::from_secs(5), received.recv())
+            .await
+            .expect("screen frame should arrive")
+            .expect("screen data channel should remain open");
+        assert_eq!(received, frame);
+        let mut remote_video = callee.remote_screen_frame();
+        callee.remote_screen_frame.send_replace(Some(Arc::new(
+            crate::call_video::DecodedVideoFrame {
+                width: 1,
+                height: 1,
+                rgba: vec![0, 0, 0, 255],
+            },
+        )));
+        remote_video.changed().await.unwrap();
+        assert!(remote_video.borrow().is_some());
+        caller.stop_screen_sharing().await;
+        tokio::time::timeout(Duration::from_secs(5), remote_video.changed())
+            .await
+            .expect("stop-sharing signal should reach the remote peer")
+            .expect("remote video watch should stay active");
+        assert!(remote_video.borrow().is_none());
+        caller.close().await.unwrap();
+        callee.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn protected_h264_screen_frame_crosses_data_channel_and_decodes_remotely() {
+        let caller = Arc::new(CallRtcSession::new().await.unwrap());
+        let callee = Arc::new(CallRtcSession::new().await.unwrap());
+        let offer = caller.create_offer().await.unwrap();
+        let answer = callee.accept_offer(&offer).await.unwrap();
+        caller.accept_answer(&answer).await.unwrap();
+        let (mut encoder, decoder) = crate::call_video::test_encoder_decoder_pair().unwrap();
+        *callee.screen_video_decoder.lock().await = Some(decoder);
+        let pixels = vec![96_u8; 320 * 240 * 4];
+        let protected = encoder.encode_and_protect(320, 240, pixels).unwrap();
+        let mut remote_frame = callee.remote_screen_frame();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match caller.send_protected_screen_frame(1, &protected).await {
+                    Ok(()) => break,
+                    Err(error) if error.contains("not open") => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("could not send protected screen frame: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("screen data channel should open after WebRTC negotiation");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                remote_frame.changed().await.unwrap();
+                if remote_frame.borrow().is_some() {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("authenticated screen frame should be rendered remotely");
+        let decoded = remote_frame.borrow().clone().unwrap();
+        assert_eq!((decoded.width, decoded.height), (320, 240));
+        assert_eq!(decoded.rgba.len(), 320 * 240 * 4);
 
         caller.close().await.unwrap();
         callee.close().await.unwrap();

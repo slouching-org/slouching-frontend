@@ -1,7 +1,8 @@
-//! Explicit, on-demand desktop monitor enumeration and still-frame capture.
+//! Explicit desktop monitor enumeration and user-triggered screen capture.
 //!
-//! Capture calls are blocking and must run outside Iced's UI thread. This is a
-//! local preview primitive; it does not transmit frames to another peer.
+//! Capture calls are blocking and must run outside Iced's UI thread. A captured
+//! frame can be shown as a local preview or encoded and sent over an active,
+//! end-to-end protected call by the call media layer.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenSource {

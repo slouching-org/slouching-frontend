@@ -80,11 +80,17 @@ updated Iced window; its sample people and chat remain illustrative. Use
 `--capture-call-negotiation` with `--capture-screen 10-call` to supply fixture
 identity, peer, and group values for a future native capture.
 
-The share screen now enumerates real monitors and can capture a single local
-still preview after the user presses **Capturar prévia**. The image is not sent
-to a peer. The repository screenshot fixtures were not regenerated for this
-change because the current environment has no Wayland or X11 display; capture
-the `05-share` view in a graphical session before treating the fixture as
+The share screen enumerates real monitors and can capture a single local still
+preview after the user presses **Capturar prévia**. During an active call, it
+also offers **Compartilhar tela na chamada**: the selected monitor is captured
+continuously, downscaled and encoded as H.264, protected with the call group
+SFrame key, and sent as bounded fragments over a WebRTC DataChannel. The peer
+authenticates and decodes complete frames before displaying them, and stopping
+the share clears the remote image. Codec and local DataChannel loopback tests
+cover these boundaries; the real two-device capture and VPN path still need
+validation. The repository screenshot fixtures were not regenerated because
+the current environment has no Wayland or X11 display; capture the `05-share`
+and `10-call` views in a graphical session before treating those fixtures as
 current.
 
 Reproduce with `cargo run -- --capture-dir /tmp/slouching-captures`.

@@ -14,6 +14,7 @@ mod peer_invite;
 pub mod screen_capture;
 pub mod storage;
 mod ui;
+pub mod video_transport;
 use prost::Message as ProstMessage;
 use serde::Deserialize;
 use std::time::Duration;
@@ -243,6 +244,9 @@ struct Slouching {
     selected_source: Option<u32>,
     screen_capture_status: String,
     screen_preview: Option<iced::widget::image::Handle>,
+    screen_share_status: String,
+    screen_sharing_active: bool,
+    remote_screen_frame: Option<iced::widget::image::Handle>,
     texture: bool,
     note: Option<&'static str>,
     capture_dir: Option<std::path::PathBuf>,
@@ -431,6 +435,9 @@ impl Default for Slouching {
             selected_source: None,
             screen_capture_status: "As telas só serão acessadas após sua ação.".to_owned(),
             screen_preview: None,
+            screen_share_status: "Entre em uma chamada para compartilhar sua tela.".to_owned(),
+            screen_sharing_active: false,
+            remote_screen_frame: None,
             texture: true,
             note: None,
             capture_dir: None,
@@ -554,6 +561,10 @@ enum Message {
     SelectScreen(u32),
     CaptureScreen(u32),
     ScreenCaptured(u32, Result<screen_capture::CapturedScreen, String>),
+    StartScreenShare,
+    StopScreenShare,
+    ScreenShareStarted(Result<(), String>),
+    ScreenShareStopped,
     ToggleTexture,
     PreviewAction(&'static str),
     DismissNote,
@@ -687,6 +698,8 @@ enum Message {
         Result<ProcessedCallSignal, String>,
     ),
     CallRtcStateChanged(u64, String),
+    CallScreenShareStatus(u64, String),
+    CallRemoteScreenFrame(u64, Option<std::sync::Arc<call_video::DecodedVideoFrame>>),
     PrepareMlsKeyPackage,
     MlsKeyPackagePrepared(Result<storage::PreparedMlsKeyPackage, String>),
     AdmitMlsMember,
@@ -982,6 +995,8 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                     return Task::none();
                 }
             };
+            state.remote_screen_frame = None;
+            state.screen_sharing_active = false;
             if state.call_rtc_session.is_some() {
                 state.call_group_status =
                     "A sessão WebRTC já foi iniciada; aguarde a negociação ou encerre-a.".into();
@@ -1014,6 +1029,44 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 "Microfone ativo; áudio protegido enviado ao peer.".into()
             };
         }
+        Message::StartScreenShare => {
+            let Some(session) = state.call_rtc_session.as_ref().cloned() else {
+                state.screen_share_status =
+                    "Inicie ou aceite uma chamada antes de compartilhar a tela.".into();
+                return Task::none();
+            };
+            let Some(monitor_id) = state.selected_source else {
+                state.screen_share_status =
+                    "Selecione uma tela antes de iniciar o compartilhamento.".into();
+                return Task::none();
+            };
+            state.screen_share_status = "Preparando captura e vídeo protegido…".into();
+            return Task::perform(
+                async move { session.start_screen_sharing(monitor_id).await },
+                Message::ScreenShareStarted,
+            );
+        }
+        Message::StopScreenShare => {
+            let stop = state.call_rtc_session.as_ref().cloned().map(|session| {
+                Task::perform(async move { session.stop_screen_sharing().await }, |_| {
+                    Message::ScreenShareStopped
+                })
+            });
+            state.screen_sharing_active = false;
+            state.screen_share_status = "Parando compartilhamento…".into();
+            return stop.unwrap_or_else(Task::none);
+        }
+        Message::ScreenShareStarted(result) => match result {
+            Ok(()) => {
+                state.screen_sharing_active = true;
+                state.screen_share_status = "Compartilhamento iniciado.".into();
+            }
+            Err(error) => {
+                state.screen_sharing_active = false;
+                state.screen_share_status = error;
+            }
+        },
+        Message::ScreenShareStopped => {}
         Message::AcceptIncomingCall => {
             let Some(pending) = state.pending_call_offer.as_ref() else {
                 state.call_group_status = "Não há oferta de chamada pendente.".into();
@@ -1080,6 +1133,8 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
         }
         Message::EndCall => {
             state.call_mic_muted = false;
+            state.screen_sharing_active = false;
+            state.remote_screen_frame = None;
             state.screen = Screen::Home;
             if let Some(session) = state.call_rtc_session.take() {
                 let commands = state.peer_session_commands.clone();
@@ -1243,7 +1298,29 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 if generation == 0 || terminal {
                     state.call_rtc_session = None;
                     state.call_mic_muted = false;
+                    state.screen_sharing_active = false;
+                    state.remote_screen_frame = None;
                 }
+            }
+        }
+        Message::CallScreenShareStatus(generation, status) => {
+            if generation == state.call_rtc_generation {
+                state.screen_sharing_active = state
+                    .call_rtc_session
+                    .as_ref()
+                    .is_some_and(|session| session.is_screen_sharing());
+                state.screen_share_status = status;
+            }
+        }
+        Message::CallRemoteScreenFrame(generation, frame) => {
+            if generation == state.call_rtc_generation {
+                state.remote_screen_frame = frame.map(|frame| {
+                    iced::widget::image::Handle::from_rgba(
+                        frame.width,
+                        frame.height,
+                        frame.rgba.clone(),
+                    )
+                });
             }
         }
         Message::InviteChanged(value) => state.invite = value,
@@ -5406,8 +5483,12 @@ fn watch_call_rtc_state(
     let events = async_stream::stream! {
         let mut state = rtc.connection_state();
         let mut audio_status = rtc.audio_status();
+        let mut screen_share_status = rtc.screen_share_status();
+        let mut remote_screen_frame = rtc.remote_screen_frame();
         let mut mic_started = false;
+        let initial_screen_share_status = screen_share_status.borrow().clone();
         yield Message::CallRtcStateChanged(generation, format!("WebRTC: {} · áudio protegido aguardando conexão.", *state.borrow()));
+        yield Message::CallScreenShareStatus(generation, initial_screen_share_status);
         loop {
             tokio::select! {
                 changed = state.changed() => {
@@ -5439,6 +5520,16 @@ fn watch_call_rtc_state(
                     if changed.is_err() { break; }
                     let status = audio_status.borrow().clone();
                     yield Message::CallRtcStateChanged(generation, status);
+                }
+                changed = screen_share_status.changed() => {
+                    if changed.is_err() { break; }
+                    let status = screen_share_status.borrow().clone();
+                    yield Message::CallScreenShareStatus(generation, status);
+                }
+                changed = remote_screen_frame.changed() => {
+                    if changed.is_err() { break; }
+                    let frame = remote_screen_frame.borrow().clone();
+                    yield Message::CallRemoteScreenFrame(generation, frame);
                 }
             }
         }
