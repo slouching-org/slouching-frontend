@@ -213,6 +213,7 @@ type ProcessedCallSignal = (
 #[derive(Debug, Clone, Copy)]
 struct PendingMlsAttachmentTransfer {
     event_id: [u8; 16],
+    peer_device: [u8; 32],
     attachment: PendingMlsAttachmentBlob,
 }
 
@@ -3557,9 +3558,74 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                             }
                             return Task::none();
                         };
+                        if let Some(attachment) =
+                            state.mls_pending_attachment_blobs.remove(&event_id)
+                        {
+                            state.mls_attachment_transfers.insert(
+                                request_id,
+                                PendingMlsAttachmentTransfer {
+                                    event_id,
+                                    peer_device,
+                                    attachment,
+                                },
+                            );
+                            let Some(commands) = state.peer_session_commands.as_ref() else {
+                                state.mls_status =
+                                    "Oferta recebida; reconecte e reenvie o anexo pendente.".into();
+                                return Task::none();
+                            };
+                            return match commands.try_send(peer::PeerCommand::SendAttachmentBlob {
+                                request_id,
+                                group_id: attachment.group_id,
+                                transfer_id: attachment.transfer_id,
+                                ciphertext_hash: attachment.ciphertext_hash,
+                            }) {
+                                Ok(()) => {
+                                    state.mls_status =
+                                        "Oferta MLS confirmada; aguardando confirmação do blob cifrado…".into();
+                                    Task::none()
+                                }
+                                Err(error) => {
+                                    state.mls_status = format!(
+                                        "Oferta MLS confirmada; anexo permanece pendente: {error}"
+                                    );
+                                    Task::none()
+                                }
+                            };
+                        }
                         return Task::perform(
                             update_mls_outbound_state_task(event_id, peer_device),
                             move |result| Message::MlsOutboundHeld(request_id, event_id, result),
+                        );
+                    }
+                    peer::PeerEvent::AttachmentBlobSent {
+                        request_id,
+                        result: Ok(()),
+                    } => {
+                        if let Some(transfer) = state.mls_attachment_transfers.remove(&request_id) {
+                            state.mls_pending_events.remove(&request_id);
+                            return Task::perform(
+                                update_mls_outbound_state_task(
+                                    transfer.event_id,
+                                    transfer.peer_device,
+                                ),
+                                move |result| {
+                                    Message::MlsOutboundHeld(request_id, transfer.event_id, result)
+                                },
+                            );
+                        }
+                        apply_peer_event(
+                            state,
+                            peer::PeerEvent::AttachmentBlobSent {
+                                request_id,
+                                result: Ok(()),
+                            },
+                        );
+                    }
+                    peer::PeerEvent::AttachmentBlobSent { request_id, result } => {
+                        apply_peer_event(
+                            state,
+                            peer::PeerEvent::AttachmentBlobSent { request_id, result },
                         );
                     }
                     peer::PeerEvent::DelegatedMlsCopyAcknowledged { request_id } => {
@@ -5254,6 +5320,19 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                         .filter(|stored| !pending_event_ids.contains(&stored.event.event_id))
                         .take(available_slots)
                     {
+                        if let Some((transfer_id, ciphertext_hash)) = stored.attachment_transfer
+                            && let Ok(attachment_group_id) =
+                                <[u8; 16]>::try_from(stored.event.group_id.as_slice())
+                        {
+                            state.mls_pending_attachment_blobs.insert(
+                                stored.event.event_id,
+                                PendingMlsAttachmentBlob {
+                                    group_id: attachment_group_id,
+                                    transfer_id,
+                                    ciphertext_hash,
+                                },
+                            );
+                        }
                         let request_id = state.mls_next_request_id;
                         state.mls_next_request_id = state.mls_next_request_id.saturating_add(1);
                         state
@@ -5364,6 +5443,12 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             let Some((&request_id, transfer)) = state.mls_attachment_transfers.iter().next() else {
                 return Task::none();
             };
+            if state.active_peer_device != Some(transfer.peer_device) {
+                state.mls_status =
+                    "Reconecte ao dispositivo que confirmou a oferta antes de reenviar o anexo."
+                        .into();
+                return Task::none();
+            }
             let Some(commands) = state.peer_session_commands.clone() else {
                 state.mls_status = "Reconecte o peer antes de reenviar o anexo.".into();
                 return Task::none();
@@ -5645,46 +5730,9 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             match result {
                 Ok(()) => {
                     state.mls_status = format!(
-                        "Peer confirmou que reteve o evento MLS {}.",
+                        "Peer confirmou o evento MLS {} e os dados associados.",
                         hex_encode_bytes(&event_id[..4])
                     );
-                    if let Some(attachment) = state.mls_pending_attachment_blobs.remove(&event_id) {
-                        state.mls_attachment_transfers.insert(
-                            request_id,
-                            PendingMlsAttachmentTransfer {
-                                event_id,
-                                attachment,
-                            },
-                        );
-                        if let Some(commands) = state.peer_session_commands.clone() {
-                            match commands.try_send(peer::PeerCommand::SendAttachmentBlob {
-                                request_id,
-                                group_id: attachment.group_id,
-                                transfer_id: attachment.transfer_id,
-                                ciphertext_hash: attachment.ciphertext_hash,
-                            }) {
-                                Ok(()) => {
-                                    state.mls_status =
-                                        "ACK MLS recebido; enviando ciphertext do anexo…".into();
-                                }
-                                Err(error) => {
-                                    state
-                                        .mls_pending_attachment_blobs
-                                        .insert(event_id, attachment);
-                                    state.mls_attachment_transfers.remove(&request_id);
-                                    state.mls_status = format!(
-                                        "Evento MLS entregue, mas o stream do anexo não iniciou: {error}"
-                                    );
-                                }
-                            }
-                        } else {
-                            state
-                                .mls_pending_attachment_blobs
-                                .insert(event_id, attachment);
-                            state.mls_status =
-                                "Evento MLS entregue; reconecte para transferir o anexo.".into();
-                        }
-                    }
                 }
                 Err(error) => {
                     state.mls_status =
@@ -7077,6 +7125,19 @@ async fn load_mls_history_task(
         .map_err(|error| format!("MLS history task failed: {error}"))?
 }
 
+fn mls_events_without_attachments(
+    events: &[storage::StoredOutboundEvent],
+) -> (Vec<storage::StoredOutboundEvent>, usize) {
+    let mut copyable = Vec::with_capacity(events.len());
+    for event in events {
+        if event.attachment_transfer.is_none() {
+            copyable.push(event.clone());
+        }
+    }
+    let attachments = events.len() - copyable.len();
+    (copyable, attachments)
+}
+
 async fn load_pending_mls_proposals_task(
     group_id: Vec<u8>,
 ) -> Result<Vec<storage::StoredMlsProposal>, String> {
@@ -7383,28 +7444,35 @@ async fn fanout_mls_events_task(
         let Some(route) = route_by_device.get(&peer_device) else {
             let pending = load_all_mls_events_for_peer_task(group_id.clone(), peer_device).await?;
             if !pending.is_empty() {
-                let (held, failure) = fanout_mls_copies_to_helpers(
-                    peer_device,
-                    &pending,
-                    &recipients,
-                    &route_by_device,
-                    relay.clone(),
-                )
-                .await;
+                let (copyable, pending_attachments) = mls_events_without_attachments(&pending);
+                let (held, failure) = if copyable.is_empty() {
+                    (0, None)
+                } else {
+                    fanout_mls_copies_to_helpers(
+                        peer_device,
+                        &copyable,
+                        &recipients,
+                        &route_by_device,
+                        relay.clone(),
+                    )
+                    .await
+                };
                 report.copies_held += held;
                 let mut stored_remote = 0;
                 let mut remote_failure = None;
-                if held < pending.len()
+                if held < copyable.len()
+                    && !copyable.is_empty()
                     && let Some(helper_url) = mailbox_url.as_deref()
                 {
                     (stored_remote, remote_failure) =
-                        upload_mls_copies_to_mailbox(helper_url, peer_device, &pending).await;
+                        upload_mls_copies_to_mailbox(helper_url, peer_device, &copyable).await;
                     report.mailbox_copies_held += stored_remote;
                 }
-                if held + stored_remote < pending.len() {
+                if held + stored_remote < copyable.len() || pending_attachments > 0 {
                     report.failures.push(format!(
-                        "{}… sem rota direta; peer helper: {}; helper Elixir: {}",
+                        "{}… sem rota direta; {} anexo(s) aguardam conexão direta; peer helper: {}; helper Elixir: {}",
                         hex_encode_bytes(&peer_device[..4]),
+                        pending_attachments,
                         failure.unwrap_or_else(|| "não configurado".into()),
                         remote_failure.unwrap_or_else(|| "não configurado".into())
                     ));
@@ -7450,24 +7518,38 @@ async fn fanout_mls_events_task(
             if let Some(error) = outcome.1 {
                 let events_for_copy =
                     load_all_mls_events_for_peer_task(group_id.clone(), peer_device).await?;
-                let (held, copy_failure) = fanout_mls_copies_to_helpers(
-                    peer_device,
-                    &events_for_copy,
-                    &recipients,
-                    &route_by_device,
-                    relay.clone(),
-                )
-                .await;
+                let (copyable, pending_attachments) =
+                    mls_events_without_attachments(&events_for_copy);
+                let (held, copy_failure) = if copyable.is_empty() {
+                    (0, None)
+                } else {
+                    fanout_mls_copies_to_helpers(
+                        peer_device,
+                        &copyable,
+                        &recipients,
+                        &route_by_device,
+                        relay.clone(),
+                    )
+                    .await
+                };
                 report.copies_held += held;
                 let mut stored_remote = 0;
                 let mut remote_failure = None;
-                if held < events_for_copy.len()
+                if held < copyable.len()
+                    && !copyable.is_empty()
                     && let Some(helper_url) = mailbox_url.as_deref()
                 {
                     (stored_remote, remote_failure) =
-                        upload_mls_copies_to_mailbox(helper_url, peer_device, &events_for_copy)
-                            .await;
+                        upload_mls_copies_to_mailbox(helper_url, peer_device, &copyable).await;
                     report.mailbox_copies_held += stored_remote;
+                }
+                if held + stored_remote == 0 && copyable.is_empty() {
+                    report.failures.push(format!(
+                        "{}…: {error}; {} anexo(s) aguardam conexão direta",
+                        hex_encode_bytes(&peer_device[..4]),
+                        pending_attachments
+                    ));
+                    break;
                 }
                 if held + stored_remote == 0 {
                     report.failures.push(format!(
@@ -7479,12 +7561,19 @@ async fn fanout_mls_events_task(
                     break;
                 }
                 if let Some(copy_failure) = copy_failure
-                    && held + stored_remote < events_for_copy.len()
+                    && held + stored_remote < copyable.len()
                 {
                     report.failures.push(format!(
                         "{}…: envio direto falhou; cópia parcial: {copy_failure}; helper Elixir: {}",
                         hex_encode_bytes(&peer_device[..4]),
                         remote_failure.unwrap_or_else(|| "não configurado".to_owned())
+                    ));
+                }
+                if pending_attachments > 0 {
+                    report.failures.push(format!(
+                        "{}…: {} anexo(s) aguardam conexão direta; helpers armazenam apenas eventos MLS",
+                        hex_encode_bytes(&peer_device[..4]),
+                        pending_attachments
                     ));
                 }
                 break;
@@ -7770,6 +7859,15 @@ async fn fanout_mls_events_to_peer(
     }
     for (index, stored) in events_to_send.into_iter().enumerate() {
         let request_id = index as u64 + 1;
+        let event_id = stored.event.event_id;
+        let attachment_group_id: [u8; 16] = match stored.event.group_id.as_slice().try_into() {
+            Ok(group_id) => group_id,
+            Err(_) => {
+                failure = Some("queued MLS attachment event has an invalid group ID".to_owned());
+                break;
+            }
+        };
+        let attachment = stored.attachment_transfer;
         let event = peer::MlsEventEnvelope {
             event_id: stored.event.event_id,
             author_device: stored.event.author_device,
@@ -7839,7 +7937,48 @@ async fn fanout_mls_events_to_peer(
         if !delivered {
             break;
         }
-        let event_id = stored.event.event_id;
+        if let Some((transfer_id, ciphertext_hash)) = attachment {
+            let transfer_request_id = request_id;
+            if let Err(error) = commands
+                .send(peer::PeerCommand::SendAttachmentBlob {
+                    request_id: transfer_request_id,
+                    group_id: attachment_group_id,
+                    transfer_id,
+                    ciphertext_hash,
+                })
+                .await
+            {
+                failure = Some(format!("could not queue attachment ciphertext: {error}"));
+                break;
+            }
+            let transferred = loop {
+                match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+                    Ok(Some(peer::PeerEvent::AttachmentBlobSent {
+                        request_id: ack,
+                        result,
+                    })) if ack == transfer_request_id => break result,
+                    Ok(Some(peer::PeerEvent::Disconnected { reason })) => {
+                        break Err(format!("peer disconnected during attachment: {reason}"));
+                    }
+                    Ok(Some(peer::PeerEvent::Connected { .. }))
+                    | Ok(Some(peer::PeerEvent::AttachmentBlobReceived { .. }))
+                    | Ok(Some(peer::PeerEvent::DelegatedMlsCopiesRequested { .. })) => continue,
+                    Ok(Some(other)) => {
+                        break Err(format!(
+                            "unexpected event during attachment transfer: {other:?}"
+                        ));
+                    }
+                    Ok(None) => break Err("session ended before attachment ACK".to_owned()),
+                    Err(_) => {
+                        break Err("timed out waiting for recipient attachment ACK".to_owned());
+                    }
+                }
+            };
+            if let Err(error) = transferred {
+                failure = Some(error);
+                break;
+            }
+        }
         if let Err(error) = tokio::task::spawn_blocking(move || {
             storage::mark_mls_event_delivered_to_peer(event_id, peer_device)
         })
@@ -8297,6 +8436,8 @@ fn apply_peer_event(state: &mut Slouching, event: peer::PeerEvent) {
             state.peer_session_commands = None;
             state.peer_listener_handle = None;
             state.active_peer_device = None;
+            state.mls_pending_events.clear();
+            state.mls_pending_attachment_blobs.clear();
             if !state.peer_pending_sends.is_empty() {
                 state.peer_pending_sends.clear();
                 state.peer_send_status = PeerSendStatus::Failed(
@@ -8786,6 +8927,7 @@ mod tests {
             7,
             PendingMlsAttachmentTransfer {
                 event_id: [0x44; 16],
+                peer_device: [0x55; 32],
                 attachment,
             },
         );

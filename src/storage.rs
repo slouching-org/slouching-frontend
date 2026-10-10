@@ -30,7 +30,8 @@ const KEY_NAME: &str = "local-profile-database-v1";
 const IDENTITY_KEY_NAME: &str = "device-signing-ed25519-v1";
 const PROFILE_DB: &str = "profile.sqlite3";
 const PROFILE_DB_KEY_LEN: usize = 32;
-const PROFILE_SCHEMA_VERSION: u32 = 26;
+const PROFILE_SCHEMA_VERSION: u32 = 27;
+type AttachmentTransfer = ([u8; 16], [u8; 32]);
 const MAX_DIRECT_HISTORY_PER_PEER: i64 = 1000;
 const MAX_MLS_HISTORY_PER_GROUP: i64 = 1000;
 const MAX_DELEGATED_COPY_BYTES: usize = 32 * 1024;
@@ -58,7 +59,7 @@ type StoredInboundEnvelope = (
     Vec<u8>,
 );
 type StoredPriorMlsCommit = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
-type StoredPriorFileAttachment = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+type StoredPriorFileAttachment = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>);
 type StoredDelegatedCopyEnvelope = (
     Vec<u8>,
     Vec<u8>,
@@ -154,6 +155,7 @@ pub struct StoredOutboundEvent {
     pub sequence: i64,
     pub event: EncryptedEvent,
     pub state: OutboundDeliveryState,
+    pub attachment_transfer: Option<AttachmentTransfer>,
 }
 
 #[derive(Debug, Clone)]
@@ -379,6 +381,7 @@ pub fn save_file_attachment(
         author_device,
         ciphertext_hash,
         offer,
+        None,
     )
 }
 
@@ -404,6 +407,7 @@ fn save_file_attachment_in(
     author_device: [u8; 32],
     ciphertext_hash: [u8; 32],
     offer: &FileOffer,
+    event_id: Option<[u8; 16]>,
 ) -> Result<(), String> {
     offer.encode()?;
     let (member_devices, group_epoch) = load_mls_group_member_devices_in(connection, &group_id)?;
@@ -433,6 +437,7 @@ fn save_file_attachment_in(
         author_device,
         ciphertext_hash,
         offer,
+        event_id,
     )?;
     transaction
         .commit()
@@ -445,23 +450,46 @@ fn insert_file_attachment_in_transaction(
     author_device: [u8; 32],
     ciphertext_hash: [u8; 32],
     offer: &FileOffer,
+    event_id: Option<[u8; 16]>,
 ) -> Result<(), String> {
     let encoded_offer = offer.encode()?;
     let prior: Option<StoredPriorFileAttachment> = connection
         .query_row(
-            "SELECT group_id, author_device, ciphertext_hash, offer FROM local_file_attachments
+            "SELECT group_id, author_device, ciphertext_hash, offer, event_id FROM local_file_attachments
              WHERE transfer_id = ?1",
             params![offer.transfer_id.as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()
         .map_err(|error| format!("could not check duplicate attachment: {error}"))?;
-    if let Some((prior_group, prior_author, prior_hash, prior_offer)) = prior {
+    if let Some((prior_group, prior_author, prior_hash, prior_offer, prior_event_id)) = prior {
         if prior_group == group_id
             && prior_author == author_device
             && prior_hash == ciphertext_hash
             && prior_offer == encoded_offer
         {
+            if prior_event_id.is_none() && event_id.is_some() {
+                connection
+                    .execute(
+                        "UPDATE local_file_attachments SET event_id = ?1 WHERE transfer_id = ?2",
+                        params![event_id.map(|id| id.to_vec()), offer.transfer_id.as_slice()],
+                    )
+                    .map_err(|error| {
+                        format!("could not link attachment to its MLS event: {error}")
+                    })?;
+            } else if prior_event_id.as_deref() != event_id.as_ref().map(|id| id.as_slice())
+                && event_id.is_some()
+            {
+                return Err("file transfer ID is already linked to another MLS event".to_owned());
+            }
             return Ok(());
         }
         return Err("file transfer ID is already bound to another attachment".to_owned());
@@ -481,8 +509,8 @@ fn insert_file_attachment_in_transaction(
     connection
         .execute(
             "INSERT INTO local_file_attachments
-                 (transfer_id, group_id, author_device, ciphertext_hash, offer, total_bytes, created_at_unix)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (transfer_id, group_id, author_device, ciphertext_hash, offer, total_bytes, created_at_unix, event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 offer.transfer_id.as_slice(),
                 group_id.as_slice(),
@@ -490,7 +518,8 @@ fn insert_file_attachment_in_transaction(
                 ciphertext_hash.as_slice(),
                 encoded_offer,
                 incoming_bytes,
-                unix_time_now()?
+                unix_time_now()?,
+                event_id.map(|id| id.to_vec())
             ],
         )
         .map_err(|error| format!("could not save encrypted file attachment: {error}"))?;
@@ -2240,6 +2269,7 @@ fn create_mls_application_event_in(
                 event.author_device,
                 attachment.ciphertext_hash,
                 &attachment.offer,
+                Some(event.event_id),
             )?;
         }
         let digest = blake3::hash(&event.ciphertext);
@@ -2764,6 +2794,7 @@ fn process_inbound_mls_application_event_at(
                 sender_device,
                 attachment.ciphertext_hash,
                 &attachment.offer,
+                Some(event.event_id),
             )?;
         }
         connection
@@ -3137,7 +3168,9 @@ pub fn list_outbound_events(
     let mut statement = connection
         .prepare(
             "SELECT e.rowid, e.event_id, e.author_device, e.group_id, e.epoch, e.checkpoint,
-                    e.expires_at_unix, e.ciphertext, e.delivery_state
+                    e.expires_at_unix, e.ciphertext, e.delivery_state,
+                    (SELECT transfer_id FROM local_file_attachments a WHERE a.event_id=e.event_id),
+                    (SELECT ciphertext_hash FROM local_file_attachments a WHERE a.event_id=e.event_id)
              FROM local_events e
              LEFT JOIN local_mls_groups g ON g.group_id = e.group_id
              WHERE e.direction = 'outbound' AND e.rowid > ?1
@@ -3157,6 +3190,8 @@ pub fn list_outbound_events(
                 row.get::<_, i64>(6)?,
                 row.get::<_, Vec<u8>>(7)?,
                 row.get::<_, String>(8)?,
+                row.get::<_, Option<Vec<u8>>>(9)?,
+                row.get::<_, Option<Vec<u8>>>(10)?,
             ))
         })
         .map_err(|error| format!("could not query local outbox: {error}"))?;
@@ -3172,6 +3207,8 @@ pub fn list_outbound_events(
             expires_at_unix,
             ciphertext,
             state,
+            transfer_id,
+            ciphertext_hash,
         ) = row.map_err(|error| format!("could not read local outbox event: {error}"))?;
         events.push(StoredOutboundEvent {
             sequence,
@@ -3186,6 +3223,7 @@ pub fn list_outbound_events(
                 ciphertext,
             },
             state: OutboundDeliveryState::try_from(state.as_str())?,
+            attachment_transfer: attachment_transfer_from_columns(transfer_id, ciphertext_hash)?,
         });
     }
     Ok(events)
@@ -3263,7 +3301,9 @@ fn list_queued_mls_events_for_peer_in(
     let mut statement = connection
         .prepare(
             "SELECT e.rowid, e.event_id, e.author_device, e.group_id, e.epoch,
-                    e.checkpoint, e.expires_at_unix, e.ciphertext, e.delivery_state
+                    e.checkpoint, e.expires_at_unix, e.ciphertext, e.delivery_state,
+                    (SELECT transfer_id FROM local_file_attachments a WHERE a.event_id=e.event_id),
+                    (SELECT ciphertext_hash FROM local_file_attachments a WHERE a.event_id=e.event_id)
              FROM local_events e
              JOIN local_mls_event_recipients r ON r.event_id = e.event_id
              JOIN local_mls_groups g ON g.group_id = e.group_id
@@ -3287,13 +3327,26 @@ fn list_queued_mls_events_for_peer_in(
                     row.get::<_, i64>(6)?,
                     row.get::<_, Vec<u8>>(7)?,
                     row.get::<_, String>(8)?,
+                    row.get::<_, Option<Vec<u8>>>(9)?,
+                    row.get::<_, Option<Vec<u8>>>(10)?,
                 ))
             },
         )
         .map_err(|error| format!("could not query peer MLS events: {error}"))?;
     rows.map(|row| {
-        let (sequence, event_id, author, group, epoch, checkpoint, expires, ciphertext, state) =
-            row.map_err(|error| format!("could not read peer MLS event: {error}"))?;
+        let (
+            sequence,
+            event_id,
+            author,
+            group,
+            epoch,
+            checkpoint,
+            expires,
+            ciphertext,
+            state,
+            transfer_id,
+            ciphertext_hash,
+        ) = row.map_err(|error| format!("could not read peer MLS event: {error}"))?;
         Ok(StoredOutboundEvent {
             sequence,
             event: EncryptedEvent {
@@ -3307,9 +3360,24 @@ fn list_queued_mls_events_for_peer_in(
                 ciphertext,
             },
             state: OutboundDeliveryState::try_from(state.as_str())?,
+            attachment_transfer: attachment_transfer_from_columns(transfer_id, ciphertext_hash)?,
         })
     })
     .collect()
+}
+
+fn attachment_transfer_from_columns(
+    transfer_id: Option<Vec<u8>>,
+    ciphertext_hash: Option<Vec<u8>>,
+) -> Result<Option<AttachmentTransfer>, String> {
+    match (transfer_id, ciphertext_hash) {
+        (None, None) => Ok(None),
+        (Some(transfer_id), Some(ciphertext_hash)) => Ok(Some((
+            fixed_bytes(transfer_id, "attachment transfer ID")?,
+            fixed_bytes(ciphertext_hash, "attachment ciphertext hash")?,
+        ))),
+        _ => Err("saved MLS attachment metadata is incomplete".to_owned()),
+    }
 }
 
 pub fn mark_mls_event_delivered_to_peer(
@@ -6283,6 +6351,72 @@ fn open_database(path: &Path, key: &[u8; PROFILE_DB_KEY_LEN]) -> Result<Connecti
             )
             .map_err(|error| format!("could not add local verified contact names: {error}"))?;
     }
+    if version < 27 {
+        let has_event_id: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('local_file_attachments') WHERE name='event_id')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("could not inspect attachment schema: {error}"))?;
+        if !has_event_id {
+            transaction
+                .execute_batch(
+                    "ALTER TABLE local_file_attachments
+                         ADD COLUMN event_id BLOB NULL CHECK (event_id IS NULL OR length(event_id) = 16);",
+                )
+                .map_err(|error| format!("could not add attachment event link column: {error}"))?;
+        }
+        transaction
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS local_file_attachments_by_event
+                     ON local_file_attachments (event_id) WHERE event_id IS NOT NULL;
+                 PRAGMA user_version = 27;",
+            )
+            .map_err(|error| format!("could not index attachment event links: {error}"))?;
+        let mut statement = transaction
+            .prepare(
+                "SELECT m.event_id, m.text, e.group_id, e.author_device
+                 FROM local_mls_messages m JOIN local_events e ON e.event_id = m.event_id
+                 WHERE m.direction IN ('sent', 'received')",
+            )
+            .map_err(|error| format!("could not prepare attachment link migration: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .map_err(|error| format!("could not query attachment link migration: {error}"))?;
+        let mut links = Vec::new();
+        for row in rows {
+            let (event_id, text, group_id, author) =
+                row.map_err(|error| format!("could not read attachment link migration: {error}"))?;
+            if let Ok(Some(attachment)) = FileAttachmentOffer::decode_mls_text(&text) {
+                links.push((event_id, attachment, group_id, author));
+            }
+        }
+        drop(statement);
+        for (event_id, attachment, group_id, author) in links {
+            transaction
+                .execute(
+                    "UPDATE local_file_attachments SET event_id = ?1
+                     WHERE transfer_id = ?2 AND group_id = ?3 AND author_device = ?4
+                       AND ciphertext_hash = ?5 AND event_id IS NULL",
+                    params![
+                        event_id,
+                        attachment.offer.transfer_id.as_slice(),
+                        group_id,
+                        author,
+                        attachment.ciphertext_hash.as_slice()
+                    ],
+                )
+                .map_err(|error| format!("could not backfill attachment event link: {error}"))?;
+        }
+    }
     transaction
         .commit()
         .map_err(|error| format!("could not finish local profile migration: {error}"))?;
@@ -8538,6 +8672,20 @@ mod tests {
             &sender_identity,
         )
         .expect("sender should encrypt the attachment reference in MLS");
+        let attachment_outbox = list_queued_mls_events_for_peer_in(
+            &sender,
+            &group.group_id,
+            receiver_identity.verifying_key().to_bytes(),
+            100,
+        )
+        .expect("attachment event should remain in the durable outbox")
+        .into_iter()
+        .find(|stored| stored.event.event_id == attachment_event.event.event_id)
+        .expect("attachment event should be listed");
+        assert_eq!(
+            attachment_outbox.attachment_transfer,
+            Some(([0xa1; 16], [0xc3; 32]))
+        );
         let sent_attachments =
             list_file_attachments_in(&sender, group.group_id.as_slice().try_into().unwrap())
                 .expect("sender should save its attachment manifest with the MLS outbox event");
@@ -8917,12 +9065,12 @@ mod tests {
                 .expect("bound member keys should be derived from MLS state"),
             vec![author]
         );
-        save_file_attachment_in(&mut connection, group_id, author, digest, &offer)
+        save_file_attachment_in(&mut connection, group_id, author, digest, &offer, None)
             .expect("attachment manifest should save");
-        save_file_attachment_in(&mut connection, group_id, author, digest, &offer)
+        save_file_attachment_in(&mut connection, group_id, author, digest, &offer, None)
             .expect("identical retries should be idempotent");
         assert!(
-            save_file_attachment_in(&mut connection, group_id, author, [0x64; 32], &offer)
+            save_file_attachment_in(&mut connection, group_id, author, [0x64; 32], &offer, None)
                 .expect_err("a transfer ID cannot be rebound to a different digest")
                 .contains("already bound")
         );
@@ -8936,7 +9084,8 @@ mod tests {
                 group_id,
                 [0xde; 32],
                 [0x65; 32],
-                &nonmember_offer
+                &nonmember_offer,
+                None
             )
             .expect_err("nonmembers cannot author group attachments")
             .contains("not a member")
@@ -8974,16 +9123,30 @@ mod tests {
                 "large.bin".to_owned(),
             )
             .expect("maximum-sized file offer should be valid");
-            save_file_attachment_in(&mut reopened, group_id, author, [0x66; 32], &large_offer)
-                .expect("two maximum-sized files should fit the 200 MiB quota");
+            save_file_attachment_in(
+                &mut reopened,
+                group_id,
+                author,
+                [0x66; 32],
+                &large_offer,
+                None,
+            )
+            .expect("two maximum-sized files should fit the 200 MiB quota");
         }
         let excess_secrets = FileTransferSecrets::from_parts([0x88; 16], [0xb6; 32]);
         let excess_offer = FileOffer::from_secrets(&excess_secrets, 1, "one-byte.bin".to_owned())
             .expect("small excess offer should be valid");
         assert!(
-            save_file_attachment_in(&mut reopened, group_id, author, [0x67; 32], &excess_offer)
-                .expect_err("the 200 MiB local quota should prevent unbounded storage")
-                .contains("200 MiB")
+            save_file_attachment_in(
+                &mut reopened,
+                group_id,
+                author,
+                [0x67; 32],
+                &excess_offer,
+                None
+            )
+            .expect_err("the 200 MiB local quota should prevent unbounded storage")
+            .contains("200 MiB")
         );
         reopened
             .execute(

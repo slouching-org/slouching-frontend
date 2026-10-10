@@ -29,6 +29,7 @@ const FRAME_MLS_DELEGATED_COPY: u8 = 12;
 const FRAME_MLS_COPY_FETCH: u8 = 13;
 const FRAME_CALL_SIGNAL: u8 = 14;
 const ATTACHMENT_STREAM_MAGIC: &[u8; 4] = b"SLAB";
+const ATTACHMENT_ACK_MAGIC: &[u8; 4] = b"SLAA";
 const ATTACHMENT_STREAM_VERSION: u16 = 1;
 const ATTACHMENT_STREAM_HEADER_BYTES: usize = 4 + 2 + 16 + 16 + 32 + 8;
 const MLS_EVENT_MAGIC: &[u8; 4] = b"SLME";
@@ -431,46 +432,53 @@ pub async fn send_attachment_blob(
         .total_bytes
         .checked_add(u64::from(offer.chunk_count).saturating_mul(16))
         .ok_or_else(|| "encrypted attachment size overflowed".to_owned())?;
-    let mut stream = connection
-        .open_uni()
+    let (mut send, mut receive) = connection
+        .open_bi()
         .await
         .map_err(|error| format!("could not open attachment QUIC stream: {error}"))?;
-    stream
-        .write_all(ATTACHMENT_STREAM_MAGIC)
+    send.write_all(ATTACHMENT_STREAM_MAGIC)
         .await
         .map_err(|error| format!("could not write attachment stream marker: {error}"))?;
-    stream
-        .write_all(&ATTACHMENT_STREAM_VERSION.to_be_bytes())
+    send.write_all(&ATTACHMENT_STREAM_VERSION.to_be_bytes())
         .await
         .map_err(|error| format!("could not write attachment stream version: {error}"))?;
-    stream
-        .write_all(&group_id)
+    send.write_all(&group_id)
         .await
         .map_err(|error| format!("could not write attachment group ID: {error}"))?;
-    stream
-        .write_all(&offer.transfer_id)
+    send.write_all(&offer.transfer_id)
         .await
         .map_err(|error| format!("could not write attachment transfer ID: {error}"))?;
-    stream
-        .write_all(&ciphertext_hash)
+    send.write_all(&ciphertext_hash)
         .await
         .map_err(|error| format!("could not write attachment ciphertext hash: {error}"))?;
-    stream
-        .write_all(&ciphertext_bytes.to_be_bytes())
+    send.write_all(&ciphertext_bytes.to_be_bytes())
         .await
         .map_err(|error| format!("could not write attachment ciphertext size: {error}"))?;
     let mut reader = store
         .ciphertext_reader(ciphertext_hash)
         .take(ciphertext_bytes);
-    let transferred = tokio::io::copy(&mut reader, &mut stream)
+    let transferred = tokio::io::copy(&mut reader, &mut send)
         .await
         .map_err(|error| format!("could not stream encrypted attachment: {error}"))?;
     if transferred != ciphertext_bytes {
         return Err("stored encrypted attachment is shorter than its MLS offer".to_owned());
     }
-    stream
-        .finish()
-        .map_err(|error| format!("could not finish attachment QUIC stream: {error}"))
+    send.finish()
+        .map_err(|error| format!("could not finish attachment QUIC stream: {error}"))?;
+    let mut acknowledgement = [0_u8; 70];
+    receive
+        .read_exact(&mut acknowledgement)
+        .await
+        .map_err(|error| format!("could not receive attachment storage ACK: {error}"))?;
+    if &acknowledgement[..4] != ATTACHMENT_ACK_MAGIC
+        || u16::from_be_bytes([acknowledgement[4], acknowledgement[5]]) != ATTACHMENT_STREAM_VERSION
+        || acknowledgement[6..22] != group_id
+        || acknowledgement[22..38] != offer.transfer_id
+        || acknowledgement[38..70] != ciphertext_hash
+    {
+        return Err("attachment storage ACK does not match the offered ciphertext".to_owned());
+    }
+    Ok(())
 }
 
 /// Receive and persist one ciphertext blob. `offer` and `ciphertext_hash`
@@ -485,8 +493,8 @@ pub async fn receive_attachment_blob(
     expected_hash: [u8; 32],
 ) -> Result<(), String> {
     offer.encode()?;
-    let mut stream = connection
-        .accept_uni()
+    let (mut send, mut stream) = connection
+        .accept_bi()
         .await
         .map_err(|error| format!("could not accept attachment QUIC stream: {error}"))?;
     let header = read_attachment_blob_header(&mut stream).await?;
@@ -503,17 +511,26 @@ pub async fn receive_attachment_blob(
     }
     store
         .import_ciphertext_stream(stream, offer, expected_hash)
-        .await
+        .await?;
+    write_attachment_ack(
+        &mut send,
+        expected_group_id,
+        offer.transfer_id,
+        expected_hash,
+    )
+    .await
 }
 
 /// Receive a stream only when the local MLS manifest exists and the connected
 /// device is a verified member of that exact group.
-async fn receive_authorized_attachment_stream<R>(
+async fn receive_authorized_attachment_stream<R, W>(
+    mut send: W,
     mut stream: R,
     peer_id: EndpointId,
 ) -> Result<([u8; 16], [u8; 16]), String>
 where
     R: AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let header = read_attachment_blob_header(&mut stream).await?;
     let offer = load_authorized_attachment(
@@ -535,7 +552,49 @@ where
         .import_ciphertext_stream(stream, &offer, header.ciphertext_hash)
         .await?;
     store.shutdown().await?;
+    write_attachment_ack(
+        &mut send,
+        header.group_id,
+        header.transfer_id,
+        header.ciphertext_hash,
+    )
+    .await?;
     Ok((header.group_id, header.transfer_id))
+}
+
+async fn write_attachment_ack<W>(
+    writer: &mut W,
+    group_id: [u8; 16],
+    transfer_id: [u8; 16],
+    ciphertext_hash: [u8; 32],
+) -> Result<(), String>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    writer
+        .write_all(ATTACHMENT_ACK_MAGIC)
+        .await
+        .map_err(|error| format!("could not write attachment storage ACK marker: {error}"))?;
+    writer
+        .write_all(&ATTACHMENT_STREAM_VERSION.to_be_bytes())
+        .await
+        .map_err(|error| format!("could not write attachment storage ACK version: {error}"))?;
+    writer
+        .write_all(&group_id)
+        .await
+        .map_err(|error| format!("could not write attachment storage ACK group: {error}"))?;
+    writer
+        .write_all(&transfer_id)
+        .await
+        .map_err(|error| format!("could not write attachment storage ACK transfer: {error}"))?;
+    writer
+        .write_all(&ciphertext_hash)
+        .await
+        .map_err(|error| format!("could not write attachment storage ACK digest: {error}"))?;
+    writer
+        .shutdown()
+        .await
+        .map_err(|error| format!("could not finish attachment storage ACK: {error}"))
 }
 
 async fn load_authorized_attachment(
@@ -804,11 +863,16 @@ impl DirectPeerSession {
             let attachment_events = side_event_sender.clone();
             let _attachment_reader = tokio::spawn(async move {
                 loop {
-                    let stream = match attachment_connection.accept_uni().await {
+                    let stream = match attachment_connection.accept_bi().await {
                         Ok(stream) => stream,
                         Err(_) => break,
                     };
-                    let result = receive_authorized_attachment_stream(stream, attachment_peer).await;
+                    let result = receive_authorized_attachment_stream(
+                        stream.0,
+                        stream.1,
+                        attachment_peer,
+                    )
+                    .await;
                     let event = match result {
                         Ok((group_id, transfer_id)) => PeerEvent::AttachmentBlobReceived {
                             group_id,

@@ -41,9 +41,10 @@ user-selected path; publication waits for AEAD and ciphertext-digest checks and
 never replaces an existing file. On Unix, plaintext staging files use mode
 0600. Encrypted blobs can be fetched over Iroh QUIC;
 the provider handler requires explicit peer authorization. A separate
-unidirectional QUIC stream helper transfers ciphertext against an expected
-group-bound offer, with a two-endpoint test that saves the received file. The
-The SQLCipher profile stores and reloads each group-bound offer, content key,
+bidirectional QUIC stream transfers ciphertext against an expected group-bound
+offer; the receiver confirms only after validating and persisting the blob. A
+two-endpoint test saves the received file. The SQLCipher profile stores and
+reloads each group-bound offer, content key,
 sender key, and ciphertext digest. Storage checks the author against active
 MLS membership and verified device bindings, rejects quarantined groups and
 conflicting transfer IDs, and rechecks the group epoch before inserting. A
@@ -58,10 +59,14 @@ The MLS composer imports and encrypts a selected file, sends its offer as an
 MLS application event, then starts a separate QUIC ciphertext stream after the
 receiver ACKs that event. The receiver checks the connected device's MLS group
 membership and exact stored offer before importing the bounded ciphertext
-stream. History renders attachment cards; **Salvar arquivo** decrypts to a
-user-selected path and publishes only after digest validation. A failed
-outbound stream can be retried from the MLS screen while the app remains open.
-Two-endpoint tests cover stream transfer and save, but the full
+stream, then confirms storage on that same stream. Group fan-out sends each
+attachment over a direct member route and keeps that recipient queued until
+the blob ACK. The outbox and local encrypted blob store allow retries after an
+app restart. Helpers and the Elixir mailbox carry MLS events but not attachment
+blobs, so an attachment remains queued until its recipient has a direct route.
+History renders attachment cards; **Salvar arquivo** decrypts to a user-selected
+path and publishes only after digest validation. Two-endpoint tests cover
+stream transfer and save, but the full
 database-authorized desktop flow and cross-machine file transfer still need
 runtime validation. The pinned iroh-blobs 0.103.1 release is marked by its
 maintainers as not production quality, so this path remains experimental.
