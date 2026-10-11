@@ -38,6 +38,7 @@ const MAX_DELEGATED_COPY_BYTES: usize = 32 * 1024;
 const MAX_DELEGATED_STORAGE_BYTES: i64 = 64 * 1024 * 1024;
 const MAX_DELEGATED_STORAGE_EVENTS: i64 = 4096;
 const MAX_DELEGATED_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
+static LOCAL_DATABASE_OPEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const MAX_DELEGATED_CHECKPOINT_BYTES: usize = 16 * 1024;
 const MAX_LOCAL_ATTACHMENT_BYTES: i64 = 200 * 1024 * 1024;
 type StoredEventEnvelope = (
@@ -5887,6 +5888,12 @@ fn secret_key(bytes: Vec<u8>) -> Result<Zeroizing<[u8; PROFILE_DB_KEY_LEN]>, Str
 }
 
 fn open_local_database() -> Result<Connection, String> {
+    // The first callers can arrive concurrently during application startup.
+    // Serialize key creation with database initialization so another caller
+    // cannot replace the key while the first connection is encrypting the DB.
+    let _open_lock = LOCAL_DATABASE_OPEN_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let entry = key_entry()?;
     let key = match entry.get_secret() {
         Ok(bytes) => secret_key(bytes)?,

@@ -328,9 +328,6 @@ fn screen(state: &Slouching, l: Layout) -> Element<'_, Message> {
     if state.texture {
         layers.push(canvas(Fx).width(Fill).height(Fill).into());
     }
-    if state.show_gallery {
-        layers.push(widget::opaque(gallery(l)));
-    }
     if let Some(qr) = &state.peer_invite_qr {
         layers.push(
             container(space())
@@ -380,7 +377,7 @@ fn screen(state: &Slouching, l: Layout) -> Element<'_, Message> {
             l.place(
                 l.panel(
                     column![
-                        l.title("Ainda é uma prévia", 25.0),
+                        l.title("Aviso", 25.0),
                         l.label(note, 13.0, PAPER),
                         l.control("close", "Entendi", Some(Message::DismissNote), true)
                     ]
@@ -416,17 +413,7 @@ fn header(state: &Slouching, l: Layout) -> Element<'_, Message> {
     let left = row![brand, l.label(page, 12.0, MUTED)]
         .spacing(l.px(18.0))
         .align_y(iced::Center);
-    let mode = if state.screen == Screen::Chat {
-        "P2P · LAN/VPN"
-    } else {
-        "PRÉVIA VISUAL"
-    };
     let right = row![
-        l.label(mode, 10.0, GOLD),
-        button(l.label("Telas", 11.0, PAPER))
-            .on_press(Message::ToggleGallery)
-            .padding(l.px(10.0))
-            .style(|_, s| button_style(s, false, false)),
         l.icon_button("settings", Message::Navigate(Screen::Settings)),
         l.icon_button("chat", Message::Navigate(Screen::Chat))
     ]
@@ -439,26 +426,6 @@ fn header(state: &Slouching, l: Layout) -> Element<'_, Message> {
         1232.0,
         46.0,
     )
-}
-fn gallery(l: Layout) -> Element<'static, Message> {
-    let mut choices = column![
-        row![
-            l.label("DESIGN BOARD", 12.0, GOLD),
-            space().width(Fill),
-            l.icon_button("close", Message::ToggleGallery)
-        ]
-        .align_y(iced::Center)
-    ]
-    .spacing(l.px(7.0));
-    for s in Screen::ALL {
-        choices = choices.push(l.nav(s.label(), Message::Navigate(s), false));
-    }
-    choices = choices.push(l.label(
-        "12 telas · chamadas de áudio em desenvolvimento\nChat texto · LAN/VPN manual",
-        11.0,
-        MUTED,
-    ));
-    l.place(l.panel(choices), 890.0, 65.0, 366.0, 700.0)
 }
 fn home(state: &Slouching, l: Layout) -> Element<'_, Message> {
     let title = l.place(
@@ -498,11 +465,7 @@ fn home(state: &Slouching, l: Layout) -> Element<'_, Message> {
         ]
         .spacing(l.px(8.0))
         .align_y(iced::Center),
-        l.label(
-            "Explore a prévia · áudio direto em desenvolvimento",
-            10.0,
-            MUTED
-        )
+        l.label("Comunicação privada entre dispositivos", 10.0, MUTED)
     ]
     .spacing(l.px(14.0));
     let features = row![
@@ -588,26 +551,26 @@ fn familiar(state: &Slouching, l: Layout) -> Element<'_, Message> {
         .style(move |_, s| button_style(s, has_custom_image, false)),
     );
     let progress = row![rule(GOLD, 3.0), rule(GOLD, 3.0), rule(LINE, 3.0)].spacing(l.px(6.0));
-    let (profile_title, profile_detail) = match &state.profile_status {
+    let (profile_title, profile_detail): (&str, String) = match &state.profile_status {
         crate::ProfileStatus::Loading => (
             "Carregando perfil local",
-            "A chave é consultada no cofre do sistema.",
+            "A chave é consultada no cofre do sistema.".to_owned(),
         ),
         crate::ProfileStatus::Empty => (
             "Perfil local ainda não salvo",
-            "O perfil fica em SQLite cifrado; a chave fica no cofre do sistema.",
+            "O perfil fica em SQLite cifrado; a chave fica no cofre do sistema.".to_owned(),
         ),
         crate::ProfileStatus::Saved => (
             "Perfil salvo localmente · cifrado",
-            "Nome e familiar não são uma identidade criptográfica.",
+            "Nome e familiar não são uma identidade criptográfica.".to_owned(),
         ),
         crate::ProfileStatus::Saving => (
             "Salvando perfil local...",
-            "A chave e os dados ficam neste dispositivo.",
+            "A chave e os dados ficam neste dispositivo.".to_owned(),
         ),
         crate::ProfileStatus::Failed => (
             "Cofre ou banco local indisponível",
-            "Ative o cofre de senhas do sistema e tente de novo. Não salvamos em texto puro.",
+            state.profile_storage_error.as_deref().unwrap_or("Ative o cofre de senhas do sistema e tente de novo. Não salvamos em texto puro.").to_owned(),
         ),
     };
     let (identity_title, identity_detail) = match &state.identity_status {
@@ -632,7 +595,12 @@ fn familiar(state: &Slouching, l: Layout) -> Element<'_, Message> {
         ),
         crate::IdentityStatus::Failed => (
             "Identidade local indisponível",
-            "Não foi possível ler a chave no cofre. Confira o serviço e tente novamente."
+            state
+                .identity_storage_error
+                .as_deref()
+                .unwrap_or(
+                    "Não foi possível ler a chave no cofre. Confira o serviço e tente novamente.",
+                )
                 .to_owned(),
         ),
     };

@@ -254,7 +254,6 @@ struct Slouching {
     name: String,
     familiar: &'static str,
     familiar_image_png: Option<Vec<u8>>,
-    show_gallery: bool,
     settings_tab: u8,
     share_tab: u8,
     screen_sources: Vec<screen_capture::ScreenSource>,
@@ -276,7 +275,9 @@ struct Slouching {
     capture_index: usize,
     capture_once: bool,
     profile_status: ProfileStatus,
+    profile_storage_error: Option<String>,
     identity_status: IdentityStatus,
+    identity_storage_error: Option<String>,
     delegated_mls_storage: Option<storage::DelegatedMlsStorageStatus>,
     delegated_mls_storage_error: Option<String>,
     delivery_mailbox_config: storage::DeliveryMailboxConfig,
@@ -482,7 +483,6 @@ impl Default for Slouching {
             name: String::new(),
             familiar: "Sapo Mago",
             familiar_image_png: None,
-            show_gallery: false,
             settings_tab: 1,
             share_tab: 0,
             screen_sources: Vec::new(),
@@ -504,7 +504,9 @@ impl Default for Slouching {
             capture_index: 0,
             capture_once: false,
             profile_status: ProfileStatus::Loading,
+            profile_storage_error: None,
             identity_status: IdentityStatus::Loading,
+            identity_storage_error: None,
             delegated_mls_storage: None,
             delegated_mls_storage_error: None,
             delivery_mailbox_config: storage::DeliveryMailboxConfig::default(),
@@ -641,7 +643,6 @@ enum Message {
     ChooseFamiliar(&'static str),
     ChooseCustomFamiliar,
     CustomFamiliarImageLoaded(Result<Option<Vec<u8>>, String>),
-    ToggleGallery,
     SettingsTab(u8),
     RefreshAudioDevices,
     AudioDevicesLoaded(Result<audio::AudioDevices, String>),
@@ -1261,7 +1262,6 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 }
             }
             state.screen = screen;
-            state.show_gallery = false;
             state.note = None;
             if screen == Screen::Share {
                 state.screen_capture_status = "Buscando telas disponíveis…".to_owned();
@@ -1273,7 +1273,6 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             stop_audio_monitor(state);
             state.settings_tab = 2;
             state.screen = Screen::Settings;
-            state.show_gallery = false;
             state.note = None;
         }
         Message::DiscoverLanPeers => {
@@ -1333,7 +1332,6 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.peer_verification_status =
                 "Informe a chave pública correspondente à rota descoberta.".to_owned();
             state.screen = Screen::Chat;
-            state.show_gallery = false;
             state.note =
                 Some("Rota preenchida. Confira a chave pública do peer antes de conectar.");
         }
@@ -1914,10 +1912,6 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
             state.note =
                 Some("Imagem inválida. Escolha um PNG com até 8 MiB e 4096 × 4096 pixels.");
         }
-        Message::ToggleGallery => {
-            stop_audio_monitor(state);
-            state.show_gallery = !state.show_gallery;
-        }
         Message::SettingsTab(value) => {
             if value != 1 {
                 stop_audio_monitor(state);
@@ -2298,10 +2292,15 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 state.familiar = storage::familiar_label(&profile.familiar);
                 state.familiar_image_png = profile.familiar_image_png;
                 state.profile_status = ProfileStatus::Saved;
+                state.profile_storage_error = None;
             }
-            Ok(None) => state.profile_status = ProfileStatus::Empty,
-            Err(_) => {
+            Ok(None) => {
+                state.profile_status = ProfileStatus::Empty;
+                state.profile_storage_error = None;
+            }
+            Err(error) => {
                 state.profile_status = ProfileStatus::Failed;
+                state.profile_storage_error = Some(error);
             }
         },
         Message::SaveProfile => {
@@ -2320,6 +2319,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 familiar_image_png: state.familiar_image_png.clone(),
             };
             state.profile_status = ProfileStatus::Saving;
+            state.profile_storage_error = None;
             return Task::perform(save_profile_task(profile.clone()), move |result| {
                 Message::ProfileSaved(profile, result)
             });
@@ -2330,33 +2330,45 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 state.familiar = storage::familiar_label(&profile.familiar);
                 state.familiar_image_png = profile.familiar_image_png;
                 state.profile_status = ProfileStatus::Saved;
+                state.profile_storage_error = None;
                 state.note = Some("Perfil salvo no armazenamento local cifrado.");
             }
-            Err(_) => {
+            Err(error) => {
                 state.profile_status = ProfileStatus::Failed;
-                state.note = Some("Não foi possível salvar o perfil local.");
+                state.profile_storage_error = Some(error);
+                state.note = Some("Falha ao salvar. O motivo completo está no status do perfil.");
             }
         },
         Message::IdentityLoaded(result) => match result {
             Ok(Some(public_key)) => {
                 state.identity_status = IdentityStatus::Ready(public_key);
+                state.identity_storage_error = None;
                 return request_peer_history(state);
             }
-            Ok(None) => state.identity_status = IdentityStatus::Missing,
-            Err(_) => state.identity_status = IdentityStatus::Failed,
+            Ok(None) => {
+                state.identity_status = IdentityStatus::Missing;
+                state.identity_storage_error = None;
+            }
+            Err(error) => {
+                state.identity_status = IdentityStatus::Failed;
+                state.identity_storage_error = Some(error);
+            }
         },
         Message::CreateIdentity => {
             state.identity_status = IdentityStatus::Creating;
+            state.identity_storage_error = None;
             return Task::perform(create_identity_task(), Message::IdentityCreated);
         }
         Message::IdentityCreated(result) => match result {
             Ok(public_key) => {
                 state.identity_status = IdentityStatus::Ready(public_key);
+                state.identity_storage_error = None;
                 state.identity_key_copied = false;
                 return request_peer_history(state);
             }
-            Err(_) => {
+            Err(error) => {
                 state.identity_status = IdentityStatus::Failed;
+                state.identity_storage_error = Some(error);
             }
         },
         Message::PairingHelperUrlChanged(value) => state.pairing_helper_url = value,
@@ -2817,7 +2829,6 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 state.peer_address.clear();
             }
             state.screen = Screen::Chat;
-            state.show_gallery = false;
             let task = update(
                 state,
                 Message::PeerPublicKeyChanged(hex_encode_key(&peer_key)),
@@ -9256,7 +9267,6 @@ mod tests {
 
         assert_eq!(state.screen, Screen::Settings);
         assert_eq!(state.settings_tab, 2);
-        assert!(!state.show_gallery);
     }
 
     #[test]
