@@ -58,7 +58,7 @@ fn assets() -> &'static Assets {
             },
             icons: vector! { "settings", "chat", "headphones", "users", "mic", "camera", "refresh",
                 "plus", "key", "close", "check", "screen", "window", "phone", "shield", "file", "pause",
-                "play", "attachment", "arrow", "mic-off", "camera-off" },
+                "play", "attachment", "arrow", "mic-off", "camera-off", "search", "wifi" },
         }
     })
 }

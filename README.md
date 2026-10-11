@@ -100,7 +100,8 @@ Cancel deletes the temporary helper session.
 From the project root, run `./scripts/smoke-pairing-e2e.sh` to start a local
 Elixir helper and exercise inviter and invitee clients with test device
 keys. It also verifies that different codes fail. This test covers the client
-protocol against the live helper, not the rendered GUI or two physical devices.
+protocol against the live helper; the rendered pairing controls are captured,
+while two-physical-device pairing remains unverified.
 
 This is an experimental contact-pairing path. It does not make peers reachable
 across NAT, establish messaging by itself, or replace transport/network setup.
@@ -267,9 +268,10 @@ MLS group**.
 The direct call UI supports one remote peer per device. The experimental SFU
 call UI accepts call MLS groups of two to 16 devices and creates one remote
 audio track per other member. Its live-helper smoke test covers three software
-clients and protected audio forwarding. Call chat and video maintain
-per-member receive state, but their multiparty exchange has not been exercised
-through the live helper. Physical-device and cross-network calls remain
+clients and protected audio forwarding. Call chat and video maintain per-member receive state. The live-helper smoke
+test now sends protected call-chat frames among three software clients using
+fixture SFrame contexts; cross-device MLS exporter interoperability and SFU
+video remain unverified. Physical-device and cross-network calls remain
 unverified; the sample characters in the call artwork are decorative.
 
 1. On one device, open **Chamada**, create a protected call group, then use
@@ -584,27 +586,28 @@ be installed and available in the user session.
 
 ![Native Iced direct chat with explicit listener and VPN address guidance, relay settings, and copy controls for sample LAN and VPN socket addresses; addresses are illustrative and Secret Service is unavailable.](docs/design/runtime/native-vhs/06-chat.png)
 
+![Tela nativa Conexão & rotas com resultado mDNS ilustrativo; a rota descoberta não autentica o peer](docs/design/runtime/native-vhs/04-connecting.png)
+
 ![Actual native Iced home with open scenery and icon-based feature strip, without the frog mage or gnome cutouts](docs/design/runtime/native-vhs/09-home.png)
 
-![Actual 934 × 1000 native Iced identity screen with a signed device invitation QR; device keys and VPN address are capture fixtures](docs/design/runtime/native-vhs/08-verify.png)
+![Tela nativa Iced de identidade com controles SPAKE2; ID e código são fixtures fictícias](docs/design/runtime/native-vhs/08-verify.png)
+
+![Tela nativa Iced de identidade com contatos verificados de demonstração; chaves e rotas são fixtures](docs/design/runtime/native-vhs/08-verify-contacts.png)
 
 ![Actual native Iced peer verification screen after importing a QR, with separate LAN and VPN address choices; all values are capture fixtures](docs/design/runtime/native-vhs/08-verify-invite-imported.png)
 
-These identity captures predate the camera-scan control, full 256-bit pair
-fingerprint, and code-pairing controls. Refresh them with the matching capture
-fixtures in a graphical session. A post-pairing-control capture attempt and
-the missing display environment are recorded in the capture instructions below.
+A captura atual da tela de identidade mostra os controles SPAKE2 e marca o ID e
+o código como fixtures fictícias. Ela valida a renderização desses controles;
+o pareamento físico entre dispositivos continua pendente. A captura importada
+a seguir é anterior aos controles atuais.
 
-![Native Iced call screen capture from before protected Opus RTP integration; a fresh capture needs a Wayland or X11 display](docs/design/runtime/native-vhs/10-call.png)
-
-This capture also predates the live participant roster. Refreshing it was
-attempted after that UI change, but this checkout has no Wayland or X11 display.
+![Tela nativa de chamada com roster atual e mídia ilustrativa; nenhum peer está conectado](docs/design/runtime/native-vhs/10-call.png)
 
 ![Actual 934 × 1000 native Iced MLS screen showing pending, approved, and rejected self-update proposal review controls; proposal rows are capture fixtures](docs/design/runtime/native-vhs/11-mls.png)
 
 ![Actual native Iced MLS screen with an encrypted attachment card and save action; attachment and connected state are capture fixtures](docs/design/runtime/native-vhs/12-mls-attachments.png)
 
-![Actual native Iced Network and P2P settings with delegated MLS copy consent and helper-listener guidance; Secret Service is unavailable in this capture, so the local policy cannot load](docs/design/runtime/native-vhs/02-settings.png)
+![Atual tela nativa Iced Rede e P2P com consentimento para cópias MLS e controles do helper SFU; a captura mostra o backend local e o Secret Service indisponíveis nesta sessão](docs/design/runtime/native-vhs/02-settings.png)
 
 ![Actual native Iced audio settings with real input/output devices and local microphone test; names are machine-specific and no call is connected](docs/design/runtime/native-vhs/13-audio-devices.png)
 
@@ -653,9 +656,8 @@ These are a first implementation of the visual direction, with comparison
 at 1280 × 800 and a compact 960 × 640 window. Exact visual parity and
 accessibility remain to be completed; local Opus/SFrame voice, camera video,
 screen sharing, and call chat are implemented, while physical-device media
-still needs validation. The updated `05-share` camera-tab screenshot could not
-be captured here: the environment has no Wayland or X11 display. Reproduce it
-with the camera capture command below in a graphical session.
+still needs validation. Refresh the `05-share` camera-tab screenshot with the
+camera capture command below when updating that view.
 The current direct transport, delegated-copy frames, call-group Welcome purpose,
 and bounded call-signaling frames are specified in the [v10 peer protocol](docs/fichas/transport/lan-peer-v10.md). Version 9 remains as the prior compatibility contract.
 
@@ -690,19 +692,15 @@ the requested window size; float/resize that window before the capture delay.
 Set `SLOUCHING_CAPTURE_DELAY_MS` to extend the default six-second delay when
 needed. `--capture-peer-addresses` supplies illustrative LAN and VPN socket
 addresses for the direct-chat capture; they are fixtures, not live interfaces.
-The route labels were updated after the current `06-chat.png` capture; this
-headless checkout cannot refresh it because Iced requires a Wayland or X11
-display.
-The SFU entry action was added to the call view, but its screenshot could not
-be captured in this checkout because neither `WAYLAND_DISPLAY` nor `DISPLAY`
-is available; run the `--capture-call-sfu` command above in a graphical
-session to refresh it. The multi-member SFU change alters call capabilities
-without changing the view layout; refresh this capture when a graphical
-session is available.
-The **Rede & P2P** settings view now includes the saved SFU URL, opt-in,
-connectivity test, and status controls. Refresh `02-settings.png` with the `--capture-delivery-mailbox`
-capture command above in a graphical session; this headless checkout cannot
-open an Iced window to save the updated PNG.
+The route labels were updated after the current `06-chat.png` capture; refresh
+the image with the command above when updating that screen.
+The SFU entry action is available in the call view. Refresh its screenshot with
+the `--capture-call-sfu` command above after changing that view. The multi-member
+SFU change alters call capabilities without changing the view layout.
+A captura atual de `02-settings.png` foi gerada com `--capture-delivery-mailbox`
+em uma sessão gráfica. Ela mostra o consentimento local para cópias MLS e os
+controles SFU; o backend local e o Secret Service estavam indisponíveis durante
+a captura.
 `SLOUCHING_WINDOW_SIZE` only requests an initial size. The normal
 default is a compact 1100 × 720 window.
 `--capture-mls-review` adds sample pending, approved, and rejected proposals to
@@ -711,9 +709,8 @@ illustrate the review controls; they are fixtures, not live MLS state.
 confirmation state for member removal; they are fixtures, not live group data.
 `--capture-mls-quarantine` shows the persistent quarantine alert and explicit
 new-group recovery action with fixture state; it does not modify stored groups.
-Refresh the MLS screenshots from a graphical Wayland or X11 session. This
-checkout environment has no display server, so this update could not produce a
-fresh rendered screenshot.
+The MLS quarantine fixture rendered in a graphical session. Refresh the review
+and member-removal captures separately with the commands above when needed.
 `--capture-mls-attachment` adds a sample attachment card and connected state;
 they are fixtures, not a transferred file or live peer session.
 The audio-settings capture uses real device enumeration from the current
@@ -723,43 +720,33 @@ and playback, but not this illustrative capture.
 live listener.
 `--capture-peer-verification` supplies sample local and peer keys for the trust
 screen, verified-contact list, and derived 256-bit fingerprint; they are
-fixtures, not identities from the keyring. The updated capture was attempted
-here, but Iced cannot start without `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, or
-`DISPLAY`; refresh the identity screenshot in a graphical Wayland or X11 session.
+fixtures, not identities from the keyring. The identity and verification fixture renders as
+[`08-verify-contacts.png`](docs/design/runtime/native-vhs/08-verify-contacts.png).
 `--capture-contact-pairing` shows the experimental code-pairing controls with
 sample session and code values; they are fixtures and cannot connect to a peer.
-Refreshing this capture was attempted after adding the controls, but this
-checkout has no Wayland or X11 display (`neither WAYLAND_DISPLAY nor
-WAYLAND_SOCKET nor DISPLAY is set`). Run the command above in a graphical
-session to produce the actual Iced screenshot.
+The current `08-verify.png` was rendered with this fixture. The helper URL,
+session ID, and code are illustrative and do not connect to a peer.
 `--capture-peer-invite` supplies a signed sample invitation and renders its QR
 in the identity screen; its keys and address are fixtures.
 `--capture-peer-invite-imported` shows the selectable LAN and VPN addresses
 after QR import; all values are fixtures.
 `--capture-call-negotiation` shows call controls with sample identity, peer, and
 group values; they do not represent a live MLS group or WebRTC session.
-Its screenshot could not be refreshed in this headless environment because
-Iced requires `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, or `DISPLAY`.
+The capture uses a disconnected camera and sample identity/group values; it
+does not show a live MLS group or WebRTC session.
 `--capture-share-camera` shows the camera tab with real enumerated device names;
 it does not open a camera or display a live image. `--capture-share-window`
 shows two illustrative window rows; it does not enumerate live windows, open the
 portal, capture, or transmit content.
-The camera/window picker captures could not be refreshed in this headless
-environment: Iced/winit requires `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, or
-`DISPLAY`. Run the matching capture command in a graphical session to render
-the current screen.
-The familiar-screen capture also predates custom PNG avatar support; refreshing
-it was attempted here but requires a Wayland or X11 session.
-The updated `04-connecting` screen was also not captured here because this
-environment has no graphical display; capture it with the command above from
-the local frontend repository in a Wayland or X11 session.
-The remote mailbox settings capture was also attempted in this headless
-checkout and could not render without `WAYLAND_DISPLAY`, `WAYLAND_SOCKET`, or
-`DISPLAY`; use the command above in a graphical session.
-The MLS transcript now renders per-device ACK counts on sent messages. Its
-updated screenshot could not be captured in this headless checkout for the same
-missing-display reason; use the `11-mls` capture command above in a graphical
-session.
+The camera/window picker capture commands render fixtures; camera names come
+from local device enumeration, while window rows are illustrative.
+The familiar-screen capture predates custom PNG avatar support; refresh it with
+the command above in a graphical session.
+The current `04-connecting.png` was rendered with the LAN discovery fixture.
+The displayed route is illustrative and does not identify a live peer.
+The current settings capture is documented above.
+The MLS transcript renders per-device ACK counts on sent messages. Refresh
+`11-mls.png` with the matching capture command after updating that view.
 
 Assets and font license/provenance notes are in [assets/README.md](assets/README.md).
 

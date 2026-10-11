@@ -120,6 +120,37 @@ pub(crate) fn test_sender_receiver() -> Result<(CallChatSender, CallChatReceiver
 }
 
 #[cfg(test)]
+pub(crate) fn test_group_sender_receiver(
+    epoch: u64,
+    local_member_index: u64,
+    remote_member_indices: &[u64],
+    key: &[u8],
+) -> Result<(CallChatSender, CallChatReceiver), String> {
+    let mut unprotectors = HashMap::with_capacity(remote_member_indices.len());
+    for member_index in remote_member_indices {
+        if *member_index == local_member_index
+            || unprotectors
+                .insert(
+                    *member_index,
+                    MediaFrameReceiver::new(epoch, *member_index, key)?,
+                )
+                .is_some()
+        {
+            return Err("test call chat roster contains a duplicate or local member".to_owned());
+        }
+    }
+    Ok((
+        CallChatSender {
+            protector: MediaFrameSender::new(epoch, local_member_index, key)?,
+        },
+        CallChatReceiver {
+            epoch,
+            unprotectors,
+        },
+    ))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

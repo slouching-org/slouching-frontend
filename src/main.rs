@@ -7230,7 +7230,8 @@ fn watch_call_rtc_state(
                     let state_name = state.borrow().clone();
                     if state_name == "Disconnected" {
                         rtc.set_microphone_muted(true);
-                        yield Message::CallRtcStateChanged(generation, "WebRTC desconectado; microfone silenciado até reconectar.".to_owned());
+                        rtc.stop_video_sharing().await;
+                        yield Message::CallRtcStateChanged(generation, "WebRTC desconectado; microfone e compartilhamento interrompidos até reconectar.".to_owned());
                         continue;
                     }
                     if state_name == "Failed" || state_name == "Closed" {

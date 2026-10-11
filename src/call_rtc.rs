@@ -586,6 +586,7 @@ impl CallRtcSession {
         let task = tokio::spawn(async move {
             let mut frame_id = 0_u32;
             let mut interval = tokio::time::interval(Duration::from_millis(200));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
                 let captured =
@@ -595,14 +596,12 @@ impl CallRtcSession {
                             session
                                 .screen_share_status
                                 .send_replace(format!("Captura Wayland da janela falhou: {error}"));
-                            session.send_video_stop_signal().await;
                             break;
                         }
                         Ok(None) => {
                             session
                                 .screen_share_status
                                 .send_replace("O portal encerrou a captura da janela.".to_owned());
-                            session.send_video_stop_signal().await;
                             break;
                         }
                         Err(_) => continue,
@@ -645,6 +644,7 @@ impl CallRtcSession {
                 }
             }
             capture.stop().await;
+            session.send_video_stop_signal().await;
             session.screen_share_active.store(false, Ordering::Release);
         });
         if let Ok(mut active_task) = self.screen_share_task.lock() {
@@ -687,6 +687,7 @@ impl CallRtcSession {
         let task = tokio::spawn(async move {
             let mut frame_id = 0_u32;
             let mut interval = tokio::time::interval(Duration::from_millis(200));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
                 let captured = tokio::task::spawn_blocking(move || {
@@ -699,14 +700,12 @@ impl CallRtcSession {
                         session
                             .screen_share_status
                             .send_replace(format!("Captura de {source_name} falhou: {error}"));
-                        session.send_video_stop_signal().await;
                         break;
                     }
                     Err(error) => {
                         session
                             .screen_share_status
                             .send_replace(format!("Tarefa de captura falhou: {error}"));
-                        session.send_video_stop_signal().await;
                         break;
                     }
                 };
@@ -747,6 +746,7 @@ impl CallRtcSession {
                     }
                 }
             }
+            session.send_video_stop_signal().await;
             session.screen_share_active.store(false, Ordering::Release);
         });
         if let Ok(mut active_task) = self.screen_share_task.lock() {
@@ -847,6 +847,7 @@ impl CallRtcSession {
                 }
             }
             stop.store(true, Ordering::Release);
+            session.send_video_stop_signal().await;
             session.screen_share_active.store(false, Ordering::Release);
         });
         if let Ok(mut active_task) = self.screen_share_task.lock() {
@@ -1181,7 +1182,11 @@ fn spawn_screen_data_channel_receiver(
                         }
                     }
                 }
-                DataChannelEvent::OnClose => break,
+                DataChannelEvent::OnClose => {
+                    reassembler.clear();
+                    context.remote_screen_frame.send_replace(None);
+                    break;
+                }
                 _ => {}
             }
         }
@@ -1272,6 +1277,7 @@ mod tests {
         let mut sessions = Vec::with_capacity(MEMBER_COUNT);
         let mut transports = Vec::with_capacity(MEMBER_COUNT);
         let mut sinks = Vec::with_capacity(MEMBER_COUNT);
+        let mut call_chat_receivers = Vec::with_capacity(MEMBER_COUNT);
 
         for (local_index, signer) in signers.iter().enumerate() {
             let remote_indices = (0..MEMBER_COUNT)
@@ -1287,6 +1293,10 @@ mod tests {
                     .unwrap()
                 })
                 .collect();
+            let remote_member_indices = remote_indices
+                .iter()
+                .map(|index| *index as u64)
+                .collect::<Vec<_>>();
             let (sink_tx, sink_rx) = mpsc::unbounded_channel();
             let session = Arc::new(
                 CallRtcSession::new_with_audio_codecs(
@@ -1302,6 +1312,16 @@ mod tests {
                 .await
                 .unwrap(),
             );
+            let (chat_sender, chat_receiver) = crate::call_chat::test_group_sender_receiver(
+                1,
+                local_index as u64,
+                &remote_member_indices,
+                EXPORTER_KEY,
+            )
+            .unwrap();
+            *session.call_chat_sender.lock().await = Some(chat_sender);
+            *session.call_chat_receiver.lock().await = Some(chat_receiver);
+            call_chat_receivers.push(session.subscribe_call_chat());
             let transport = crate::sfu_call::SfuCallTransport::connect_and_join(
                 &ws_url,
                 group_id,
@@ -1395,6 +1415,56 @@ mod tests {
                 assert_eq!(received.len(), crate::call_audio::FRAME_SAMPLES);
                 assert!(received.iter().any(|sample| sample.abs() > 0.01));
             }
+        }
+
+        for (member_index, session) in sessions.iter().enumerate() {
+            let sent = timeout(Duration::from_secs(10), async {
+                loop {
+                    match session
+                        .send_call_chat(&format!("member-{member_index}"))
+                        .await
+                    {
+                        Ok(()) => break,
+                        Err(error)
+                            if error.contains("not ready") || error.contains("not connected") =>
+                        {
+                            sleep(Duration::from_millis(10)).await;
+                        }
+                        Err(error) => panic!("could not send protected group chat: {error}"),
+                    }
+                }
+            })
+            .await;
+            let channel = session.screen_data_channel.lock().await.clone();
+            let channel_state = match channel {
+                Some(channel) => Some(channel.ready_state().await),
+                None => None,
+            };
+            assert!(
+                sent.is_ok(),
+                "member {member_index} SFU DataChannel did not open: {channel_state:?}"
+            );
+        }
+        for (local_index, incoming) in call_chat_receivers.iter_mut().enumerate() {
+            let mut received = Vec::with_capacity(MEMBER_COUNT - 1);
+            for _ in 0..MEMBER_COUNT - 1 {
+                received.push(
+                    timeout(Duration::from_secs(5), incoming.recv())
+                        .await
+                        .expect("each member should receive both other members' chat")
+                        .expect("call chat receiver remains open"),
+                );
+            }
+            let expected = (0..MEMBER_COUNT)
+                .filter(|member_index| *member_index != local_index)
+                .map(|member_index| format!("member-{member_index}"))
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(
+                received
+                    .into_iter()
+                    .collect::<std::collections::HashSet<_>>(),
+                expected
+            );
         }
 
         for transport in &transports {

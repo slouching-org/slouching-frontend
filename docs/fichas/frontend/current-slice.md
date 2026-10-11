@@ -131,8 +131,10 @@ still image after an explicit user action. During an active call, the user can
 share the selected monitor: capture runs outside Iced's UI thread, H.264 frames
 are protected with the call group's SFrame key, and bounded fragments travel on
 a WebRTC DataChannel. The receiving peer authenticates and decodes complete
-frames before rendering them; a stop signal clears the remote image. Local
-tests cover codec replay rejection, bounded fragmentation, protected frame
+frames before rendering them; a stop signal or DataChannel closure clears the
+remote image. Local capture stops on WebRTC disconnection and must be restarted
+explicitly after reconnection. Capture failures also signal the remote peer to
+clear its last frame. Local tests cover codec replay rejection, bounded fragmentation, protected frame
 delivery, remote decoding, and stop signaling. Physical-device capture,
 permissions, and VPN delivery still need validation. The camera tab enumerates
 native devices and supports an explicit local preview or in-call H.264/SFrame
