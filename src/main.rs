@@ -3124,7 +3124,7 @@ fn update(state: &mut Slouching, message: Message) -> Task<Message> {
                 }
             } else if let Some(handle) = state.peer_listener_handle.take() {
                 // While accept is pending, no session command receiver is active;
-                // dropping this task closes the listener endpoint.
+                // dropping this task requests cancellation-safe endpoint shutdown.
                 handle.abort();
                 state.peer_session_commands = None;
                 state.peer_listener_generation = state.peer_listener_generation.saturating_add(1);
@@ -8637,7 +8637,9 @@ fn hex_decode_bytes(value: &str) -> Result<Vec<u8>, String> {
     }
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let digit = |byte: u8| match byte {
                 b'0'..=b'9' => Some(byte - b'0'),
@@ -8676,6 +8678,24 @@ fn peer_listener_task(
             }
         };
         let bind_address = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        let mut events = Box::pin(peer_listener_events(local_identity, bind_address, expected_peer, relay));
+        while let Some(event) = events.next().await {
+            yield event;
+        }
+    };
+    Task::run(events, move |event| {
+        Message::PeerListenEvent(generation, event)
+    })
+    .abortable()
+}
+
+fn peer_listener_events(
+    local_identity: iroh::SecretKey,
+    bind_address: std::net::SocketAddr,
+    expected_peer: Option<iroh::EndpointId>,
+    relay: Option<peer::ParticipantRelay>,
+) -> impl futures_util::Stream<Item = PeerListenEvent> + Send {
+    async_stream::stream! {
         let listener_result = if let Some(expected_peer) = expected_peer {
             peer::bind_listener_with_relay(local_identity, bind_address, expected_peer, relay).await
         } else {
@@ -8693,7 +8713,7 @@ fn peer_listener_task(
             Ok(advertiser) => (Some(advertiser), None),
             Err(error) => (None, Some(error)),
         };
-        let _advertiser = advertiser;
+        let mut advertiser = advertiser;
         yield PeerListenEvent::Bound { addresses, discovery_error };
         loop {
             match listener.accept_session().await {
@@ -8703,10 +8723,17 @@ fn peer_listener_task(
                     let mut events = Box::pin(session.run(command_rx));
                     while let Some(event) = events.next().await {
                         let disconnected = matches!(event, peer::PeerEvent::Disconnected { .. });
+                        if disconnected && expected_peer.is_some() {
+                            // The consumer may stop polling at the terminal event.
+                            drop(advertiser.take());
+                            listener.close().await;
+                        }
                         yield PeerListenEvent::Session(event);
                         if disconnected { break; }
                     }
                     if expected_peer.is_some() {
+                        drop(advertiser.take());
+                        listener.close().await;
                         return;
                     }
                 }
@@ -8714,16 +8741,14 @@ fn peer_listener_task(
                     yield PeerListenEvent::Session(peer::PeerEvent::Unauthorized { peer_id });
                 }
                 Err(peer::PeerAcceptError::Failed(error)) => {
+                    drop(advertiser.take());
+                    listener.close().await;
                     yield PeerListenEvent::Failed(error);
                     return;
                 }
             }
         }
-    };
-    Task::run(events, move |event| {
-        Message::PeerListenEvent(generation, event)
-    })
-    .abortable()
+    }
 }
 
 fn peer_connect_task(
@@ -9235,6 +9260,259 @@ fn hex_encode_key(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Exercise the same event stream as the Iced task, without loading a real keyring identity.
+    async fn pinned_listener_shutdown_regression() {
+        let listener_key = iroh::SecretKey::from_bytes(&[0x71; 32]);
+        let sender_key = iroh::SecretKey::from_bytes(&[0x72; 32]);
+        let listener_id = listener_key.public();
+        let mut listener_events = Box::pin(peer_listener_events(
+            listener_key,
+            "127.0.0.1:0".parse().unwrap(),
+            Some(sender_key.public()),
+            None,
+        ));
+        let Some(PeerListenEvent::Bound { addresses, .. }) = listener_events.next().await else {
+            panic!("listener should bind");
+        };
+        let address = addresses
+            .into_iter()
+            .find(|a| a.ip().is_loopback())
+            .unwrap();
+        let listener_task = tokio::spawn(async move {
+            let mut commands = None;
+            while let Some(event) = listener_events.next().await {
+                match event {
+                    PeerListenEvent::SessionCommands(sender) => commands = Some(sender),
+                    PeerListenEvent::Session(peer::PeerEvent::Received { sequence, .. }) => {
+                        let commands = commands.as_ref().unwrap();
+                        commands
+                            .send(peer::PeerCommand::AcceptInbound { sequence })
+                            .await
+                            .unwrap();
+                        commands.send(peer::PeerCommand::Disconnect).await.unwrap();
+                    }
+                    PeerListenEvent::Session(peer::PeerEvent::Disconnected { .. }) => {
+                        // The UI may stop polling as soon as it receives this event.
+                        return;
+                    }
+                    PeerListenEvent::Failed(error) => panic!("listener failed: {error}"),
+                    _ => {}
+                }
+            }
+            panic!("listener ended without Disconnected");
+        });
+        let session = peer::connect_peer(sender_key, listener_id, address)
+            .await
+            .unwrap();
+        let (commands, receiver) = tokio::sync::mpsc::channel(4);
+        commands
+            .send(peer::PeerCommand::Send {
+                request_id: 1,
+                text: "close regression".into(),
+            })
+            .await
+            .unwrap();
+        let mut events = Box::pin(session.run(receiver));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut acknowledged = false;
+            while let Some(event) = events.next().await {
+                match event {
+                    peer::PeerEvent::Acknowledged { request_id: 1, .. } => acknowledged = true,
+                    peer::PeerEvent::Disconnected { reason } => {
+                        assert!(
+                            acknowledged,
+                            "pending delivery must be acknowledged before close"
+                        );
+                        assert_eq!(reason, "peer disconnected");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            panic!("remote ended without Disconnected");
+        })
+        .await
+        .expect("remote must disconnect before the eight-second CLOSE_TIMEOUT");
+        listener_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_active_listener_task_disconnects_remote() {
+        let listener_key = iroh::SecretKey::from_bytes(&[0x7b; 32]);
+        let sender_key = iroh::SecretKey::from_bytes(&[0x7c; 32]);
+        let listener_id = listener_key.public();
+        let mut listener_events = Box::pin(peer_listener_events(
+            listener_key,
+            "127.0.0.1:0".parse().unwrap(),
+            Some(sender_key.public()),
+            None,
+        ));
+        let Some(PeerListenEvent::Bound { addresses, .. }) = listener_events.next().await else {
+            panic!("listener should bind");
+        };
+        let address = addresses
+            .into_iter()
+            .find(|a| a.ip().is_loopback())
+            .unwrap();
+        let listener_task = tokio::spawn(async move {
+            let mut commands = None;
+            while let Some(event) = listener_events.next().await {
+                match event {
+                    PeerListenEvent::SessionCommands(sender) => commands = Some(sender),
+                    PeerListenEvent::Session(peer::PeerEvent::Received { sequence, .. }) => {
+                        commands
+                            .as_ref()
+                            .unwrap()
+                            .send(peer::PeerCommand::AcceptInbound { sequence })
+                            .await
+                            .unwrap();
+                    }
+                    PeerListenEvent::Failed(error) => panic!("listener failed: {error}"),
+                    _ => {}
+                }
+            }
+        });
+        let session = peer::connect_peer(sender_key, listener_id, address)
+            .await
+            .unwrap();
+        let (commands, receiver) = tokio::sync::mpsc::channel(4);
+        commands
+            .send(peer::PeerCommand::Send {
+                request_id: 1,
+                text: "before cancellation".into(),
+            })
+            .await
+            .unwrap();
+        let mut events = Box::pin(session.run(receiver));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match events.next().await {
+                    Some(peer::PeerEvent::Acknowledged { request_id: 1, .. }) => break,
+                    Some(peer::PeerEvent::Disconnected { reason }) => {
+                        panic!("premature disconnect: {reason}")
+                    }
+                    None => panic!("remote ended before acknowledgement"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        listener_task.abort();
+        assert!(listener_task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = events.next().await {
+                if matches!(event, peer::PeerEvent::Disconnected { .. }) {
+                    return;
+                }
+            }
+            panic!("remote ended without Disconnected");
+        })
+        .await
+        .expect("cancelling an active listener must notify the remote promptly");
+    }
+
+    #[tokio::test]
+    async fn helper_listener_task_accepts_two_sessions_then_cancels() {
+        let listener_key = iroh::SecretKey::from_bytes(&[0x78; 32]);
+        let listener_id = listener_key.public();
+        let mut listener_events = Box::pin(peer_listener_events(
+            listener_key,
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            None,
+        ));
+        let Some(PeerListenEvent::Bound { addresses, .. }) = listener_events.next().await else {
+            panic!("helper listener should bind");
+        };
+        let address = addresses
+            .into_iter()
+            .find(|a| a.ip().is_loopback())
+            .unwrap();
+        let (finished, mut sessions) = tokio::sync::mpsc::channel(2);
+        let listener_task = tokio::spawn(async move {
+            let mut commands = None;
+            while let Some(event) = listener_events.next().await {
+                match event {
+                    PeerListenEvent::SessionCommands(sender) => commands = Some(sender),
+                    PeerListenEvent::Session(peer::PeerEvent::Received { sequence, .. }) => {
+                        let commands = commands.as_ref().unwrap();
+                        commands
+                            .send(peer::PeerCommand::AcceptInbound { sequence })
+                            .await
+                            .unwrap();
+                        commands.send(peer::PeerCommand::Disconnect).await.unwrap();
+                    }
+                    PeerListenEvent::Session(peer::PeerEvent::Disconnected { .. }) => {
+                        finished.send(()).await.unwrap();
+                    }
+                    PeerListenEvent::Failed(error) => panic!("helper listener failed: {error}"),
+                    _ => {}
+                }
+            }
+        });
+        for key_byte in [0x79, 0x7a] {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let session = peer::connect_peer(
+                    iroh::SecretKey::from_bytes(&[key_byte; 32]),
+                    listener_id,
+                    address,
+                )
+                .await
+                .unwrap();
+                let (commands, receiver) = tokio::sync::mpsc::channel(4);
+                commands
+                    .send(peer::PeerCommand::Send {
+                        request_id: 1,
+                        text: "helper reuse".into(),
+                    })
+                    .await
+                    .unwrap();
+                let mut events = Box::pin(session.run(receiver));
+                let mut acknowledged = false;
+                while let Some(event) = events.next().await {
+                    match event {
+                        peer::PeerEvent::Acknowledged { request_id: 1, .. } => acknowledged = true,
+                        peer::PeerEvent::Disconnected { reason } => {
+                            assert!(acknowledged);
+                            assert_eq!(reason, "peer disconnected");
+                            sessions.recv().await.expect("helper session completed");
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                panic!("helper session ended without Disconnected");
+            })
+            .await
+            .expect("helper must serve each session promptly");
+        }
+        // Cancellation while waiting for the next accept must release the endpoint.
+        listener_task.abort();
+        assert!(listener_task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(socket) = std::net::UdpSocket::bind(address) {
+                    drop(socket);
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled helper must release its listening socket");
+    }
+
+    #[tokio::test]
+    async fn pinned_listener_task_closes_before_terminal_event() {
+        pinned_listener_shutdown_regression().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pinned_listener_task_closes_before_terminal_event_multithread() {
+        pinned_listener_shutdown_regression().await;
+    }
 
     #[test]
     fn saved_sfu_helper_is_used_and_environment_remains_a_fallback() {

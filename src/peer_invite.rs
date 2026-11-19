@@ -315,7 +315,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let digit = |byte: u8| match byte {
             b'0'..=b'9' => Some(byte - b'0'),
             b'a'..=b'f' => Some(byte - b'a' + 10),

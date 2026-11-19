@@ -538,19 +538,19 @@ fn copy_video_frame(
     match format {
         spa::param::video::VideoFormat::RGBA => Ok(frame),
         spa::param::video::VideoFormat::RGBx => {
-            for pixel in frame.rgba.chunks_exact_mut(4) {
+            for pixel in frame.rgba.as_chunks_mut::<4>().0 {
                 pixel[3] = 255;
             }
             Ok(frame)
         }
         spa::param::video::VideoFormat::BGRA => {
-            for pixel in frame.rgba.chunks_exact_mut(4) {
+            for pixel in frame.rgba.as_chunks_mut::<4>().0 {
                 pixel.swap(0, 2);
             }
             Ok(frame)
         }
         spa::param::video::VideoFormat::BGRx => {
-            for pixel in frame.rgba.chunks_exact_mut(4) {
+            for pixel in frame.rgba.as_chunks_mut::<4>().0 {
                 pixel.swap(0, 2);
                 pixel[3] = 255;
             }

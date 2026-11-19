@@ -7,7 +7,7 @@ use iroh::{
 use std::{collections::HashMap, net::SocketAddr, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::mpsc,
+    sync::{mpsc, watch},
 };
 
 /// Direct-only protocol version used for persistent paired-device sessions.
@@ -63,7 +63,38 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub struct DirectPeerListener {
     endpoint: Endpoint,
+    shutdown: EndpointShutdown,
     expected_peer: Option<EndpointId>,
+}
+
+/// The endpoint owner requests shutdown by calling close or dropping this guard.
+/// Keep the only Endpoint::close future in its own task: iroh does not resume a
+/// cancelled close on a subsequent call. Dropping an event stream or an Iced
+/// task must therefore never drop that future. Cleanup needs the runtime alive.
+struct EndpointShutdown {
+    request: watch::Sender<bool>,
+    completed: watch::Receiver<bool>,
+}
+
+impl EndpointShutdown {
+    fn new(endpoint: &Endpoint) -> Self {
+        let endpoint = endpoint.clone();
+        let (request, mut requested) = watch::channel(false);
+        let (complete, completed) = watch::channel(false);
+        tokio::spawn(async move {
+            // An explicit request and the owner's cancellation both close the endpoint.
+            let _ = requested.changed().await;
+            endpoint.close().await;
+            let _ = complete.send(true);
+        });
+        Self { request, completed }
+    }
+
+    async fn close(&self) {
+        let _ = self.request.send(true);
+        let mut completed = self.completed.clone();
+        let _ = completed.wait_for(|done| *done).await;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -410,7 +441,7 @@ enum PendingOutbound {
 
 pub struct DirectPeerSession {
     endpoint: Endpoint,
-    close_endpoint: bool,
+    shutdown: Option<EndpointShutdown>,
     connection: Connection,
     send: iroh::endpoint::SendStream,
     receive: iroh::endpoint::RecvStream,
@@ -739,7 +770,7 @@ impl DirectPeerListener {
             })?;
         Ok(DirectPeerSession {
             endpoint: self.endpoint.clone(),
-            close_endpoint: false,
+            shutdown: None,
             connection,
             send,
             receive,
@@ -819,9 +850,8 @@ impl DirectPeerListener {
         received.ok_or_else(|| "peer session ended before receiving text".to_owned())
     }
 
-    #[allow(dead_code)]
     pub async fn close(&self) {
-        self.endpoint.close().await;
+        self.shutdown.close().await;
     }
 
     #[allow(dead_code)]
@@ -1457,8 +1487,8 @@ impl DirectPeerSession {
                 }
             }
             self.connection.close(0_u32.into(), b"Slouching session ended");
-            if self.close_endpoint {
-                self.endpoint.close().await;
+            if let Some(shutdown) = &self.shutdown {
+                shutdown.close().await;
             }
             yield PeerEvent::Disconnected { reason: disconnect_reason };
         }
@@ -1481,6 +1511,7 @@ pub async fn bind_listener_with_relay(
 ) -> Result<DirectPeerListener, String> {
     let endpoint = bind_endpoint_with_relay(local_identity, bind_address, relay).await?;
     Ok(DirectPeerListener {
+        shutdown: EndpointShutdown::new(&endpoint),
         endpoint,
         expected_peer: Some(expected_peer),
     })
@@ -1504,6 +1535,7 @@ pub async fn bind_helper_listener_with_relay(
 ) -> Result<DirectPeerListener, String> {
     let endpoint = bind_endpoint_with_relay(local_identity, bind_address, relay).await?;
     Ok(DirectPeerListener {
+        shutdown: EndpointShutdown::new(&endpoint),
         endpoint,
         expected_peer: None,
     })
@@ -1532,29 +1564,40 @@ pub async fn connect_peer_with_relay(
         relay.clone(),
     )
     .await?;
-    let mut remote = EndpointAddr::new(expected_peer);
-    if let Some(peer_address) = peer_address {
-        remote = remote.with_ip_addr(peer_address);
+    let shutdown = EndpointShutdown::new(&endpoint);
+    let connected = async {
+        let mut remote = EndpointAddr::new(expected_peer);
+        if let Some(peer_address) = peer_address {
+            remote = remote.with_ip_addr(peer_address);
+        }
+        if let Some(relay) = relay {
+            remote = remote.with_relay_url(relay.url);
+        }
+        let connection = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(remote, PEER_ALPN))
+            .await
+            .map_err(|_| "timed out connecting to direct peer".to_owned())?
+            .map_err(|error| format!("could not connect to pinned peer: {error}"))?;
+        if connection.remote_id() != expected_peer {
+            connection.close(1_u32.into(), b"unexpected device identity");
+            return Err("connected peer does not match the pinned device identity".to_owned());
+        }
+        let (send, receive) = tokio::time::timeout(ACCEPT_STREAM_TIMEOUT, connection.open_bi())
+            .await
+            .map_err(|_| "timed out opening the peer session stream".to_owned())?
+            .map_err(|error| format!("could not open peer session stream: {error}"))?;
+        Ok((connection, send, receive))
     }
-    if let Some(relay) = relay {
-        remote = remote.with_relay_url(relay.url);
-    }
-    let connection = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(remote, PEER_ALPN))
-        .await
-        .map_err(|_| "timed out connecting to direct peer".to_owned())?
-        .map_err(|error| format!("could not connect to pinned peer: {error}"))?;
-    if connection.remote_id() != expected_peer {
-        connection.close(1_u32.into(), b"unexpected device identity");
-        endpoint.close().await;
-        return Err("connected peer does not match the pinned device identity".to_owned());
-    }
-    let (send, receive) = tokio::time::timeout(ACCEPT_STREAM_TIMEOUT, connection.open_bi())
-        .await
-        .map_err(|_| "timed out opening the peer session stream".to_owned())?
-        .map_err(|error| format!("could not open peer session stream: {error}"))?;
+    .await;
+    let (connection, send, receive) = match connected {
+        Ok(connected) => connected,
+        Err(error) => {
+            shutdown.close().await;
+            return Err(error);
+        }
+    };
     Ok(DirectPeerSession {
         endpoint,
-        close_endpoint: true,
+        shutdown: Some(shutdown),
         connection,
         send,
         receive,
@@ -2527,6 +2570,98 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::duplex;
 
+    #[tokio::test]
+    async fn dropping_listener_closes_owned_endpoint() {
+        let listener = bind_helper_listener(
+            SecretKey::from_bytes(&[0x73; 32]),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        // A session may still hold a clone; dropping one handle is not explicit closure.
+        let endpoint = listener.endpoint.clone();
+        drop(listener);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !endpoint.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the owner must close its endpoint");
+    }
+
+    #[tokio::test]
+    async fn cancelling_listener_close_still_finishes_endpoint_shutdown() {
+        let listener = bind_helper_listener(
+            SecretKey::from_bytes(&[0x74; 32]),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        let address = listener
+            .direct_addresses()
+            .into_iter()
+            .find(|a| a.ip().is_loopback())
+            .unwrap();
+        let (session, incoming) = tokio::join!(
+            connect_peer(SecretKey::from_bytes(&[0x77; 32]), listener.id(), address),
+            async { listener.endpoint.accept().await.unwrap().await.unwrap() },
+        );
+        let session = session.unwrap();
+        {
+            let close = listener.close();
+            futures_util::pin_mut!(close);
+            assert!(futures_util::poll!(close).is_pending());
+            // Cancel close after it starts, while the listener owner remains alive.
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !listener.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelling close must not abandon in-flight QUIC cleanup");
+        drop(incoming);
+        session.endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_unpolled_connector_session_closes_owned_endpoint() {
+        let sender_key = SecretKey::from_bytes(&[0x75; 32]);
+        let listener = bind_listener(
+            SecretKey::from_bytes(&[0x76; 32]),
+            "127.0.0.1:0".parse().unwrap(),
+            sender_key.public(),
+        )
+        .await
+        .unwrap();
+        let address = listener
+            .direct_addresses()
+            .into_iter()
+            .find(|a| a.ip().is_loopback())
+            .unwrap();
+        // QUIC connection establishment does not need the application session stream.
+        let accept = listener.endpoint.accept();
+        let connect = connect_peer(sender_key, listener.id(), address);
+        let (session, incoming) =
+            tokio::join!(connect, async { accept.await.unwrap().await.unwrap() });
+        let session = session.unwrap();
+        let endpoint = session.endpoint.clone();
+        let (_commands, receiver) = mpsc::channel(4);
+        drop(session.run(receiver));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !endpoint.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping an unpolled connector must close its endpoint");
+        tokio::time::timeout(Duration::from_secs(2), incoming.closed())
+            .await
+            .unwrap();
+        listener.close().await;
+    }
+
     #[derive(Debug)]
     struct RelayTestToken(String);
 
@@ -2806,6 +2941,8 @@ mod tests {
                         .expect("receiver should keep the session open until ACK is written");
                     while let Some(event) = events.next().await {
                         if matches!(event, PeerEvent::Disconnected { .. }) {
+                            // Flush QUIC closure before dropping the listener endpoint.
+                            listener.close().await;
                             return proposal;
                         }
                     }
@@ -2860,10 +2997,18 @@ mod tests {
             acknowledged,
             "accepted proposal should receive a transport ACK"
         );
-        commands
-            .send(PeerCommand::Disconnect)
-            .await
-            .expect("sender should close the proposal test session");
+        // The event stream drives CLOSE/CLOSE_ACK as well as application events.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = events.next().await {
+                if let PeerEvent::Disconnected { reason } = event {
+                    assert_eq!(reason, "peer disconnected");
+                    return;
+                }
+            }
+            panic!("session ended before graceful disconnect");
+        })
+        .await
+        .expect("driven sender should promptly acknowledge CLOSE");
         let received = tokio::time::timeout(Duration::from_secs(8), receiver_task)
             .await
             .expect("receiver task should return");
@@ -2909,6 +3054,8 @@ mod tests {
                         .expect("receiver should close after ACKing the signal");
                     while let Some(event) = events.next().await {
                         if matches!(event, PeerEvent::Disconnected { .. }) {
+                            // Flush QUIC closure before dropping the listener endpoint.
+                            listener.close().await;
                             return signal;
                         }
                     }
@@ -2947,6 +3094,18 @@ mod tests {
             }
         }
         assert!(acknowledged, "call offer should receive a transport ACK");
+        // The event stream drives CLOSE/CLOSE_ACK as well as application events.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = events.next().await {
+                if let PeerEvent::Disconnected { reason } = event {
+                    assert_eq!(reason, "peer disconnected");
+                    return;
+                }
+            }
+            panic!("session ended before graceful disconnect");
+        })
+        .await
+        .expect("driven sender should promptly acknowledge CLOSE");
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(8), receiver_task)
                 .await
