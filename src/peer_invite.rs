@@ -170,19 +170,22 @@ pub fn scan_rgba(
 }
 
 fn scan_image(image: image_codec::DynamicImage, now: u64) -> Result<Option<PeerInvite>, String> {
-    let mut prepared = rqrr::PreparedImage::prepare(image.to_luma8());
-    let grids = prepared.detect_grids();
-    if grids.is_empty() {
-        return Ok(None);
-    }
-    if grids.len() != 1 {
-        return Err("A imagem deve conter exatamente um QR".to_owned());
-    }
-    let (_, text) = match grids[0].decode() {
-        Ok(decoded) => decoded,
-        Err(_) => return Ok(None),
-    };
-    decode(&text, now).map(Some)
+    // All mutable decoder state is owned by this closure and discarded on unwind;
+    // no partially mutated rqrr state is exposed or reused. AssertUnwindSafe is
+    // sound for this isolated scan, including preparation, detection and decoding.
+    let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let mut prepared = rqrr::PreparedImage::prepare(image.to_luma8());
+        let grids = prepared.detect_grids();
+        if grids.is_empty() {
+            return Ok(None);
+        }
+        if grids.len() != 1 {
+            return Err("A imagem deve conter exatamente um QR".to_owned());
+        }
+        Ok(grids[0].decode().ok().map(|(_, text)| text))
+    }))
+    .map_err(|_| "Não foi possível ler o QR: imagem inválida ou distorcida".to_owned())??;
+    text.map(|text| decode(&text, now)).transpose()
 }
 
 fn normalize_addresses(addresses: &[SocketAddr]) -> Result<Vec<SocketAddr>, String> {
@@ -315,7 +318,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let digit = |byte: u8| match byte {
             b'0'..=b'9' => Some(byte - b'0'),
             b'a'..=b'f' => Some(byte - b'a' + 10),
@@ -339,6 +342,40 @@ pub fn unix_time_seconds() -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Pixels decoded from the 89-byte minimized fuzz input, re-encoded with valid PNG
+    // checksums: cfg(fuzzing) skips CRC checks, but the production PNG decoder does not.
+    fn minimized_perspective_png() -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAKMAAAAPAQAAAACgyUK4AAAAlklEQVR42mNg4eAREJGQUVDR0DEwsbBxcPHwCXBgQBOct2jZqnULGLAIblrAgEVw2wIGLIK7FjBgEdx3gAGL4KEDDFgEjx1gwCJ46gADFsFzBxiwCF46wIBF8NoBBhOLn45ro+KS0rLyisqq6poePHnx5gGDhc1f142ogh8eMNg4MLJ6+gaGzpr7KKhl62+P0CWLFyUAAEL6i6TgynWiAAAAAElFTkSuQmCC"
+        ).unwrap()
+    }
+
+    #[test]
+    fn minimized_png_geometry_panic_becomes_an_error() {
+        let png = minimized_perspective_png();
+        assert_eq!(png.len(), 207);
+        assert_eq!(
+            decode_png(&png, 1_800_000_001).unwrap_err(),
+            "Não foi possível ler o QR: imagem inválida ou distorcida"
+        );
+    }
+
+    #[test]
+    fn minimized_camera_geometry_panic_becomes_an_error() {
+        let rgba = image_codec::load_from_memory_with_format(
+            &minimized_perspective_png(),
+            image_codec::ImageFormat::Png,
+        )
+        .unwrap()
+        .to_rgba8();
+        assert_eq!(rgba.dimensions(), (163, 15));
+        assert_eq!(
+            scan_rgba(rgba.width(), rgba.height(), rgba.as_raw(), 1_800_000_001).unwrap_err(),
+            "Não foi possível ler o QR: imagem inválida ou distorcida"
+        );
+    }
 
     fn key(seed: u8) -> iroh::SecretKey {
         iroh::SecretKey::from_bytes(&[seed; 32])

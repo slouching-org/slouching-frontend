@@ -18,22 +18,37 @@ pub fn derive(local_device: &[u8; 32], peer_device: &[u8; 32]) -> String {
 
 /// Formats a fingerprint as four short groups per line for live comparison.
 pub fn display(fingerprint: &str) -> String {
-    fingerprint
-        .as_bytes()
-        .chunks(16)
-        .map(|line| {
-            line.chunks(4)
-                .map(|group| std::str::from_utf8(group).expect("hex fingerprint is ASCII"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut formatted = String::with_capacity(fingerprint.len());
+    for (index, character) in fingerprint.chars().enumerate() {
+        if index > 0 {
+            if index % 16 == 0 {
+                formatted.push('\n');
+            } else if index % 4 == 0 {
+                formatted.push(' ');
+            }
+        }
+        formatted.push(character);
+    }
+    formatted
 }
 
 #[cfg(test)]
 mod tests {
     use super::{derive, display};
+
+    #[test]
+    fn minimized_utf8_fingerprint_formats_without_splitting_a_character() {
+        let input = "@$[\u{0380}";
+        assert_eq!(input.len(), 5);
+        assert_eq!(display(input), input);
+        assert_eq!(display("abcédefghijklmnopq"), "abcé defg hijk lmno\npq");
+    }
+
+    #[test]
+    fn fingerprint_display_preserves_ascii_grouping() {
+        assert_eq!(display(""), "");
+        assert_eq!(display("0123456789abcdef0123"), "0123 4567 89ab cdef\n0123");
+    }
 
     #[test]
     fn fingerprint_is_symmetric_and_full_length() {

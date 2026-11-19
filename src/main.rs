@@ -8637,7 +8637,9 @@ fn hex_decode_bytes(value: &str) -> Result<Vec<u8>, String> {
     }
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let digit = |byte: u8| match byte {
                 b'0'..=b'9' => Some(byte - b'0'),
@@ -9220,11 +9222,8 @@ fn hex_decode_key(value: &str) -> Result<[u8; 32], String> {
         return Err("device public key must be exactly 64 hexadecimal characters".to_owned());
     }
     let mut key = [0_u8; 32];
-    for (index, byte) in key.iter_mut().enumerate() {
-        let start = index * 2;
-        *byte = u8::from_str_radix(&value[start..start + 2], 16)
-            .map_err(|_| "device public key must be hexadecimal".to_owned())?;
-    }
+    hex::decode_to_slice(value.as_bytes(), &mut key)
+        .map_err(|_| "device public key must be hexadecimal".to_owned())?;
     Ok(key)
 }
 
@@ -9584,6 +9583,27 @@ mod tests {
             None
         );
         assert_eq!(missing_predecessor_from_error("invalid Commit"), None);
+    }
+
+    #[test]
+    fn minimized_peer_key_rejects_utf8_crossing_a_hex_pair_boundary() {
+        let input = "ea4a6c6c520abef5507b12534C2d3EE2d\u{05fa}E2d3E4ebe7b92421eea691446d49c";
+        assert_eq!(input.len(), 64);
+        assert!(hex_decode_key(input).is_err());
+        assert!(parse_peer_id(input).is_err());
+    }
+
+    #[test]
+    fn peer_key_decoder_preserves_mixed_case_hex_and_rejects_invalid_bytes() {
+        assert_eq!(hex_decode_key(&"aB".repeat(32)).unwrap(), [0xab; 32]);
+        for input in [
+            "g0".repeat(32),
+            "é".repeat(32),
+            "00".repeat(31),
+            "00".repeat(33),
+        ] {
+            assert!(hex_decode_key(&input).is_err());
+        }
     }
 
     #[test]
