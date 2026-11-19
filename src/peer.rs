@@ -2806,6 +2806,8 @@ mod tests {
                         .expect("receiver should keep the session open until ACK is written");
                     while let Some(event) = events.next().await {
                         if matches!(event, PeerEvent::Disconnected { .. }) {
+                            // Flush QUIC closure before dropping the listener endpoint.
+                            listener.close().await;
                             return proposal;
                         }
                     }
@@ -2860,10 +2862,18 @@ mod tests {
             acknowledged,
             "accepted proposal should receive a transport ACK"
         );
-        commands
-            .send(PeerCommand::Disconnect)
-            .await
-            .expect("sender should close the proposal test session");
+        // The event stream drives CLOSE/CLOSE_ACK as well as application events.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = events.next().await {
+                if let PeerEvent::Disconnected { reason } = event {
+                    assert_eq!(reason, "peer disconnected");
+                    return;
+                }
+            }
+            panic!("session ended before graceful disconnect");
+        })
+        .await
+        .expect("driven sender should promptly acknowledge CLOSE");
         let received = tokio::time::timeout(Duration::from_secs(8), receiver_task)
             .await
             .expect("receiver task should return");
@@ -2909,6 +2919,8 @@ mod tests {
                         .expect("receiver should close after ACKing the signal");
                     while let Some(event) = events.next().await {
                         if matches!(event, PeerEvent::Disconnected { .. }) {
+                            // Flush QUIC closure before dropping the listener endpoint.
+                            listener.close().await;
                             return signal;
                         }
                     }
@@ -2947,6 +2959,18 @@ mod tests {
             }
         }
         assert!(acknowledged, "call offer should receive a transport ACK");
+        // The event stream drives CLOSE/CLOSE_ACK as well as application events.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = events.next().await {
+                if let PeerEvent::Disconnected { reason } = event {
+                    assert_eq!(reason, "peer disconnected");
+                    return;
+                }
+            }
+            panic!("session ended before graceful disconnect");
+        })
+        .await
+        .expect("driven sender should promptly acknowledge CLOSE");
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(8), receiver_task)
                 .await
