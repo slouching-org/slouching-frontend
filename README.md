@@ -72,8 +72,9 @@ runtime validation. The pinned iroh-blobs 0.103.1 release is marked by its
 maintainers as not production quality, so this path remains experimental.
 
 The app also opens `ws://127.0.0.1:3707/ws` asynchronously, sends a binary
-protobuf `ClientHello` v1, and validates one binary `ServerHello` or
-`VersionError` response. A compatible development transport stays open with
+protobuf `ClientHello` v2 with its device public key, and validates a binary
+`ServerHello` or `VersionError` response. It signs the server challenge and
+checks `Authenticated` before the compatible transport stays open with
 WebSocket Ping/Pong heartbeats and reconnects after a disconnect. This does
 not establish a peer session. The UI shows connection and protocol errors
 separately. **Refresh backend** repeats both
@@ -342,7 +343,7 @@ route, but the helper flow has not yet been exercised over a remote relay.
 The native app now recreates all eleven design-board views with real Iced
 widgets, original characters and scenery, extracted outline SVG icons,
 Bricolage Grotesque and JetBrains Mono, translucent panels, scanlines, and
-vignette. The top-right **Telas** button opens the screen gallery.
+vignette.
 
 An additional **Grupo MLS** screen supports two-device group setup. Create the
 group on one device and share its ID. The invitee can send its public KeyPackage
@@ -687,7 +688,7 @@ SLOUCHING_WINDOW_SIZE=1280x800 cargo run -- --capture-dir /tmp/slouching-capture
 
 The capture command renders all twelve screens, saves screenshots through
 Iced's window screenshot API, and exits. Add `--capture-screen <slug>` to
-capture one view, such as the familiar screen, instead of the full gallery. A tiling compositor may override
+capture one view, such as the familiar screen, instead of the full screen set. A tiling compositor may override
 the requested window size; float/resize that window before the capture delay.
 Set `SLOUCHING_CAPTURE_DELAY_MS` to extend the default six-second delay when
 needed. `--capture-peer-addresses` supplies illustrative LAN and VPN socket

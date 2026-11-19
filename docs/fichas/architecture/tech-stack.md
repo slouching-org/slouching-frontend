@@ -7,7 +7,7 @@ and [ADR 0005](https://github.com/slouching-org/slouching/blob/main/docs/fichas/
 
 | Layer | Choice | Current state |
 | --- | --- | --- |
-| Desktop UI | Rust 2024 + pinned Iced 0.14.0 | Twelve native design-board views with direct chat, MLS, calls, sharing, identity, and settings flows |
+| Desktop UI | Rust 2024 + pinned Iced 0.14.0 | Twelve native screens: eleven design-board views plus the MLS group screen, with direct chat, calls, sharing, identity, and settings flows |
 | Rendering | Iced/wgpu | Native images, SVG icons, canvas scenes, local capture previews, and authenticated remote video frames |
 | Local media | CPAL, Opus/SFrame, WebRTC | Device selection and microphone test; direct call media is implemented, with experimental two-device SFU audio tested against the local Elixir helper |
 | Local client core | Rust, Tokio, Iroh/QUIC, OpenMLS | Pinned-device direct chat, MLS groups and events, durable per-device delivery, file transfer, local route book, signed QR invites, and LAN discovery hints |

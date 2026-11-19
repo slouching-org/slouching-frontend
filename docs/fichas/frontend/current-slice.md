@@ -68,7 +68,7 @@ quarantine is not implemented.
 
 `src/main.rs` owns application and transport state; `src/ui.rs` composes the
 native Iced views, original art, icons, embedded fonts, and texture effects.
-The **Telas** gallery reaches each screen. The MLS view creates groups,
+The MLS view creates groups,
 prepares and admits device-bound KeyPackages, processes Welcome and ratchet
 tree data, loads a bounded local transcript, sends application messages, and
 retries queued outbox events for the selected group unless it is quarantined. Group invitations require a separately trusted device-key pin and an explicit

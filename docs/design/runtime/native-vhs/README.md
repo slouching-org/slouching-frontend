@@ -5,7 +5,7 @@ window screenshot API. Every numbered image corresponds to the supplied
 design-board view. These are rendered widgets and source assets, not screen
 PNGs pasted into an app. `compact/` keeps representative 960 × 640 captures.
 
-The window gallery, familiar selection, preview fields, tabs, texture
+The familiar selection, preview fields, tabs, texture
 control, and local MLS group invitation flow work locally. The familiar screen now persists the display name and
 familiar using SQLCipher encrypted SQLite with a key in the system credential
 store. A missing credential store appears as an unavailable state; no
